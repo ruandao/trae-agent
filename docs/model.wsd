@@ -1,0 +1,181 @@
+@startuml
+' 代理相关模型
+class AgentStepState as "AgentStepState\n(枚举)" {
+  THINKING
+  CALLING_TOOL
+  REFLECTING
+  COMPLETED
+  ERROR
+}
+
+class AgentState as "AgentState\n(枚举)" {
+  IDLE
+  RUNNING
+  COMPLETED
+  ERROR
+}
+
+class AgentStep {
+  - state: AgentStepState
+  - thinking: str
+  - tool_call: ToolCall
+  - tool_result: ToolResult
+  - llm_response: LLMResponse
+  - error: AgentError
+}
+
+class AgentExecution {
+  - task: str
+  - steps: List<AgentStep>
+  - final_result: str
+  - state: AgentState
+  - error: AgentError
+}
+
+class AgentError {
+  - message: str
+  - traceback: str
+}
+
+' LLM交互模型
+class LLMMessage {
+  - role: str
+  - content: str
+  - tool_call: ToolCall
+  - tool_result: ToolResult
+}
+
+class LLMUsage {
+  - input_tokens: int
+  - output_tokens: int
+  - total_tokens: int
+}
+
+class LLMResponse {
+  - content: str
+  - usage: LLMUsage
+  - model_info: str
+  - tool_calls: List<ToolCall>
+}
+
+' 配置相关模型
+class ModelProvider {
+  - api_key: str
+  - provider_name: str
+  - base_url: str
+  - api_version: str
+}
+
+class ModelConfig {
+  - model_name: str
+  - temperature: float
+  - top_p: float
+  - tool_call_support: bool
+  - provider: ModelProvider
+}
+
+class MCPServerConfig {
+  - command: str
+  - url: str
+  - timeout: int
+  - env_vars: Dict[str, str]
+}
+
+class AgentConfig {
+  - model_config: ModelConfig
+  - mcp_server_config: MCPServerConfig
+}
+
+class TraeAgentConfig {
+  - tools: List[Tool]
+  - lakeview_support: bool
+  - lakeview_config: LakeviewConfig
+}
+
+class LakeviewConfig {
+  - enabled: bool
+  - url: str
+  - api_key: str
+}
+
+class Config {
+  - agent_config: AgentConfig
+  - model_providers: List[ModelProvider]
+  - logging_config: Dict[str, any]
+}
+
+' 工具相关模型
+class ToolError {
+  - message: str
+  - traceback: str
+}
+
+class ToolExecResult {
+  - success: bool
+  - output: str
+  - error: ToolError
+}
+
+class ToolResult {
+  - tool_call_id: str
+  - output: str
+  - error: ToolError
+  - observation: str
+}
+
+class ToolCall {
+  - name: str
+  - id: str
+  - params: Dict[str, any]
+}
+
+class ToolParameter {
+  - name: str
+  - type: str
+  - description: str
+  - required: bool
+  - default: any
+}
+
+class Tool {
+  - name: str
+  - description: str
+  - parameters: List[ToolParameter]
+  - execute(call: ToolCall): ToolResult
+}
+
+class ToolExecutor {
+  - tools: List[Tool]
+  - execute(call: ToolCall): ToolResult
+}
+
+' 关系定义
+AgentExecution "1" *-- "*" AgentStep
+AgentStep "1" -- "1" AgentStepState
+AgentStep "1" -- "1" LLMResponse
+AgentStep "1" -- "1" AgentError
+AgentStep "1" -- "1" ToolCall
+AgentStep "1" -- "1" ToolResult
+
+AgentExecution "1" -- "1" AgentState
+AgentExecution "1" -- "1" AgentError
+
+LLMResponse "1" *-- "1" LLMUsage
+LLMResponse "1" *-- "*" ToolCall
+LLMMessage "1" -- "1" ToolCall
+LLMMessage "1" -- "1" ToolResult
+
+TraeAgentConfig --|> AgentConfig
+AgentConfig "1" -- "1" ModelConfig
+AgentConfig "1" -- "1" MCPServerConfig
+ModelConfig "1" -- "1" ModelProvider
+TraeAgentConfig "1" -- "1" LakeviewConfig
+Config "1" -- "1" AgentConfig
+Config "1" *-- "*" ModelProvider
+
+ToolExecutor "1" *-- "*" Tool
+Tool "1" *-- "*" ToolParameter
+ToolCall "1" -- "1" ToolResult
+ToolResult "1" -- "1" ToolError
+
+@enduml
