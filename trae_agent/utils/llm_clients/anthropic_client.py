@@ -9,10 +9,13 @@ from typing import override
 import anthropic
 from anthropic.types.tool_union_param import TextEditor20250429
 
+import time
+
 from trae_agent.tools.base import Tool, ToolCall, ToolResult
 from trae_agent.utils.config import ModelConfig
 from trae_agent.utils.llm_clients.base_client import BaseLLMClient
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.utils.llm_clients.llm_logger import LLMLogger
 from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
@@ -27,6 +30,7 @@ class AnthropicClient(BaseLLMClient):
         )
         self.message_history: list[anthropic.types.MessageParam] = []
         self.system_message: str | anthropic.NotGiven = anthropic.NOT_GIVEN
+        self.logger = LLMLogger(model_config.model)
 
     @override
     def set_chat_history(self, messages: list[LLMMessage]) -> None:
@@ -93,64 +97,107 @@ class AnthropicClient(BaseLLMClient):
                         )
                     )
 
+        # Log the request
+        model_config_dict = {
+            "model": model_config.model,
+            "temperature": model_config.temperature,
+            "top_p": model_config.top_p,
+            "top_k": model_config.top_k,
+            "max_tokens": model_config.max_tokens,
+        }
+        self.logger.log_request(
+            messages=[msg.__dict__ for msg in messages],
+            tool_schemas=tool_schemas,
+            model_config=model_config_dict,
+        )
+
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
             func=self._create_anthropic_response,
             provider_name="Anthropic",
             max_retries=model_config.max_retries,
         )
-        response = retry_decorator(model_config, tool_schemas)
 
-        # Handle tool calls in response
-        content = ""
-        tool_calls: list[ToolCall] = []
+        # Measure latency
+        start_time = time.time()
+        try:
+            response = retry_decorator(model_config, tool_schemas)
+            latency = time.time() - start_time
 
-        for content_block in response.content:
-            if content_block.type == "text":
-                content += content_block.text
-                self.message_history.append(
-                    anthropic.types.MessageParam(role="assistant", content=content_block.text)
-                )
-            elif content_block.type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        call_id=content_block.id,
-                        name=content_block.name,
-                        arguments=content_block.input,  # pyright: ignore[reportArgumentType]
+            # Handle tool calls in response
+            content = ""
+            tool_calls: list[ToolCall] = []
+
+            for content_block in response.content:
+                if content_block.type == "text":
+                    content += content_block.text
+                    self.message_history.append(
+                        anthropic.types.MessageParam(role="assistant", content=content_block.text)
                     )
-                )
-                self.message_history.append(
-                    anthropic.types.MessageParam(role="assistant", content=[content_block])
+                elif content_block.type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(
+                            call_id=content_block.id,
+                            name=content_block.name,
+                            arguments=content_block.input,  # pyright: ignore[reportArgumentType]
+                        )
+                    )
+                    self.message_history.append(
+                        anthropic.types.MessageParam(role="assistant", content=[content_block])
+                    )
+
+            usage = None
+            if response.usage:
+                usage = LLMUsage(
+                    input_tokens=response.usage.input_tokens or 0,
+                    output_tokens=response.usage.output_tokens or 0,
+                    cache_creation_input_tokens=response.usage.cache_creation_input_tokens or 0,
+                    cache_read_input_tokens=response.usage.cache_read_input_tokens or 0,
                 )
 
-        usage = None
-        if response.usage:
-            usage = LLMUsage(
-                input_tokens=response.usage.input_tokens or 0,
-                output_tokens=response.usage.output_tokens or 0,
-                cache_creation_input_tokens=response.usage.cache_creation_input_tokens or 0,
-                cache_read_input_tokens=response.usage.cache_read_input_tokens or 0,
+            llm_response = LLMResponse(
+                content=content,
+                usage=usage,
+                model=response.model,
+                finish_reason=response.stop_reason,
+                tool_calls=tool_calls if len(tool_calls) > 0 else None,
             )
 
-        llm_response = LLMResponse(
-            content=content,
-            usage=usage,
-            model=response.model,
-            finish_reason=response.stop_reason,
-            tool_calls=tool_calls if len(tool_calls) > 0 else None,
-        )
-
-        # Record trajectory if recorder is available
-        if self.trajectory_recorder:
-            self.trajectory_recorder.record_llm_interaction(
-                messages=messages,
-                response=llm_response,
-                provider="anthropic",
-                model=model_config.model,
-                tools=tools,
+            # Log the response
+            response_dict = {
+                "content": llm_response.content,
+                "tool_calls": [tc.__dict__ for tc in tool_calls] if tool_calls else None,
+                "finish_reason": llm_response.finish_reason,
+                "model": llm_response.model,
+            }
+            usage_dict = {
+                "input_tokens": llm_response.usage.input_tokens if llm_response.usage else 0,
+                "output_tokens": llm_response.usage.output_tokens if llm_response.usage else 0,
+            }
+            self.logger.log_response(
+                response=response_dict,
+                usage=usage_dict,
+                latency=latency,
             )
 
-        return llm_response
+            # Record trajectory if recorder is available
+            if self.trajectory_recorder:
+                self.trajectory_recorder.record_llm_interaction(
+                    messages=messages,
+                    response=llm_response,
+                    provider="anthropic",
+                    model=model_config.model,
+                    tools=tools,
+                )
+
+            return llm_response
+        except Exception as e:
+            latency = time.time() - start_time
+            self.logger.log_error(
+                error=str(e),
+                traceback=str(e.__traceback__),
+            )
+            raise
 
     def parse_messages(self, messages: list[LLMMessage]) -> list[anthropic.types.MessageParam]:
         """Parse the messages to Anthropic format."""

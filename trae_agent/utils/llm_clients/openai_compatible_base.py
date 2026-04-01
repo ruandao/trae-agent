@@ -4,6 +4,7 @@
 """Base class for OpenAI-compatible clients with shared logic."""
 
 import json
+import time
 from abc import ABC, abstractmethod
 from typing import override
 
@@ -28,6 +29,7 @@ from trae_agent.tools.base import Tool, ToolCall
 from trae_agent.utils.config import ModelConfig
 from trae_agent.utils.llm_clients.base_client import BaseLLMClient
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.utils.llm_clients.llm_logger import LLMLogger
 from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
@@ -70,6 +72,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         self.provider_config = provider_config
         self.client = provider_config.create_client(self.api_key, self.base_url, self.api_version)
         self.message_history: list[ChatCompletionMessageParam] = []
+        self.logger = LLMLogger(model_config.model)
 
     @override
     def set_chat_history(self, messages: list[LLMMessage]) -> None:
@@ -138,81 +141,123 @@ class OpenAICompatibleClient(BaseLLMClient):
         # Get provider-specific extra headers
         extra_headers = self.provider_config.get_extra_headers()
 
+        # Log the request
+        model_config_dict = {
+            "model": model_config.model,
+            "temperature": model_config.temperature,
+            "top_p": model_config.top_p,
+            "max_tokens": model_config.get_max_tokens_param(),
+        }
+        self.logger.log_request(
+            messages=[msg.__dict__ for msg in messages],
+            tool_schemas=tool_schemas,
+            model_config=model_config_dict,
+        )
+
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
             func=self._create_response,
             provider_name=self.provider_config.get_service_name(),
             max_retries=model_config.max_retries,
         )
-        response = retry_decorator(model_config, tool_schemas, extra_headers)
 
-        choice = response.choices[0]
+        # Measure latency
+        start_time = time.time()
+        try:
+            response = retry_decorator(model_config, tool_schemas, extra_headers)
+            latency = time.time() - start_time
 
-        tool_calls: list[ToolCall] | None = None
-        if choice.message.tool_calls:
-            tool_calls = []
-            for tool_call in choice.message.tool_calls:
-                tool_calls.append(
-                    ToolCall(
-                        name=tool_call.function.name,
-                        call_id=tool_call.id,
-                        arguments=(
-                            json.loads(tool_call.function.arguments)
-                            if tool_call.function.arguments
-                            else {}
-                        ),
+            choice = response.choices[0]
+
+            tool_calls: list[ToolCall] | None = None
+            if choice.message.tool_calls:
+                tool_calls = []
+                for tool_call in choice.message.tool_calls:
+                    tool_calls.append(
+                        ToolCall(
+                            name=tool_call.function.name,
+                            call_id=tool_call.id,
+                            arguments=(
+                                json.loads(tool_call.function.arguments)
+                                if tool_call.function.arguments
+                                else {}
+                            ),
+                        )
+                    )
+
+            llm_response = LLMResponse(
+                content=choice.message.content or "",
+                tool_calls=tool_calls,
+                finish_reason=choice.finish_reason,
+                model=response.model,
+                usage=(
+                    LLMUsage(
+                        input_tokens=response.usage.prompt_tokens or 0,
+                        output_tokens=response.usage.completion_tokens or 0,
+                    )
+                    if response.usage
+                    else None
+                ),
+            )
+
+            # Update message history
+            if llm_response.tool_calls:
+                self.message_history.append(
+                    ChatCompletionAssistantMessageParam(
+                        role="assistant",
+                        content=llm_response.content,
+                        tool_calls=[
+                            ChatCompletionMessageToolCallParam(
+                                id=tool_call.call_id,
+                                function=Function(
+                                    name=tool_call.name,
+                                    arguments=json.dumps(tool_call.arguments),
+                                ),
+                                type="function",
+                            )
+                            for tool_call in llm_response.tool_calls
+                        ],
                     )
                 )
-
-        llm_response = LLMResponse(
-            content=choice.message.content or "",
-            tool_calls=tool_calls,
-            finish_reason=choice.finish_reason,
-            model=response.model,
-            usage=(
-                LLMUsage(
-                    input_tokens=response.usage.prompt_tokens or 0,
-                    output_tokens=response.usage.completion_tokens or 0,
+            elif llm_response.content:
+                self.message_history.append(
+                    ChatCompletionAssistantMessageParam(content=llm_response.content, role="assistant")
                 )
-                if response.usage
-                else None
-            ),
-        )
 
-        # Update message history
-        if llm_response.tool_calls:
-            self.message_history.append(
-                ChatCompletionAssistantMessageParam(
-                    role="assistant",
-                    content=llm_response.content,
-                    tool_calls=[
-                        ChatCompletionMessageToolCallParam(
-                            id=tool_call.call_id,
-                            function=Function(
-                                name=tool_call.name,
-                                arguments=json.dumps(tool_call.arguments),
-                            ),
-                            type="function",
-                        )
-                        for tool_call in llm_response.tool_calls
-                    ],
+            # Log the response
+            response_dict = {
+                "content": llm_response.content,
+                "tool_calls": [tc.__dict__ for tc in tool_calls] if tool_calls else None,
+                "finish_reason": llm_response.finish_reason,
+                "model": llm_response.model,
+            }
+            usage_dict = {
+                "input_tokens": llm_response.usage.input_tokens if llm_response.usage else 0,
+                "output_tokens": llm_response.usage.output_tokens if llm_response.usage else 0,
+            }
+            self.logger.log_response(
+                response=response_dict,
+                usage=usage_dict,
+                latency=latency,
+            )
+
+            if self.trajectory_recorder:
+                self.trajectory_recorder.record_llm_interaction(
+                    messages=messages,
+                    response=llm_response,
+                    provider=self.provider_config.get_provider_name(),
+                    model=model_config.model,
+                    tools=tools,
                 )
-            )
-        elif llm_response.content:
-            self.message_history.append(
-                ChatCompletionAssistantMessageParam(content=llm_response.content, role="assistant")
-            )
 
-        if self.trajectory_recorder:
-            self.trajectory_recorder.record_llm_interaction(
-                messages=messages,
-                response=llm_response,
-                provider=self.provider_config.get_provider_name(),
-                model=model_config.model,
-                tools=tools,
+            return llm_response
+        except Exception as e:
+            latency = time.time() - start_time
+            self.logger.log_error(
+                error=str(e),
+                traceback=str(e.__traceback__),
             )
-
-        return llm_response
+            raise
 
     def parse_messages(self, messages: list[LLMMessage]) -> list[ChatCompletionMessageParam]:
         """Parse LLM messages to OpenAI format."""

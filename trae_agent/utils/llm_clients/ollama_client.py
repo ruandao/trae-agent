@@ -6,6 +6,7 @@ Ollama API client wrapper with tool integration
 """
 
 import json
+import time
 import uuid
 from typing import override
 
@@ -22,6 +23,7 @@ from trae_agent.tools.base import Tool, ToolCall, ToolResult
 from trae_agent.utils.config import ModelConfig
 from trae_agent.utils.llm_clients.base_client import BaseLLMClient
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
+from trae_agent.utils.llm_clients.llm_logger import LLMLogger
 from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
@@ -38,6 +40,7 @@ class OllamaClient(BaseLLMClient):
         )
 
         self.message_history: ResponseInputParam = []
+        self.logger = LLMLogger(model_config.model)
 
     @override
     def set_chat_history(self, messages: list[LLMMessage]) -> None:
@@ -99,49 +102,87 @@ class OllamaClient(BaseLLMClient):
         else:
             self.message_history = msgs
 
+        # Log the request
+        model_config_dict = {
+            "model": model_config.model,
+            "temperature": model_config.temperature,
+            "top_p": model_config.top_p,
+            "top_k": model_config.top_k,
+        }
+        self.logger.log_request(
+            messages=[msg.__dict__ for msg in messages],
+            tool_schemas=tool_schemas,
+            model_config=model_config_dict,
+        )
+
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
             func=self._create_ollama_response,
             provider_name="Ollama",
             max_retries=model_config.max_retries,
         )
-        response = retry_decorator(model_config, tool_schemas)
 
-        content = ""
-        tool_calls: list[ToolCall] = []
+        # Measure latency
+        start_time = time.time()
+        try:
+            response = retry_decorator(model_config, tool_schemas)
+            latency = time.time() - start_time
 
-        if response.message.tool_calls:
-            for tool in response.message.tool_calls:
-                tool_calls.append(
-                    ToolCall(
-                        call_id=self._id_generator(),
-                        name=tool.function.name,
-                        arguments=dict(tool.function.arguments),
-                        id=self._id_generator(),
+            content = ""
+            tool_calls: list[ToolCall] = []
+
+            if response.message.tool_calls:
+                for tool in response.message.tool_calls:
+                    tool_calls.append(
+                        ToolCall(
+                            call_id=self._id_generator(),
+                            name=tool.function.name,
+                            arguments=dict(tool.function.arguments),
+                            id=self._id_generator(),
+                        )
                     )
-                )
-        else:
-            # consider response is not a tool call
-            content = str(response.message.content)
+            else:
+                # consider response is not a tool call
+                content = str(response.message.content)
 
-        llm_response = LLMResponse(
-            content=content,
-            usage=None,
-            model=model_config.model,
-            finish_reason=None,  # seems can't get finish reason will check docs soon
-            tool_calls=tool_calls if len(tool_calls) > 0 else None,
-        )
-
-        if self.trajectory_recorder:
-            self.trajectory_recorder.record_llm_interaction(
-                messages=messages,
-                response=llm_response,
-                provider="ollama",
+            llm_response = LLMResponse(
+                content=content,
+                usage=None,
                 model=model_config.model,
-                tools=tools,
+                finish_reason=None,  # seems can't get finish reason will check docs soon
+                tool_calls=tool_calls if len(tool_calls) > 0 else None,
             )
 
-        return llm_response
+            # Log the response
+            response_dict = {
+                "content": llm_response.content,
+                "tool_calls": [tc.__dict__ for tc in tool_calls] if tool_calls else None,
+                "finish_reason": llm_response.finish_reason,
+                "model": llm_response.model,
+            }
+            self.logger.log_response(
+                response=response_dict,
+                usage=None,
+                latency=latency,
+            )
+
+            if self.trajectory_recorder:
+                self.trajectory_recorder.record_llm_interaction(
+                    messages=messages,
+                    response=llm_response,
+                    provider="ollama",
+                    model=model_config.model,
+                    tools=tools,
+                )
+
+            return llm_response
+        except Exception as e:
+            latency = time.time() - start_time
+            self.logger.log_error(
+                error=str(e),
+                traceback=str(e.__traceback__),
+            )
+            raise
 
     def parse_messages(self, messages: list[LLMMessage]) -> ResponseInputParam:
         """
