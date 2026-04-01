@@ -77,6 +77,12 @@ class ModelConfig:
         they will override the values in the config file.
         """
         self.model = str(resolve_config_value(cli_value=model, config_value=self.model))
+        resolved_provider = resolve_config_value(
+            cli_value=provider,
+            config_value=None,
+            env_var="TRAE_MODEL_PROVIDER",
+        )
+        provider = str(resolved_provider) if resolved_provider else None
 
         # If the user wants to change the model provider, they should either:
         # * Make sure the provider name is available in the model_providers dict;
