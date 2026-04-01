@@ -6,6 +6,7 @@
 import json
 import os
 import time
+from dataclasses import is_dataclass
 from datetime import datetime
 
 
@@ -19,7 +20,7 @@ class LLMLogger:
             model_name: The name of the model being used.
         """
         self.model_name = model_name
-        self.log_dir = "logs"
+        self.log_dir = os.getenv("TRAE_LOG_DIR", os.path.expanduser("~/.trae-agent/logs"))
         os.makedirs(self.log_dir, exist_ok=True)
         self.log_file = os.path.join(self.log_dir, f"{model_name}.log")
 
@@ -81,6 +82,28 @@ class LLMLogger:
         Args:
             log_entry: The log entry to write.
         """
+        safe_entry = self._to_json_safe(log_entry)
         with open(self.log_file, "a", encoding="utf-8") as f:
-            json.dump(log_entry, f, ensure_ascii=False)
+            json.dump(safe_entry, f, ensure_ascii=False)
             f.write("\n")
+
+    def _to_json_safe(self, value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._to_json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._to_json_safe(v) for v in value]
+        if is_dataclass(value):
+            return {
+                key: self._to_json_safe(val)
+                for key, val in value.__dict__.items()
+                if not key.startswith("_")
+            }
+        if hasattr(value, "__dict__"):
+            return {
+                key: self._to_json_safe(val)
+                for key, val in value.__dict__.items()
+                if not key.startswith("_")
+            }
+        return str(value)

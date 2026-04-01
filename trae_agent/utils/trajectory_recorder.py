@@ -9,6 +9,7 @@
 """Trajectory recording functionality for Trae Agent."""
 
 import json
+from dataclasses import is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,8 @@ class TrajectoryRecorder:
         """
         if trajectory_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            trajectory_path = f"trajectories/trajectory_{timestamp}.json"
+            # Use a hidden directory to avoid agents treating trajectory files as task inputs.
+            trajectory_path = f".trajectories/trajectory_{timestamp}.json"
 
         self.trajectory_path: Path = Path(trajectory_path).resolve()
         try:
@@ -246,20 +248,48 @@ class TrajectoryRecorder:
         return {
             "call_id": tool_call.call_id,
             "name": tool_call.name,
-            "arguments": tool_call.arguments,
-            "id": getattr(tool_call, "id", None),
+            "arguments": self._to_json_safe(tool_call.arguments),
+            "id": self._to_json_safe(getattr(tool_call, "id", None)),
         }
 
     def _serialize_tool_result(self, tool_result: ToolResult) -> dict[str, Any]:
         """Serialize a tool result to a dictionary."""
         return {
-            "call_id": tool_result.call_id,
-            "success": tool_result.success,
-            "result": tool_result.result,
-            "error": tool_result.error,
-            "id": getattr(tool_result, "id", None),
+            "call_id": self._to_json_safe(tool_result.call_id),
+            "success": self._to_json_safe(tool_result.success),
+            "result": self._to_json_safe(tool_result.result),
+            "error": self._to_json_safe(tool_result.error),
+            "id": self._to_json_safe(getattr(tool_result, "id", None)),
         }
 
     def get_trajectory_path(self) -> str:
         """Get the path where trajectory is being saved."""
         return str(self.trajectory_path)
+
+    def _to_json_safe(self, value: Any) -> Any:
+        """Convert arbitrary objects to JSON-serializable values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, dict):
+            return {str(k): self._to_json_safe(v) for k, v in value.items()}
+
+        if isinstance(value, (list, tuple, set)):
+            return [self._to_json_safe(item) for item in value]
+
+        if is_dataclass(value):
+            # Avoid importing asdict to keep control over recursive conversion.
+            return {
+                key: self._to_json_safe(val)
+                for key, val in value.__dict__.items()
+                if not key.startswith("_")
+            }
+
+        if hasattr(value, "__dict__"):
+            return {
+                key: self._to_json_safe(val)
+                for key, val in value.__dict__.items()
+                if not key.startswith("_")
+            }
+
+        return str(value)

@@ -220,24 +220,8 @@ class DeepSeekClient(BaseLLMClient):
 
         api_call_input: ResponseInputParam = []
         if reuse_history:
-            # Clean message history to avoid consecutive assistant messages
-            self._clean_message_history()
             api_call_input.extend(self.message_history)
         api_call_input.extend(deepseek_messages)
-        
-        # Clean api_call_input to avoid consecutive assistant messages
-        if len(api_call_input) > 1:
-            cleaned_input = []
-            for msg in api_call_input:
-                # Get role from either LLMMessage object or dictionary
-                msg_role = msg.role if hasattr(msg, 'role') else msg.get('role', '')
-                # Get previous role from either LLMMessage object or dictionary
-                prev_role = cleaned_input[-1].role if (cleaned_input and hasattr(cleaned_input[-1], 'role')) else cleaned_input[-1].get('role', '') if cleaned_input else ''
-                # Only add the message if it's not an assistant message or if the previous message is not an assistant message
-                if not cleaned_input or msg_role != 'assistant' or (msg_role == 'assistant' and prev_role != 'assistant'):
-                    cleaned_input.append(msg)
-            
-            api_call_input = cleaned_input
         
         # Log the final api_call_input for debugging
         self.logger.log_request(
@@ -291,7 +275,11 @@ class DeepSeekClient(BaseLLMClient):
                         )
                     )
 
-            # Update message history
+            # Update message history with current turn input first.
+            if reuse_history and deepseek_messages:
+                self.message_history.extend(deepseek_messages)
+
+            # Then append the model response for this turn.
             if tool_calls:
                 self.message_history.append({
                     "role": "assistant",
@@ -313,9 +301,6 @@ class DeepSeekClient(BaseLLMClient):
                     "role": "assistant",
                     "content": content,
                 })
-            
-            # Clean message history after updating to avoid consecutive assistant messages
-            self._clean_message_history()
 
             usage = None
             if response.usage:
