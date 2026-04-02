@@ -126,7 +126,9 @@
         </div>
         <div>
           <label for="parentId">父任务 ID（可选，叠加可写层）</label>
-          <input type="text" id="parentId" placeholder="留空为根层" />
+          <select id="parentId" title="基于当前任务列表；选「根层」则从新建层开始">
+            <option value="">（无）根层 · 新建可写层</option>
+          </select>
         </div>
       </div>
       <button type="button" id="btnRun">提交执行</button>
@@ -212,6 +214,25 @@
       document.getElementById('cfgYaml').value = j.yaml || '';
     };
 
+    function fillParentJobSelect(jobs) {
+      const sel = document.getElementById('parentId');
+      const prev = sel.value;
+      sel.replaceChildren();
+      const root = document.createElement('option');
+      root.value = '';
+      root.textContent = '（无）根层 · 新建可写层';
+      sel.appendChild(root);
+      for (const j of jobs) {
+        const o = document.createElement('option');
+        o.value = j.id;
+        const cmd = j.command || '';
+        const short = cmd.length > 42 ? cmd.slice(0, 42) + '…' : cmd;
+        o.textContent = `${short || j.id} · 层 ${j.layer_id}`;
+        sel.appendChild(o);
+      }
+      if (prev && [...sel.options].some((opt) => opt.value === prev)) sel.value = prev;
+    }
+
     async function loadJobs() {
       const r = await api('/api/jobs');
       const box = document.getElementById('jobs');
@@ -220,6 +241,7 @@
         return;
       }
       const { jobs } = await r.json();
+      fillParentJobSelect(jobs);
       box.innerHTML = jobs
         .map(
           (j) => `
