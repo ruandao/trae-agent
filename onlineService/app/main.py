@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from .auth import AuthDep
 from .hub import hub
+from .layer_fs import list_layer_children, list_layer_files, list_layers, read_layer_file
 from .jobs import store
 from .paths import config_file_path, service_root
 
@@ -173,4 +174,61 @@ async def events_stream(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@app.get("/api/layers")
+async def api_list_layers(_: AuthDep) -> dict[str, Any]:
+    layers = list_layers()
+    # 将 layer_id 映射到 jobs 记录的执行命令（用于 UI 展示）。
+    # 如果某个 layer 目录存在但 jobs 状态里已不存在，则不返回 command。
+    cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in store.list_jobs()}
+    for item in layers:
+        lid = item.get("layer_id")
+        if lid and lid in cmd_by_layer_id:
+            item["command"] = cmd_by_layer_id[lid]
+    return {"layers": layers}
+
+
+@app.get("/api/layers/{layer_id}/files")
+async def api_list_layer_files(
+    _: AuthDep,
+    layer_id: str,
+    prefix: str | None = Query(default=None, description="可选：相对路径前缀过滤（只支持前缀，不支持 .. / 绝对路径）"),
+    max_files: int = Query(default=2000, ge=1, le=5000),
+) -> dict[str, Any]:
+    return list_layer_files(layer_id=layer_id, prefix=prefix, max_files=max_files)
+
+
+@app.get("/api/layers/{layer_id}/files/{file_rel_posix:path}")
+async def api_read_layer_file(
+    _: AuthDep,
+    layer_id: str,
+    file_rel_posix: str,
+    max_bytes: int | None = Query(default=None, ge=1, le=50_000_000),
+    max_text_chars: int | None = Query(default=None, ge=1, le=5_000_000),
+) -> dict[str, Any]:
+    return read_layer_file(
+        layer_id=layer_id,
+        file_rel_posix=file_rel_posix,
+        max_bytes=max_bytes,
+        max_text_chars=max_text_chars,
+    )
+
+
+@app.get("/api/layers/{layer_id}/children")
+async def api_list_layer_children(
+    _: AuthDep,
+    layer_id: str,
+    dir: str = Query(default="", description="目录（相对层内路径）；空表示根目录"),
+    prefix: str | None = Query(default=None, description="前缀过滤（相对路径，支持只看 src/ 之类）"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    return list_layer_children(
+        layer_id=layer_id,
+        dir_rel_posix=dir,
+        prefix=prefix,
+        offset=offset,
+        limit=limit,
     )

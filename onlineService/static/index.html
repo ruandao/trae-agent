@@ -41,7 +41,7 @@
     }
     h2 { font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0 0 0.75rem; }
     label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.35rem; }
-    input[type="text"], textarea, select {
+    input[type="text"], input[type="number"], textarea, select {
       width: 100%;
       padding: 0.5rem 0.65rem;
       border-radius: 6px;
@@ -95,6 +95,34 @@
       border-radius: 6px;
     }
     .err-msg { color: var(--err); font-size: 0.85rem; margin-top: 0.5rem; }
+    .file-panel { display: flex; gap: 1rem; flex-wrap: wrap; align-items: stretch; }
+    .file-panel > div { flex: 1; min-width: 300px; }
+    select.file-select { min-height: 280px; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+
+    .tree {
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      max-height: 420px;
+      overflow: auto;
+      background: rgba(0,0,0,0.05);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem;
+    }
+    .tree-node {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.18rem 0.25rem;
+      border-radius: 6px;
+      user-select: none;
+      cursor: pointer;
+    }
+    .tree-node:hover { background: rgba(61,139,253,0.14); }
+    .tree-toggle { width: 18px; display: inline-block; color: var(--muted); }
+    .tree-children { margin-left: 14px; margin-top: 0.25rem; }
+    .tree-more { margin-left: 14px; margin-top: 0.25rem; }
+    .tree-path-meta { margin-top: 0.45rem; }
   </style>
 </head>
 <body>
@@ -142,6 +170,49 @@
       <div id="jobs"></div>
     </section>
     <section>
+      <h2>可写层文件浏览</h2>
+      <div class="row">
+        <div>
+          <label for="layerSelect">选择层（layer_id）</label>
+          <select id="layerSelect"></select>
+          <div class="meta" id="layerCommandMeta" style="margin-top:0.35rem;"></div>
+        </div>
+        <div>
+          <label for="filePrefix">文件前缀过滤（可选）</label>
+          <input type="text" id="filePrefix" placeholder="例如：src/ 或 README" />
+        </div>
+      </div>
+      <div class="row" style="margin-top: 0.75rem;">
+        <div>
+          <label for="fileMaxBytes">最大读取字节（max_bytes）</label>
+          <input type="number" id="fileMaxBytes" value="2000000" min="10000" max="20000000" step="10000" />
+        </div>
+        <div>
+          <label for="fileMaxTextChars">最大展示字符（max_text_chars）</label>
+          <input type="number" id="fileMaxTextChars" value="200000" min="1000" max="5000000" step="1000" />
+        </div>
+        <div>
+          <label for="dirPageSize">目录分页大小（每次加载）</label>
+          <input type="number" id="dirPageSize" value="200" min="10" max="2000" step="10" />
+        </div>
+      </div>
+
+      <button type="button" id="btnLoadLayerFiles">刷新树</button>
+      <div class="err-msg" id="layerFilesErr"></div>
+
+      <div class="file-panel" style="margin-top: 0.75rem;">
+        <div>
+          <label>文件树（支持展开/翻页）</label>
+          <div id="fileTree" class="tree"></div>
+          <div class="meta" id="fileListMeta"></div>
+        </div>
+        <div>
+          <label>文件内容</label>
+          <pre class="out" id="fileContent" style="max-height: 420px; margin-top: 0.5rem;"></pre>
+        </div>
+      </div>
+    </section>
+    <section>
       <h2>查询父节点</h2>
       <div class="row">
         <div>
@@ -184,7 +255,12 @@
         } else {
           sseAppend(ev.data.slice(0, 200));
         }
-        if (o.type === 'job_finished' || o.type === 'job_created' || o.type === 'jobs_reset') loadJobs();
+        if (o.type === 'job_finished' || o.type === 'job_created') loadJobs();
+        if (o.type === 'jobs_reset') {
+          loadJobs();
+          // jobs_reset 后可写层也会被清理，刷新树形 UI
+          reloadLayerTree();
+        }
       } catch (_) {
         sseAppend(ev.data.slice(0, 120));
       }
@@ -271,6 +347,327 @@
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
     }
+    function setText(id, v) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = v;
+    }
+
+    let treeCache = new Map(); // dirRelPath => { loaded: bool, nextOffset: number, truncated: bool }
+    let treeRequestToken = 0;
+
+    function getSelectedLayerId() {
+      const layerSelect = document.getElementById('layerSelect');
+      return (layerSelect.value || '').trim();
+    }
+    function getPrefixFilter() {
+      return (document.getElementById('filePrefix').value || '').trim();
+    }
+    function getMaxBytes() {
+      const v = parseInt(document.getElementById('fileMaxBytes').value || '2000000', 10);
+      return isFinite(v) ? v : 2000000;
+    }
+    function getMaxTextChars() {
+      const v = parseInt(document.getElementById('fileMaxTextChars').value || '200000', 10);
+      return isFinite(v) ? v : 200000;
+    }
+    function getDirPageSize() {
+      const v = parseInt(document.getElementById('dirPageSize').value || '200', 10);
+      return isFinite(v) ? v : 200;
+    }
+    function baseName(relPath) {
+      if (!relPath) return '';
+      const parts = relPath.split('/').filter(Boolean);
+      return parts[parts.length - 1] || relPath;
+    }
+
+    function clearLayerTreeUI() {
+      treeCache = new Map();
+      const treeEl = document.getElementById('fileTree');
+      treeEl.innerHTML = '';
+      document.getElementById('fileContent').textContent = '';
+      document.getElementById('fileListMeta').textContent = '';
+    }
+
+    function updateLayerCommandMeta() {
+      const metaEl = document.getElementById('layerCommandMeta');
+      const sel = document.getElementById('layerSelect');
+      if (!metaEl || !sel) return;
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      const cmd = (opt && opt.dataset && opt.dataset.command) ? opt.dataset.command : '';
+      if (cmd) {
+        const short = cmd.length > 200 ? cmd.slice(0, 200) + '…' : cmd;
+        metaEl.textContent = `命令: ${short}`;
+      } else {
+        metaEl.textContent = '命令: —';
+      }
+    }
+
+    function createDirNode(dirRelPath, depthIgnored) {
+      const wrapper = document.createElement('div');
+      const row = document.createElement('div');
+      row.className = 'tree-node';
+      row.title = dirRelPath ? dirRelPath : '/';
+
+      const toggle = document.createElement('span');
+      toggle.className = 'tree-toggle';
+      toggle.textContent = '+';
+
+      const name = document.createElement('span');
+      name.className = 'tree-dir-name';
+      name.textContent = baseName(dirRelPath);
+
+      row.appendChild(toggle);
+      row.appendChild(name);
+
+      const childrenEl = document.createElement('div');
+      childrenEl.className = 'tree-children';
+      childrenEl.style.display = 'none';
+
+      const moreEl = document.createElement('div');
+      moreEl.className = 'tree-more';
+
+      wrapper.appendChild(row);
+      wrapper.appendChild(childrenEl);
+      wrapper.appendChild(moreEl);
+
+      row.onclick = async () => {
+        const cache = treeCache.get(dirRelPath) || { loaded: false, nextOffset: 0, truncated: false };
+        if (!childrenEl || !moreEl) return;
+        if (childrenEl.style.display === 'none') {
+          // Expand
+          childrenEl.style.display = 'block';
+          moreEl.style.display = 'block';
+          toggle.textContent = '-';
+          if (!cache.loaded) {
+            treeCache.set(dirRelPath, { ...cache, loading: true });
+            await loadDirPage(dirRelPath, childrenEl, moreEl, 0, false);
+          }
+        } else {
+          // Collapse
+          childrenEl.style.display = 'none';
+          moreEl.style.display = 'none';
+          toggle.textContent = '+';
+        }
+      };
+
+      return wrapper;
+    }
+
+    function createFileNode(fileRelPath, metaLine) {
+      const row = document.createElement('div');
+      row.className = 'tree-node';
+      row.title = fileRelPath;
+      row.textContent = '';
+
+      const toggle = document.createElement('span');
+      toggle.className = 'tree-toggle';
+      toggle.textContent = ' ';
+
+      const name = document.createElement('span');
+      name.className = 'tree-file-name';
+      name.textContent = baseName(fileRelPath);
+
+      const spacer = document.createElement('span');
+      spacer.style.marginLeft = '0.4rem';
+      spacer.style.color = 'var(--muted)';
+      spacer.style.fontSize = '0.7rem';
+      spacer.textContent = metaLine || '';
+
+      row.appendChild(toggle);
+      row.appendChild(name);
+      if (metaLine) row.appendChild(spacer);
+
+      row.onclick = async () => {
+        await loadLayerFileContent(fileRelPath);
+      };
+
+      return row;
+    }
+
+    async function loadLayers() {
+      const errEl = document.getElementById('layerFilesErr');
+      errEl.textContent = '';
+      const sel = document.getElementById('layerSelect');
+      const contentEl = document.getElementById('fileContent');
+      const metaEl = document.getElementById('fileListMeta');
+
+      sel.replaceChildren();
+      contentEl.textContent = '';
+      metaEl.textContent = '';
+
+      const r = await api('/api/layers');
+      if (!r.ok) {
+        errEl.textContent = await r.text();
+        return;
+      }
+      const j = await r.json();
+      const layers = j.layers || [];
+      if (!layers.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '（无可写层）';
+        sel.appendChild(opt);
+        updateLayerCommandMeta();
+        return;
+      }
+
+      for (const l of layers) {
+        const opt = document.createElement('option');
+        opt.value = l.layer_id;
+        const created = l.created_at ? `${l.created_at}` : '';
+        const cmd = l.command ? ` · cmd: ${l.command}` : '';
+        const txt = created ? `${l.layer_id} · ${created}${cmd}` : `${l.layer_id}${cmd}`;
+        opt.textContent = txt.length > 140 ? txt.slice(0, 140) + '…' : txt;
+        if (l.command) opt.dataset.command = l.command;
+        sel.appendChild(opt);
+      }
+      sel.value = layers[0].layer_id;
+      updateLayerCommandMeta();
+      await reloadLayerTree();
+    }
+
+    async function loadDirPage(dirRelPath, childrenEl, moreEl, offset, append) {
+      const errEl = document.getElementById('layerFilesErr');
+      errEl.textContent = '';
+
+      const token = treeRequestToken;
+      const layerId = getSelectedLayerId();
+      if (!layerId) return;
+
+      const prefix = getPrefixFilter();
+      const pageLimit = getDirPageSize();
+
+      if (!append && offset === 0) {
+        childrenEl.innerHTML = '';
+      }
+
+      // Avoid stale updates when user reloads the tree.
+      if (token !== treeRequestToken) return;
+
+      const url =
+        `/api/layers/${encodeURIComponent(layerId)}/children` +
+        `?dir=${encodeURIComponent(dirRelPath || '')}` +
+        `&prefix=${encodeURIComponent(prefix)}` +
+        `&offset=${offset}` +
+        `&limit=${pageLimit}`;
+
+      const r = await api(url);
+      if (!r.ok) {
+        errEl.textContent = await r.text();
+        return;
+      }
+      const j = await r.json();
+
+      if (token !== treeRequestToken) return;
+
+      const entries = j.entries || [];
+      if (!append && offset === 0 && entries.length === 0) {
+        childrenEl.innerHTML = '<div class="meta">（无匹配条目）</div>';
+      } else {
+        for (const e of entries) {
+          if (e.type === 'dir') {
+            const node = createDirNode(e.path, 0);
+            childrenEl.appendChild(node);
+          } else {
+            const metaLine = e.size ? `${e.size}B` : '';
+            childrenEl.appendChild(createFileNode(e.path, metaLine));
+          }
+        }
+      }
+
+      treeCache.set(dirRelPath || '', {
+        loaded: true,
+        nextOffset: j.next_offset ?? (offset + entries.length),
+        truncated: !!j.truncated,
+      });
+
+      if (j.truncated) {
+        moreEl.innerHTML = '';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'secondary';
+        btn.textContent = '加载更多';
+        btn.onclick = async () => {
+          const cache = treeCache.get(dirRelPath || '') || {};
+          if (cache.loading) return;
+          cache.loading = true;
+          treeCache.set(dirRelPath || '', cache);
+          await loadDirPage(dirRelPath, childrenEl, moreEl, cache.nextOffset || offset + entries.length, true);
+          const after = treeCache.get(dirRelPath || '') || {};
+          after.loading = false;
+          treeCache.set(dirRelPath || '', after);
+        };
+        moreEl.appendChild(btn);
+      } else {
+        moreEl.innerHTML = '';
+      }
+
+      document.getElementById('fileListMeta').textContent =
+        `目录: ${dirRelPath || '/'} · 当前加载: ${entries.length} · 总数: ${j.total ?? '-'}${j.truncated ? '（可继续加载）' : ''}`;
+    }
+
+    async function reloadLayerTree() {
+      const layerId = getSelectedLayerId();
+      if (!layerId) return;
+
+      updateLayerCommandMeta();
+      treeRequestToken += 1;
+      clearLayerTreeUI();
+
+      const treeEl = document.getElementById('fileTree');
+      const rootChildren = document.createElement('div');
+      const rootMore = document.createElement('div');
+      rootMore.className = 'tree-more';
+      treeEl.appendChild(rootChildren);
+      treeEl.appendChild(rootMore);
+
+      treeCache.set('', { loaded: false, nextOffset: 0, truncated: false });
+      await loadDirPage('', rootChildren, rootMore, 0, false);
+    }
+
+    async function loadLayerFileContent(fileRelPath) {
+      const errEl = document.getElementById('layerFilesErr');
+      const layerId = getSelectedLayerId();
+      const contentEl = document.getElementById('fileContent');
+      const metaEl = document.getElementById('fileListMeta');
+      errEl.textContent = '';
+
+      if (!layerId || !fileRelPath) {
+        contentEl.textContent = '';
+        metaEl.textContent = '';
+        return;
+      }
+
+      const segments = fileRelPath.split('/').map(encodeURIComponent).join('/');
+      const r = await api(
+        `/api/layers/${encodeURIComponent(layerId)}/files/${segments}` +
+          `?max_bytes=${encodeURIComponent(getMaxBytes())}` +
+          `&max_text_chars=${encodeURIComponent(getMaxTextChars())}`,
+      );
+      if (!r.ok) {
+        errEl.textContent = await r.text();
+        return;
+      }
+
+      const j = await r.json();
+      if (j.kind === 'text') {
+        const notice = j.truncated ? `[内容已截断: 原始 ${j.size}B，读取 ${j.read_bytes}B]\n\n` : '';
+        contentEl.textContent = notice + (j.text || '');
+        metaEl.textContent = `文件: ${j.path} · 原始 ${j.size}B · 读取 ${j.read_bytes}B`;
+      } else if (j.kind === 'binary') {
+        const prefix = (j.base64 || '').slice(0, 400);
+        const more = (j.base64 || '').length > 400 ? '…' : '';
+        const notice = j.truncated ? `（二进制内容已截断；原始 ${j.size}B，读取 ${j.read_bytes}B）\n` : '';
+        contentEl.textContent = `${notice}二进制文件。\nbase64(前400字符):\n${prefix}${more}\n`;
+        metaEl.textContent = `文件: ${j.path} · 原始 ${j.size}B · 读取 ${j.read_bytes}B · binary`;
+      } else {
+        contentEl.textContent = JSON.stringify(j, null, 2);
+      }
+    }
+
+    document.getElementById('btnLoadLayerFiles').onclick = reloadLayerTree;
+    document.getElementById('layerSelect').onchange = reloadLayerTree;
+    document.getElementById('filePrefix').onchange = reloadLayerTree;
     document.getElementById('btnRefresh').onclick = loadJobs;
     document.getElementById('btnReset').onclick = async () => {
       const ok = confirm('确定要中断并清空所有任务吗？');
@@ -286,6 +683,7 @@
         }
         await r.json().catch(() => null);
         loadJobs();
+        reloadLayerTree();
       } finally {
         btn.disabled = false;
       }
@@ -313,6 +711,7 @@
       pre.textContent = JSON.stringify(await r.json(), null, 2);
     };
     loadJobs();
+    loadLayers();
   </script>
 </body>
 </html>

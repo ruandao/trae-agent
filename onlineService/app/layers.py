@@ -2,12 +2,14 @@
 
 import secrets
 import shutil
+import re
 from datetime import datetime
 from pathlib import Path
 
 from .paths import layers_root
 
 _SKIP_NAMES = {".git", "__pycache__", ".DS_Store"}
+_LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 
 
 def new_layer_id() -> str:
@@ -46,3 +48,30 @@ def create_stacked_layer(layer_id: str, parent_layer_path: Path) -> Path:
         except OSError:
             continue
     return child.resolve()
+
+
+def cleanup_layers() -> dict[str, int]:
+    """Delete writable layer directories created for jobs.
+
+    Safety: only delete directories whose name matches `layer_id` format.
+    """
+    root = layers_root()
+    removed = 0
+    skipped = 0
+
+    if not root.is_dir():
+        return {"removed": 0, "skipped": 0}
+
+    for p in root.iterdir():
+        try:
+            if not p.is_dir():
+                continue
+            if not _LAYER_ID_RE.match(p.name):
+                skipped += 1
+                continue
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+        except OSError:
+            skipped += 1
+
+    return {"removed": removed, "skipped": skipped}

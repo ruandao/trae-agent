@@ -13,7 +13,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .hub import hub
-from .layers import create_root_layer, create_stacked_layer, new_layer_id
+from .layers import cleanup_layers, create_root_layer, create_stacked_layer, new_layer_id
 from .paths import config_file_path, jobs_state_path, venv_activate_path
 
 
@@ -237,12 +237,16 @@ class JobStore:
             except PermissionError:
                 proc.terminate()
 
+        # 清理磁盘上的可写层（防止 reset 后 layers 仍残留）
+        layers_stat = cleanup_layers()
+
         await self._save()
         await hub.publish({"type": "jobs_reset"})
         return {
             "jobs_cleared": len(all_job_ids),
             "running_interrupted": len(running_items),
             "runner_tasks_cancelled": len(runner_items),
+            "layers_removed": layers_stat.get("removed", 0),
         }
 
 
