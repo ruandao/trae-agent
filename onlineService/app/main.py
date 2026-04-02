@@ -135,6 +135,11 @@ async def interrupt_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     return {"job_id": job_id, "status": "interrupt_requested"}
 
 
+@app.post("/api/jobs/reset")
+async def reset_jobs(_: AuthDep) -> dict[str, Any]:
+    return await store.reset_all()
+
+
 @app.get("/api/events/stream")
 async def events_stream(
     access_token: Annotated[str | None, Query(alias="access_token")] = None,

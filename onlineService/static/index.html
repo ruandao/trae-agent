@@ -137,6 +137,8 @@
     <section>
       <h2>任务列表</h2>
       <button type="button" class="secondary" id="btnRefresh">刷新</button>
+      <button type="button" class="danger" id="btnReset">重置（中断并清空）</button>
+      <div class="err-msg" id="resetErr"></div>
       <div id="jobs"></div>
     </section>
     <section>
@@ -182,7 +184,7 @@
         } else {
           sseAppend(ev.data.slice(0, 200));
         }
-        if (o.type === 'job_finished' || o.type === 'job_created') loadJobs();
+        if (o.type === 'job_finished' || o.type === 'job_created' || o.type === 'jobs_reset') loadJobs();
       } catch (_) {
         sseAppend(ev.data.slice(0, 120));
       }
@@ -270,6 +272,24 @@
         .replace(/>/g, '&gt;');
     }
     document.getElementById('btnRefresh').onclick = loadJobs;
+    document.getElementById('btnReset').onclick = async () => {
+      const ok = confirm('确定要中断并清空所有任务吗？');
+      if (!ok) return;
+      document.getElementById('resetErr').textContent = '';
+      const btn = document.getElementById('btnReset');
+      btn.disabled = true;
+      try {
+        const r = await api('/api/jobs/reset', { method: 'POST' });
+        if (!r.ok) {
+          document.getElementById('resetErr').textContent = await r.text();
+          return;
+        }
+        await r.json().catch(() => null);
+        loadJobs();
+      } finally {
+        btn.disabled = false;
+      }
+    };
     document.getElementById('btnRun').onclick = async () => {
       document.getElementById('jobErr').textContent = '';
       const command = document.getElementById('cmd').value.trim();

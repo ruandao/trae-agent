@@ -42,6 +42,7 @@ class JobStore:
         self._jobs: dict[str, JobRecord] = {}
         self._lock = asyncio.Lock()
         self._running: dict[str, asyncio.subprocess.Process] = {}
+        self._runner_tasks: dict[str, asyncio.Task[None]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -108,7 +109,9 @@ class JobStore:
             self._jobs[jid] = rec
         await self._save()
         await hub.publish({"type": "job_created", "job": rec.to_dict()})
-        asyncio.create_task(self._run_job(jid))
+        task = asyncio.create_task(self._run_job(jid))
+        self._runner_tasks[jid] = task
+        task.add_done_callback(lambda _t, job_id=jid: self._runner_tasks.pop(job_id, None))
         return rec
 
     async def _run_job(self, job_id: str) -> None:
@@ -202,6 +205,45 @@ class JobStore:
             proc.terminate()
         await hub.publish({"type": "job_interrupt_requested", "job_id": job_id})
         return True
+
+    async def reset_all(self) -> dict[str, Any]:
+        """中断所有任务并清空任务列表。"""
+        async with self._lock:
+            all_job_ids = list(self._jobs.keys())
+            running_items = list(self._running.items())
+            runner_items = list(self._runner_tasks.items())
+
+            # 让后续 job_finished 事件能反映“中断”
+            for jid in all_job_ids:
+                rec = self._jobs.get(jid)
+                if rec and rec.status in ("pending", "running"):
+                    rec.status = "interrupted"
+
+            # 清空内存状态，确保 /api/jobs 立刻变空
+            self._jobs.clear()
+            self._running.clear()
+            self._runner_tasks.clear()
+
+        # 取消所有 runner task（阻止未生成进程的任务启动）
+        for _jid, task in runner_items:
+            task.cancel()
+
+        # 终止所有运行中的进程组
+        for _jid, proc in running_items:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                proc.terminate()
+
+        await self._save()
+        await hub.publish({"type": "jobs_reset"})
+        return {
+            "jobs_cleared": len(all_job_ids),
+            "running_interrupted": len(running_items),
+            "runner_tasks_cancelled": len(runner_items),
+        }
 
 
 store = JobStore()

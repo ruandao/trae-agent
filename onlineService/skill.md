@@ -42,11 +42,12 @@
 - `GET /api/jobs/{job_id}` — 单条任务详情。  
 - `GET /api/jobs/{job_id}/parent` — 查看**上一层指令任务**（父任务完整记录；根任务返回 `parent: null`）。  
 - `POST /api/jobs/{job_id}/interrupt` — 对运行中任务发送 `SIGTERM`（进程组）。
+- `POST /api/jobs/reset` — 中断所有运行中/待开始任务，并清空任务列表（包含落盘的 `onlineService/runtime/jobs_state.json`）。
 
 ### 实时事件（SSE）
 
 - `GET /api/events/stream?access_token=<ACCESS_TOKEN>`  
-  - `text/event-stream`，JSON 行事件，主要 `type`：`connected`、`job_created`、`job_started`、`job_output`、`job_finished`、`job_interrupt_requested`。  
+  - `text/event-stream`，JSON 行事件，主要 `type`：`connected`、`job_created`、`job_started`、`job_output`、`job_finished`、`job_interrupt_requested`、`jobs_reset`。  
   - 浏览器 `EventSource` 无法自定义 Header，因此**必须**使用查询参数传递令牌。  
   - 约 30s 无事件会发送注释行 `: ping` 作为保活。
 
