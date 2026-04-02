@@ -1,0 +1,207 @@
+"""Job registry, persistence, and trae-cli subprocess execution."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shlex
+import signal
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
+from uuid import uuid4
+
+from .hub import hub
+from .layers import create_root_layer, create_stacked_layer, new_layer_id
+from .paths import config_file_path, jobs_state_path, venv_activate_path
+
+
+JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
+
+
+@dataclass
+class JobRecord:
+    id: str
+    layer_id: str
+    layer_path: str
+    command: str
+    parent_job_id: str | None
+    status: JobStatus
+    created_at: str
+    exit_code: int | None = None
+    output: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        return d
+
+
+class JobStore:
+    def __init__(self) -> None:
+        self._jobs: dict[str, JobRecord] = {}
+        self._lock = asyncio.Lock()
+        self._running: dict[str, asyncio.subprocess.Process] = {}
+        self._load()
+
+    def _load(self) -> None:
+        p = jobs_state_path()
+        if not p.exists():
+            return
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            for row in data.get("jobs", []):
+                rec = JobRecord(**row)
+                if rec.status == "running":
+                    rec.status = "interrupted"
+                self._jobs[rec.id] = rec
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+
+    def _save_sync(self) -> None:
+        p = jobs_state_path()
+        payload = {"jobs": [j.to_dict() for j in self._jobs.values()]}
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    async def _save(self) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._save_sync)
+
+    def get(self, job_id: str) -> JobRecord | None:
+        return self._jobs.get(job_id)
+
+    def list_jobs(self) -> list[JobRecord]:
+        return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+
+    async def create_job(self, command: str, parent_job_id: str | None) -> JobRecord:
+        from datetime import datetime
+
+        cfg = config_file_path()
+        if not cfg.is_file():
+            raise FileNotFoundError(
+                f"Config missing: {cfg}. Push config via POST /api/config first."
+            )
+        act = venv_activate_path()
+        if not act.is_file():
+            raise FileNotFoundError(f"venv activate script not found: {act}")
+
+        layer_id = new_layer_id()
+        if parent_job_id:
+            parent_rec = self._jobs.get(parent_job_id)
+            if not parent_rec:
+                raise ValueError(f"parent_job_id not found: {parent_job_id}")
+            lp = create_stacked_layer(layer_id, Path(parent_rec.layer_path))
+        else:
+            lp = create_root_layer(layer_id)
+
+        jid = str(uuid4())
+        rec = JobRecord(
+            id=jid,
+            layer_id=layer_id,
+            layer_path=str(lp),
+            command=command,
+            parent_job_id=parent_job_id,
+            status="pending",
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        async with self._lock:
+            self._jobs[jid] = rec
+        await self._save()
+        await hub.publish({"type": "job_created", "job": rec.to_dict()})
+        asyncio.create_task(self._run_job(jid))
+        return rec
+
+    async def _run_job(self, job_id: str) -> None:
+        rec = self._jobs.get(job_id)
+        if not rec:
+            return
+        cfg = config_file_path()
+        act = venv_activate_path()
+        work = rec.layer_path
+        script = (
+            f"source {shlex.quote(str(act))} && "
+            f"trae-cli run {shlex.quote(rec.command)} "
+            f"--config-file={shlex.quote(str(cfg))} "
+            f"--working-dir={shlex.quote(work)}"
+        )
+        cmd = ["bash", "-lc", script]
+
+        rec.status = "running"
+        rec.output = ""
+        await self._save()
+        await hub.publish({"type": "job_started", "job_id": job_id})
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=work,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                start_new_session=True,
+            )
+        except Exception as e:
+            rec.status = "failed"
+            rec.output = f"spawn error: {e}\n"
+            rec.exit_code = -1
+            await self._save()
+            await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
+            return
+
+        self._running[job_id] = proc
+        assert proc.stdout is not None
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace")
+                rec.output += text
+                await hub.publish(
+                    {
+                        "type": "job_output",
+                        "job_id": job_id,
+                        "chunk": text,
+                    }
+                )
+            code = await proc.wait()
+            rec.exit_code = code
+            if job_id in self._running:
+                del self._running[job_id]
+            if rec.status == "running":
+                if code is not None and code < 0:
+                    rec.status = "interrupted"
+                elif code == 0:
+                    rec.status = "completed"
+                else:
+                    rec.status = "failed"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            rec.status = "failed"
+            rec.output += f"\n[runner error] {e}\n"
+            rec.exit_code = rec.exit_code if rec.exit_code is not None else -1
+        finally:
+            if job_id in self._running:
+                del self._running[job_id]
+            await self._save()
+            await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
+
+    async def interrupt(self, job_id: str) -> bool:
+        rec = self._jobs.get(job_id)
+        if not rec or rec.status != "running":
+            return False
+        proc = self._running.get(job_id)
+        if not proc:
+            return False
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            proc.terminate()
+        await hub.publish({"type": "job_interrupt_requested", "job_id": job_id})
+        return True
+
+
+store = JobStore()

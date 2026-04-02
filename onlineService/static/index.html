@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trae Online Service</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d8bfd;
+      --ok: #3ecf8e;
+      --warn: #f0c14b;
+      --err: #f87171;
+      --border: #2d3a4d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    h1 { font-size: 1.15rem; font-weight: 600; margin: 0; }
+    main { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+    h2 { font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0 0 0.75rem; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.35rem; }
+    input[type="text"], textarea, select {
+      width: 100%;
+      padding: 0.5rem 0.65rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+    textarea { min-height: 120px; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 0.45rem 1rem;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      cursor: pointer;
+      margin-right: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    button.secondary { background: #334155; }
+    button.danger { background: var(--err); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
+    .row > div { flex: 1; min-width: 200px; }
+    .status { font-size: 0.8rem; }
+    .status.running { color: var(--warn); }
+    .status.completed { color: var(--ok); }
+    .status.failed, .status.interrupted { color: var(--err); }
+    pre.out {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem;
+      overflow: auto;
+      max-height: 220px;
+      font-size: 0.75rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .job-card { border-top: 1px solid var(--border); padding-top: 0.75rem; margin-top: 0.75rem; }
+    .job-card:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+    .meta { font-size: 0.78rem; color: var(--muted); }
+    #sseLog {
+      font-family: ui-monospace, monospace;
+      font-size: 0.72rem;
+      max-height: 140px;
+      overflow: auto;
+      background: var(--bg);
+      padding: 0.5rem;
+      border-radius: 6px;
+    }
+    .err-msg { color: var(--err); font-size: 0.85rem; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Trae Online Service</h1>
+    <p class="meta" style="margin:0.35rem 0 0">控制台 · 路径中的 AccessToken 已校验</p>
+  </header>
+  <main>
+    <section>
+      <h2>SSE 实时事件</h2>
+      <p class="meta">订阅 <code>/api/events/stream?access_token=…</code></p>
+      <div id="sseLog"></div>
+    </section>
+    <section>
+      <h2>推送配置</h2>
+      <p class="meta">写入 <code>onlineService/runtime/service_config.yaml</code></p>
+      <label for="cfgYaml">YAML 内容</label>
+      <textarea id="cfgYaml" placeholder="粘贴 service 配置…"></textarea>
+      <button type="button" id="btnPushCfg">上传配置</button>
+      <button type="button" class="secondary" id="btnPullCfg">拉取当前配置</button>
+      <div class="err-msg" id="cfgErr"></div>
+    </section>
+    <section>
+      <h2>新建任务</h2>
+      <div class="row">
+        <div>
+          <label for="cmd">指令（trae-cli run）</label>
+          <input type="text" id="cmd" placeholder="例如：列出当前目录" />
+        </div>
+        <div>
+          <label for="parentId">父任务 ID（可选，叠加可写层）</label>
+          <input type="text" id="parentId" placeholder="留空为根层" />
+        </div>
+      </div>
+      <button type="button" id="btnRun">提交执行</button>
+      <div class="err-msg" id="jobErr"></div>
+    </section>
+    <section>
+      <h2>任务列表</h2>
+      <button type="button" class="secondary" id="btnRefresh">刷新</button>
+      <div id="jobs"></div>
+    </section>
+    <section>
+      <h2>查询父节点</h2>
+      <div class="row">
+        <div>
+          <label for="lookupJob">任务 ID</label>
+          <input type="text" id="lookupJob" />
+        </div>
+      </div>
+      <button type="button" id="btnParent">查询上一层指令</button>
+      <pre class="out" id="parentOut" style="max-height: 320px">{}</pre>
+    </section>
+  </main>
+  <script>
+    const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
+    const api = (path, opts = {}) => {
+      const u = new URL(path, location.origin);
+      u.searchParams.set('access_token', ACCESS_TOKEN);
+      return fetch(u.toString(), {
+        ...opts,
+        headers: {
+          'X-Access-Token': ACCESS_TOKEN,
+          ...(opts.headers || {}),
+        },
+      });
+    };
+    const logEl = document.getElementById('sseLog');
+    function sseAppend(line) {
+      const t = document.createElement('div');
+      t.textContent = new Date().toISOString().slice(11, 19) + ' ' + line;
+      logEl.appendChild(t);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const es = new EventSource(
+      '/api/events/stream?access_token=' + encodeURIComponent(ACCESS_TOKEN)
+    );
+    es.onmessage = (ev) => {
+      try {
+        const o = JSON.parse(ev.data);
+        if (o.type === 'job_output') {
+          sseAppend('output ' + o.job_id.slice(0, 8) + '…');
+        } else {
+          sseAppend(ev.data.slice(0, 200));
+        }
+        if (o.type === 'job_finished' || o.type === 'job_created') loadJobs();
+      } catch (_) {
+        sseAppend(ev.data.slice(0, 120));
+      }
+    };
+    es.onerror = () => sseAppend('[SSE error / reconnecting]');
+
+    document.getElementById('btnPushCfg').onclick = async () => {
+      document.getElementById('cfgErr').textContent = '';
+      const yaml = document.getElementById('cfgYaml').value;
+      const fd = new FormData();
+      fd.append('file', new Blob([yaml], { type: 'text/yaml' }), 'service_config.yaml');
+      const u = new URL('/api/config', location.origin);
+      u.searchParams.set('access_token', ACCESS_TOKEN);
+      const r = await fetch(u, { method: 'POST', body: fd, headers: { 'X-Access-Token': ACCESS_TOKEN } });
+      if (!r.ok) {
+        document.getElementById('cfgErr').textContent = await r.text();
+        return;
+      }
+      alert('配置已保存');
+    };
+    document.getElementById('btnPullCfg').onclick = async () => {
+      document.getElementById('cfgErr').textContent = '';
+      const r = await api('/api/config');
+      if (!r.ok) {
+        document.getElementById('cfgErr').textContent = await r.text();
+        return;
+      }
+      const j = await r.json();
+      document.getElementById('cfgYaml').value = j.yaml || '';
+    };
+
+    async function loadJobs() {
+      const r = await api('/api/jobs');
+      const box = document.getElementById('jobs');
+      if (!r.ok) {
+        box.innerHTML = '<p class="err-msg">' + (await r.text()) + '</p>';
+        return;
+      }
+      const { jobs } = await r.json();
+      box.innerHTML = jobs
+        .map(
+          (j) => `
+        <div class="job-card" data-id="${j.id}">
+          <div class="meta">层: ${j.layer_id} · ${j.created_at}</div>
+          <div><strong>${escapeHtml(j.command)}</strong></div>
+          <div class="status ${j.status}">${j.status} ${j.exit_code != null ? '(exit ' + j.exit_code + ')' : ''}</div>
+          <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}</div>
+          <pre class="out">${escapeHtml(j.output || '')}</pre>
+          <button class="danger" data-interrupt="${j.id}" ${j.status !== 'running' ? 'disabled' : ''}>中断</button>
+        </div>`
+        )
+        .join('');
+      box.querySelectorAll('[data-interrupt]').forEach((btn) => {
+        btn.onclick = async () => {
+          const id = btn.getAttribute('data-interrupt');
+          await api('/api/jobs/' + id + '/interrupt', { method: 'POST' });
+          loadJobs();
+        };
+      });
+    }
+    function escapeHtml(s) {
+      return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+    document.getElementById('btnRefresh').onclick = loadJobs;
+    document.getElementById('btnRun').onclick = async () => {
+      document.getElementById('jobErr').textContent = '';
+      const command = document.getElementById('cmd').value.trim();
+      const parent_job_id = document.getElementById('parentId').value.trim() || null;
+      const r = await api('/api/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command, parent_job_id }),
+      });
+      if (!r.ok) {
+        document.getElementById('jobErr').textContent = await r.text();
+        return;
+      }
+      document.getElementById('cmd').value = '';
+      loadJobs();
+    };
+    document.getElementById('btnParent').onclick = async () => {
+      const id = document.getElementById('lookupJob').value.trim();
+      const r = await api('/api/jobs/' + encodeURIComponent(id) + '/parent');
+      const pre = document.getElementById('parentOut');
+      pre.textContent = JSON.stringify(await r.json(), null, 2);
+    };
+    loadJobs();
+  </script>
+</body>
+</html>

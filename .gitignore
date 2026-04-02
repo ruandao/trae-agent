@@ -176,7 +176,6 @@ cython_debug/
 trae-config-local.json
 trae_config.json
 trae_config.yaml
-onlineService/runtime/service_config.yaml
 
 # Trajectories
 /trajectories/
@@ -187,3 +186,5 @@ onlineService/runtime/service_config.yaml
 
 # Patch selection python binary
 py312/
+
+onlineProject
