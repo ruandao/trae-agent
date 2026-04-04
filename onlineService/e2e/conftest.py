@@ -40,6 +40,39 @@ def require_task_gate_endpoint() -> None:
         pytest.skip(f"无法连接 {TRAE_UI_BASE}：{e}")
 
 
+@pytest.fixture(scope="module", autouse=True)
+def require_redo_endpoint() -> None:
+    """若服务无 POST /api/jobs/{id}/redo，跳过依赖该能力的用例。"""
+    url = (
+        f"{TRAE_UI_BASE.rstrip('/')}/api/jobs/"
+        "00000000-0000-0000-0000-000000000000/redo"
+        f"?access_token={urllib.parse.quote(ACCESS_TOKEN)}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"X-Access-Token": ACCESS_TOKEN},
+        method="POST",
+        data=b"",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if resp.status == 404:
+                pytest.skip(
+                    "POST /api/jobs/…/redo 为 404：请用当前仓库代码重启 onlineService。"
+                )
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            pytest.skip(
+                "POST /api/jobs/…/redo 为 404：请用当前仓库代码重启 onlineService。"
+            )
+        if e.code == 400:
+            # 预期：占位 UUID 无对应任务
+            return
+        raise
+    except OSError as e:
+        pytest.skip(f"无法连接 {TRAE_UI_BASE}：{e}")
+
+
 @pytest.fixture(scope="session")
 def playwright_instance() -> Playwright:
     with sync_playwright() as p:

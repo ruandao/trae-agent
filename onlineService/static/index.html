@@ -505,7 +505,7 @@
         } else {
           sseAppend(ev.data.slice(0, 200));
         }
-        if (o.type === 'job_finished' || o.type === 'job_created') loadJobs();
+        if (o.type === 'job_finished' || o.type === 'job_created' || o.type === 'job_redone') loadJobs();
         if (o.type === 'jobs_reset') {
           resetCloneSectionUi();
           loadJobs();
@@ -740,6 +740,7 @@
           <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}${j.git_branch ? ' · 分支: ' + escapeHtml(j.git_branch) : ''}</div>
           <div class="job-log-actions">
             <button type="button" class="secondary copy-job-log" data-copy-log="${j.id}">复制日志</button>
+            <button type="button" data-redo="${j.id}">重新执行</button>
           </div>
           <pre class="out">${escapeHtml(j.output || '')}</pre>
           <button class="danger" data-interrupt="${j.id}" ${j.status !== 'running' ? 'disabled' : ''}>中断</button>
@@ -767,6 +768,34 @@
             }, 1600);
           } catch (e) {
             alert('复制失败：' + (e && e.message ? e.message : String(e)));
+          }
+        };
+      });
+      box.querySelectorAll('[data-redo]').forEach((btn) => {
+        btn.onclick = async () => {
+          const id = btn.getAttribute('data-redo');
+          const label = btn.textContent;
+          btn.disabled = true;
+          try {
+            const r = await api('/api/jobs/' + encodeURIComponent(id) + '/redo', {
+              method: 'POST',
+            });
+            if (!r.ok) {
+              const t = await r.text();
+              let msg = t;
+              try {
+                const j = JSON.parse(t);
+                if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+              } catch (_) {}
+              alert('重新执行失败：' + msg);
+              return;
+            }
+            await loadJobs();
+          } catch (e) {
+            alert('重新执行失败：' + (e && e.message ? e.message : String(e)));
+          } finally {
+            btn.disabled = false;
+            btn.textContent = label;
           }
         };
       });

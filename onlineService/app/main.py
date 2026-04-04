@@ -226,6 +226,15 @@ async def interrupt_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     return {"job_id": job_id, "status": "interrupt_requested"}
 
 
+@app.post("/api/jobs/{job_id}/redo")
+async def redo_job(_: AuthDep, job_id: str) -> dict[str, Any]:
+    try:
+        rec = await store.redo_job(job_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return rec.to_dict()
+
+
 @app.post("/api/jobs/reset")
 async def reset_jobs(_: AuthDep) -> dict[str, Any]:
     return await store.reset_all()

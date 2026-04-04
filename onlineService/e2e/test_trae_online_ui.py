@@ -11,6 +11,9 @@ Playwright 核验：http://127.0.0.1:8765/ui/dev-local-token
   cd /path/to/trae-agent && pytest onlineService/e2e/test_trae_online_ui.py -v --tb=short
 
 说明：每个测试前都会点击「重置」并确认对话框（与页面行为一致）。
+
+「重新执行」用例（test_redo_button）会提交真实 trae-cli 任务；若长时间处于 running，
+会在最多约 3 分钟内尝试「中断」后再点「重新执行」，总时长可能达数分钟，视本机 LLM 与任务而定。
 """
 
 from __future__ import annotations
@@ -85,3 +88,52 @@ def test_shallow_clone_somanyad_unlocks_new_task_and_gate_api(page: Page) -> Non
         ACCESS_TOKEN,
     )
     assert res.get("clone_done") is True
+
+
+def test_redo_button(page: Page) -> None:
+    """克隆后提交任务；必要时先中断，再点「重新执行」应 POST /redo 成功并回到 pending/running。"""
+    page.locator("#cloneUrl").fill(TEST_REPO)
+    page.locator("#cloneDepth").fill("1")
+    page.locator("#btnClone").click()
+
+    expect(page.locator("#btnClone")).to_be_enabled(timeout=300_000)
+    expect(page.locator("#cloneErr")).to_have_text("", timeout=10_000)
+    expect(page.locator("#btnRun")).to_be_enabled(timeout=60_000)
+
+    page.locator("#cmd").fill("e2e：重新执行烟测")
+    page.locator("#btnRun").click()
+
+    card = page.locator(".job-card").first
+    expect(card).to_be_visible(timeout=30_000)
+
+    # 等到非 pending（running 或已结束），最长约 5 分钟
+    page.wait_for_function(
+        """() => {
+          const st = document.querySelector('.job-card .status');
+          if (!st) return false;
+          const c = st.className || '';
+          return /\\brunning\\b|\\bcompleted\\b|\\bfailed\\b|\\binterrupted\\b/.test(c);
+        }""",
+        timeout=300_000,
+    )
+
+    status = card.locator(".status").first
+    cls = (status.get_attribute("class") or "").lower()
+    if "running" in cls:
+        with page.expect_response(
+            lambda r: r.request.method == "POST" and "/interrupt" in r.url
+        ):
+            card.locator("[data-interrupt]").click()
+        expect(card.locator(".status.interrupted")).to_be_visible(timeout=120_000)
+
+    redo = card.locator("[data-redo]")
+    expect(redo).to_be_visible()
+    with page.expect_response(
+        lambda r: r.request.method == "POST" and "/redo" in r.url
+    ) as redo_info:
+        redo.click()
+    assert redo_info.value.ok, redo_info.value.text()
+
+    expect(
+        card.locator(".status.pending, .status.running")
+    ).to_be_visible(timeout=60_000)

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
 import signal
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ class JobRecord:
     exit_code: int | None = None
     output: str = ""
     git_branch: str | None = None
+    repo_layer_id: str | None = None  # 无父任务时从该层复制工作区
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -56,6 +58,7 @@ class JobStore:
             data = json.loads(p.read_text(encoding="utf-8"))
             for row in data.get("jobs", []):
                 row.setdefault("git_branch", None)
+                row.setdefault("repo_layer_id", None)
                 rec = JobRecord(**row)
                 if rec.status == "running":
                     rec.status = "interrupted"
@@ -129,6 +132,7 @@ class JobStore:
             status="pending",
             created_at=datetime.now().isoformat(timespec="seconds"),
             git_branch=git_branch,
+            repo_layer_id=repo_layer_id if not parent_job_id else None,
         )
         async with self._lock:
             self._jobs[jid] = rec
@@ -248,6 +252,69 @@ class JobStore:
             proc.terminate()
         await hub.publish({"type": "job_interrupt_requested", "job_id": job_id})
         return True
+
+    async def redo_job(self, job_id: str) -> JobRecord:
+        """删除该任务可写层并从创建时的来源重新复制，再执行同一指令。"""
+        async with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                raise ValueError("Job not found")
+            runner_task = self._runner_tasks.get(job_id)
+
+        if rec.status == "running" and runner_task and not runner_task.done():
+            _ = await self.interrupt(job_id)
+        elif rec.status == "pending" and runner_task and not runner_task.done():
+            runner_task.cancel()
+            try:
+                await runner_task
+            except asyncio.CancelledError:
+                pass
+        elif runner_task and not runner_task.done():
+            try:
+                await asyncio.wait_for(runner_task, timeout=120.0)
+            except TimeoutError:
+                runner_task.cancel()
+                try:
+                    await runner_task
+                except asyncio.CancelledError:
+                    pass
+
+        async with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                raise ValueError("Job not found")
+
+            old_path = Path(rec.layer_path)
+            if old_path.is_dir():
+                await asyncio.to_thread(shutil.rmtree, old_path, True)
+
+            new_lid = new_layer_id()
+            if rec.parent_job_id:
+                parent = self._jobs.get(rec.parent_job_id)
+                if not parent:
+                    raise ValueError(f"parent_job_id not found: {rec.parent_job_id}")
+                lp = create_stacked_layer(new_lid, Path(parent.layer_path))
+            elif rec.repo_layer_id:
+                src = layer_path(rec.repo_layer_id)
+                if not src.is_dir():
+                    raise ValueError(f"repo_layer_id not found: {rec.repo_layer_id}")
+                lp = create_stacked_layer(new_lid, src.resolve())
+            else:
+                lp = create_root_layer(new_lid)
+
+            rec.layer_id = new_lid
+            rec.layer_path = str(lp)
+            rec.status = "pending"
+            rec.output = ""
+            rec.exit_code = None
+
+        await self._save()
+        await hub.publish({"type": "job_redone", "job_id": job_id, "job": rec.to_dict()})
+
+        task = asyncio.create_task(self._run_job(job_id))
+        self._runner_tasks[job_id] = task
+        task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
+        return rec
 
     async def reset_all(self) -> dict[str, Any]:
         """中断所有任务并清空任务列表。"""
