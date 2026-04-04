@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import yaml
 
+from trae_agent.tools import tools_registry
 from trae_agent.utils.legacy_config import LegacyConfig
 
 
@@ -158,7 +159,7 @@ class AgentConfig:
     mcp_servers_config: dict[str, MCPServerConfig]
     max_steps: int
     model: ModelConfig
-    tools: list[str]
+    tools_blacklist: list[str]
 
 
 @dataclass
@@ -168,14 +169,7 @@ class TraeAgentConfig(AgentConfig):
     """
 
     enable_lakeview: bool = True
-    tools: list[str] = field(
-        default_factory=lambda: [
-            "bash",
-            "str_replace_based_edit_tool",
-            "sequentialthinking",
-            "task_done",
-        ]
-    )
+    tools_blacklist: list[str] = field(default_factory=list)
 
     def resolve_config_values(
         self,
@@ -290,8 +284,25 @@ class Config:
                     raise ConfigError(f"Model {agent_model_name} not found") from e
                 match agent_name:
                     case "trae_agent":
+                        agent_config_resolved = dict(agent_config)
+                        if "tools" in agent_config_resolved and "tools_blacklist" in agent_config_resolved:
+                            raise ConfigError(
+                                "Specify only one of 'tools' or 'tools_blacklist' in trae_agent config."
+                            )
+                        if "tools" in agent_config_resolved:
+                            allowed = set(agent_config_resolved["tools"])
+                            unknown = allowed - set(tools_registry.keys())
+                            if unknown:
+                                raise ConfigError(
+                                    f"Unknown tools in config: {sorted(unknown)}. "
+                                    f"Valid names: {sorted(tools_registry.keys())}"
+                                )
+                            agent_config_resolved["tools_blacklist"] = [
+                                name for name in tools_registry if name not in allowed
+                            ]
+                            del agent_config_resolved["tools"]
                         trae_agent_config = TraeAgentConfig(
-                            **agent_config,
+                            **agent_config_resolved,
                             mcp_servers_config=mcp_servers_config,
                             allow_mcp_servers=allow_mcp_servers,
                         )

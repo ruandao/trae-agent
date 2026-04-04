@@ -31,6 +31,8 @@ class _BashSession:
         self._started = False
         self._timed_out = False
         self._process: asyncio.subprocess.Process | None = None
+        # Allow timeout to be configured via environment variable
+        self._timeout = float(os.environ.get("TRAE_BASH_TOOL_TIMEOUT", "120.0"))
 
     async def start(self) -> None:
         if self._started:
@@ -186,6 +188,8 @@ class BashTool(Tool):
 * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
 * Please avoid commands that may produce a very large amount of output.
 * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+* Note: Commands have a default timeout of 120 seconds. For long-running git operations (clone, fetch),
+  you may need to set the TRAE_BASH_TOOL_TIMEOUT environment variable to a higher value.
 """
 
     @override

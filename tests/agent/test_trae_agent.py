@@ -61,7 +61,7 @@ class TestTraeAgentExtended(unittest.TestCase):
 
         self.assertEqual(self.agent.project_path, self.test_project_path)
         self.assertEqual(self.agent.must_patch, "true")
-        self.assertEqual(len(self.agent.tools), 4)
+        self.assertEqual(len(self.agent.tools), 6)
         self.assertTrue(any(tool.get_name() == "bash" for tool in self.agent.tools))
 
     @patch("subprocess.check_output")
@@ -98,20 +98,16 @@ class TestTraeAgentExtended(unittest.TestCase):
             self.assertTrue(self.agent._is_task_completed(mock_response))
 
     def test_tool_initialization(self):
-        tools = [
-            "bash",
-            "str_replace_based_edit_tool",
-            "sequentialthinking",
-            "task_done",
-        ]
-        self.agent.new_task("test", {"project_path": self.test_project_path}, tools)
+        self.agent.new_task("test", {"project_path": self.test_project_path})
         tool_names = [tool.get_name() for tool in self.agent.tools]
 
-        self.assertEqual(len(self.agent.tools), len(tools))
+        self.assertEqual(len(self.agent.tools), 6)
         self.assertIn("bash", tool_names)
         self.assertIn("str_replace_based_edit_tool", tool_names)
         self.assertIn("sequentialthinking", tool_names)
         self.assertIn("task_done", tool_names)
+        self.assertIn("json_edit_tool", tool_names)
+        self.assertIn("ckg", tool_names)
 
     def test_protected_attributes_access_restrictions(self):
         """Test that protected attributes cannot be accessed directly from outside the class."""

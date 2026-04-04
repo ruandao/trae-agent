@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .auth import AuthDep
+from .git_clone import clone_into_new_layer
 from .hub import hub
 from .layer_fs import list_layer_children, list_layer_files, list_layers, read_layer_file
 from .jobs import store
@@ -24,6 +25,14 @@ app = FastAPI(title="Trae Online Service", version="1.0.0")
 class JobCreateBody(BaseModel):
     command: str = Field(..., min_length=1)
     parent_job_id: str | None = None
+
+
+class CloneRepoBody(BaseModel):
+    """将远程仓库克隆到新的可写层根目录（空目录内 ``git clone … .``）。"""
+
+    url: str = Field(..., min_length=1, max_length=4096)
+    branch: str | None = None
+    depth: int | None = Field(default=None, ge=1, le=10_000)
 
 
 @app.get("/skill.md", include_in_schema=False)
@@ -80,6 +89,65 @@ async def get_config(_: AuthDep) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="No config pushed yet")
     text = p.read_text(encoding="utf-8")
     return {"path": str(p), "yaml": text}
+
+
+@app.post("/api/repos/clone")
+async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
+    """在新建可写层目录中执行 ``git clone``（需系统已安装 git）。"""
+    async def _publish(ev: dict[str, Any]) -> None:
+        await hub.publish(ev)
+
+    try:
+        layer_id, lp, out, code = await clone_into_new_layer(
+            body.url,
+            branch=body.branch,
+            depth=body.depth,
+            publish=_publish,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if code != 0:
+        await hub.publish(
+            {
+                "type": "repo_clone_finished",
+                "layer_id": layer_id,
+                "layer_path": str(lp),
+                "status": "error",
+                "exit_code": code,
+            }
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "git clone failed",
+                "exit_code": code,
+                "output": out,
+            },
+        )
+    await hub.publish(
+        {
+            "type": "repo_clone_finished",
+            "layer_id": layer_id,
+            "layer_path": str(lp),
+            "status": "ok",
+            "exit_code": code,
+        }
+    )
+    await hub.publish(
+        {
+            "type": "repo_cloned",
+            "layer_id": layer_id,
+            "layer_path": str(lp),
+        }
+    )
+    return {
+        "status": "ok",
+        "layer_id": layer_id,
+        "layer_path": str(lp),
+        "output": out,
+    }
 
 
 @app.post("/api/jobs")

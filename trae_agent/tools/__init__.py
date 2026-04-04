@@ -22,6 +22,7 @@ __all__ = [
     "SequentialThinkingTool",
     "TaskDoneTool",
     "CKGTool",
+    "iter_enabled_builtin_tool_names",
 ]
 
 tools_registry: dict[str, type[Tool]] = {
@@ -32,3 +33,15 @@ tools_registry: dict[str, type[Tool]] = {
     "task_done": TaskDoneTool,
     "ckg": CKGTool,
 }
+
+
+def iter_enabled_builtin_tool_names(tools_blacklist: list[str]) -> list[str]:
+    """Return built-in tool names to load: all registry keys minus ``tools_blacklist`` (order preserved)."""
+    blacklist = set(tools_blacklist)
+    unknown = blacklist - set(tools_registry.keys())
+    if unknown:
+        raise ValueError(
+            f"Unknown tool name(s) in tools_blacklist: {sorted(unknown)}. "
+            f"Valid names: {sorted(tools_registry.keys())}"
+        )
+    return [name for name in tools_registry if name not in blacklist]

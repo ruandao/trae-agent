@@ -146,6 +146,33 @@
       <div class="err-msg" id="cfgErr"></div>
     </section>
     <section>
+      <h2>重置</h2>
+      <p class="meta">中断所有运行中/待执行任务，清空任务列表并删除可写层目录</p>
+      <button type="button" class="danger" id="btnReset">重置（中断并清空）</button>
+      <div class="err-msg" id="resetErr"></div>
+    </section>
+    <section>
+      <h2>克隆仓库</h2>
+      <p class="meta">新建可写层并在该目录执行 <code>git clone … .</code>（服务器需已安装 <code>git</code>）</p>
+      <div class="row">
+        <div>
+          <label for="cloneUrl">仓库 URL</label>
+          <input type="text" id="cloneUrl" placeholder="https://github.com/org/repo.git 或 git@github.com:org/repo.git" />
+        </div>
+        <div>
+          <label for="cloneBranch">分支（可选）</label>
+          <input type="text" id="cloneBranch" placeholder="main" />
+        </div>
+        <div>
+          <label for="cloneDepth">浅克隆 depth（可选）</label>
+          <input type="number" id="cloneDepth" placeholder="例如 1" min="1" max="10000" />
+        </div>
+      </div>
+      <button type="button" id="btnClone">克隆到新建层</button>
+      <div class="err-msg" id="cloneErr"></div>
+      <pre class="out" id="cloneOut" style="max-height: 200px; margin-top: 0.5rem;"></pre>
+    </section>
+    <section>
       <h2>新建任务</h2>
       <div class="row">
         <div>
@@ -165,8 +192,6 @@
     <section>
       <h2>任务列表</h2>
       <button type="button" class="secondary" id="btnRefresh">刷新</button>
-      <button type="button" class="danger" id="btnReset">重置（中断并清空）</button>
-      <div class="err-msg" id="resetErr"></div>
       <div id="jobs"></div>
     </section>
     <section>
@@ -226,6 +251,85 @@
   </main>
   <script>
     const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
+    const CLONE_PERSIST_KEY = 'trae_online_clone_ui_v1';
+    const MAX_CLONE_LOG_CHARS = 480000;
+    let lastCloneForm = { url: '', branch: '', depth: '' };
+    let currentStreamingLayerId = null;
+    let clonePersistDebounce = null;
+
+    function truncateCloneOutput(text) {
+      if (!text || text.length <= MAX_CLONE_LOG_CHARS) return text;
+      return '\n…(日志过长，仅保留末尾)\n' + text.slice(-MAX_CLONE_LOG_CHARS);
+    }
+
+    function saveClonePersistState(payload) {
+      try {
+        sessionStorage.setItem(
+          CLONE_PERSIST_KEY,
+          JSON.stringify({ v: 1, savedAt: Date.now(), ...payload })
+        );
+      } catch (_) {}
+    }
+
+    function readClonePersistState() {
+      try {
+        const raw = sessionStorage.getItem(CLONE_PERSIST_KEY);
+        if (!raw) return null;
+        const o = JSON.parse(raw);
+        if (o.v !== 1) return null;
+        return o;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function clearClonePersistState() {
+      try {
+        sessionStorage.removeItem(CLONE_PERSIST_KEY);
+      } catch (_) {}
+    }
+
+    function snapshotClonePersist(status, extra) {
+      const outEl = document.getElementById('cloneOut');
+      const output = outEl ? truncateCloneOutput(outEl.textContent) : '';
+      saveClonePersistState({
+        layer_id: extra.layer_id,
+        layer_path: extra.layer_path || '',
+        clone_url: lastCloneForm.url || extra.clone_url || '',
+        branch: lastCloneForm.branch || '',
+        depth: lastCloneForm.depth || '',
+        output,
+        status,
+        errorMsg: extra.errorMsg || '',
+      });
+    }
+
+    function applyPersistedCloneUi(p) {
+      if (!p) return;
+      if (p.clone_url) {
+        lastCloneForm = {
+          url: p.clone_url,
+          branch: p.branch != null ? String(p.branch) : '',
+          depth: p.depth != null ? String(p.depth) : '',
+        };
+      }
+      const out = document.getElementById('cloneOut');
+      if (out && typeof p.output === 'string') out.textContent = p.output;
+      const u = document.getElementById('cloneUrl');
+      if (u && p.clone_url) u.value = p.clone_url;
+      const br = document.getElementById('cloneBranch');
+      if (br && p.branch != null) br.value = p.branch;
+      const dep = document.getElementById('cloneDepth');
+      if (dep && p.depth != null && p.depth !== '') dep.value = String(p.depth);
+      const errEl = document.getElementById('cloneErr');
+      if (errEl) {
+        if (p.status === 'error' && p.errorMsg) errEl.textContent = p.errorMsg;
+        else if (p.status === 'running')
+          errEl.textContent = '（上次克隆未结束，日志为刷新前已保存部分）';
+        else errEl.textContent = '';
+      }
+    }
+
     const api = (path, opts = {}) => {
       const u = new URL(path, location.origin);
       u.searchParams.set('access_token', ACCESS_TOKEN);
@@ -244,12 +348,83 @@
       logEl.appendChild(t);
       logEl.scrollTop = logEl.scrollHeight;
     }
+    function appendCloneLog(chunk) {
+      const el = document.getElementById('cloneOut');
+      if (!el) return;
+      el.textContent += chunk;
+      el.scrollTop = el.scrollHeight;
+      if (clonePersistDebounce) clearTimeout(clonePersistDebounce);
+      clonePersistDebounce = setTimeout(() => {
+        clonePersistDebounce = null;
+        if (!currentStreamingLayerId) return;
+        const o = document.getElementById('cloneOut');
+        saveClonePersistState({
+          layer_id: currentStreamingLayerId,
+          clone_url: lastCloneForm.url,
+          branch: lastCloneForm.branch,
+          depth: lastCloneForm.depth,
+          output: o ? truncateCloneOutput(o.textContent) : '',
+          status: 'running',
+        });
+      }, 500);
+    }
     const es = new EventSource(
       '/api/events/stream?access_token=' + encodeURIComponent(ACCESS_TOKEN)
     );
     es.onmessage = (ev) => {
       try {
         const o = JSON.parse(ev.data);
+        if (o.type === 'repo_clone_output') {
+          appendCloneLog(o.chunk || '');
+          return;
+        }
+        if (o.type === 'repo_clone_started') {
+          currentStreamingLayerId = o.layer_id || null;
+          if (o.url) lastCloneForm.url = o.url;
+          const el = document.getElementById('cloneOut');
+          if (el) {
+            el.textContent = '';
+            appendCloneLog(
+              '开始克隆 (第 ' +
+                (o.attempt ?? '?') +
+                '/' +
+                (o.max_attempts ?? '?') +
+                ')\n' +
+                (o.url || '') +
+                '\n\n'
+            );
+          }
+          return;
+        }
+        if (o.type === 'repo_clone_retry') {
+          appendCloneLog('\n━━ ' + (o.message || '重试') + ' ━━\n');
+          return;
+        }
+        if (o.type === 'repo_clone_finished') {
+          currentStreamingLayerId = null;
+          if (o.status === 'ok' && o.layer_id) {
+            snapshotClonePersist('ok', {
+              layer_id: o.layer_id,
+              layer_path: o.layer_path,
+            });
+            loadLayers(o.layer_id).then(() => {
+              const sel = document.getElementById('layerSelect');
+              if (sel && o.layer_id) sel.value = o.layer_id;
+              updateLayerCommandMeta();
+              reloadLayerTree();
+            });
+          } else if (o.status === 'error') {
+            const errEl = document.getElementById('cloneErr');
+            const msg = '克隆失败 (exit ' + (o.exit_code ?? '?') + ')';
+            if (errEl) errEl.textContent = msg;
+            snapshotClonePersist('error', {
+              layer_id: o.layer_id,
+              layer_path: o.layer_path,
+              errorMsg: msg,
+            });
+          }
+          return;
+        }
         if (o.type === 'job_output') {
           sseAppend('output ' + o.job_id.slice(0, 8) + '…');
         } else {
@@ -258,7 +433,9 @@
         if (o.type === 'job_finished' || o.type === 'job_created') loadJobs();
         if (o.type === 'jobs_reset') {
           loadJobs();
+          clearClonePersistState();
           // jobs_reset 后可写层也会被清理，刷新树形 UI
+          loadLayers();
           reloadLayerTree();
         }
       } catch (_) {
@@ -290,6 +467,82 @@
       }
       const j = await r.json();
       document.getElementById('cfgYaml').value = j.yaml || '';
+    };
+
+    document.getElementById('btnClone').onclick = async () => {
+      const errEl = document.getElementById('cloneErr');
+      const outEl = document.getElementById('cloneOut');
+      errEl.textContent = '';
+      outEl.textContent = '';
+      clearClonePersistState();
+      const url = document.getElementById('cloneUrl').value.trim();
+      const branchRaw = document.getElementById('cloneBranch').value.trim();
+      const depthRaw = document.getElementById('cloneDepth').value.trim();
+      lastCloneForm = { url, branch: branchRaw, depth: depthRaw };
+      const body = { url };
+      if (branchRaw) body.branch = branchRaw;
+      if (depthRaw) {
+        const d = parseInt(depthRaw, 10);
+        if (!isFinite(d) || d < 1) {
+          errEl.textContent = 'depth 须为正整数';
+          return;
+        }
+        body.depth = d;
+      }
+      const btn = document.getElementById('btnClone');
+      btn.disabled = true;
+      try {
+        const r = await api('/api/repos/clone', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const text = await r.text();
+        let j = null;
+        try {
+          j = JSON.parse(text);
+        } catch (_) {
+          j = null;
+        }
+        if (!r.ok) {
+          if (j && j.detail) {
+            if (typeof j.detail === 'object' && j.detail.output != null) {
+              errEl.textContent =
+                (j.detail.message || '克隆失败') + ' (exit ' + (j.detail.exit_code ?? '?') + ')';
+              if (!outEl.textContent.trim()) {
+                outEl.textContent = j.detail.output || '';
+              }
+              snapshotClonePersist('error', {
+                layer_id: j.detail.layer_id,
+                errorMsg: errEl.textContent,
+              });
+            } else {
+              errEl.textContent = typeof j.detail === 'string' ? j.detail : text;
+            }
+          } else {
+            errEl.textContent = text || r.statusText;
+          }
+          return;
+        }
+        errEl.textContent = '';
+        currentStreamingLayerId = null;
+        if (j && j.layer_id && !document.getElementById('cloneOut').textContent.trim()) {
+          outEl.textContent = (j && j.output) || '';
+        }
+        if (j && j.layer_id) {
+          snapshotClonePersist('ok', {
+            layer_id: j.layer_id,
+            layer_path: j.layer_path,
+          });
+          await loadLayers(j.layer_id);
+          const sel = document.getElementById('layerSelect');
+          if (sel && j.layer_id) sel.value = j.layer_id;
+          updateLayerCommandMeta();
+          reloadLayerTree();
+        }
+      } finally {
+        btn.disabled = false;
+      }
     };
 
     function fillParentJobSelect(jobs) {
@@ -484,7 +737,7 @@
       return row;
     }
 
-    async function loadLayers() {
+    async function loadLayers(preferredLayerId) {
       const errEl = document.getElementById('layerFilesErr');
       errEl.textContent = '';
       const sel = document.getElementById('layerSelect');
@@ -521,7 +774,14 @@
         if (l.command) opt.dataset.command = l.command;
         sel.appendChild(opt);
       }
-      sel.value = layers[0].layer_id;
+      let pick = layers[0].layer_id;
+      if (
+        preferredLayerId &&
+        layers.some((x) => x.layer_id === preferredLayerId)
+      ) {
+        pick = preferredLayerId;
+      }
+      sel.value = pick;
       updateLayerCommandMeta();
       await reloadLayerTree();
     }
@@ -710,8 +970,11 @@
       const pre = document.getElementById('parentOut');
       pre.textContent = JSON.stringify(await r.json(), null, 2);
     };
+    const __persistedClone = readClonePersistState();
     loadJobs();
-    loadLayers();
+    loadLayers(__persistedClone && __persistedClone.layer_id).then(() => {
+      applyPersistedCloneUi(__persistedClone);
+    });
   </script>
 </body>
 </html>

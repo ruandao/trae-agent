@@ -15,11 +15,9 @@ agents:
         # 在下方 models 中任选其一，将名称填到这里
         model: trae_agent_model
         max_steps: 200
-        tools:
-            - bash
-            - str_replace_based_edit_tool
-            - sequentialthinking
-            - task_done
+        # 内置工具为黑名单模式：列出要从 registry 中排除的名称；默认 [] 表示启用全部内置工具
+        # tools_blacklist:
+        #     - ckg
 allow_mcp_servers:
     - playwright
 mcp_servers:

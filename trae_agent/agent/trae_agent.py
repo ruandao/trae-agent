@@ -12,20 +12,11 @@ from typing import override
 from trae_agent.agent.agent_basics import AgentError, AgentExecution
 from trae_agent.agent.base_agent import BaseAgent
 from trae_agent.prompt.agent_prompt import TRAE_AGENT_SYSTEM_PROMPT
-from trae_agent.tools import tools_registry
+from trae_agent.tools import iter_enabled_builtin_tool_names, tools_registry
 from trae_agent.tools.base import Tool, ToolResult
 from trae_agent.utils.config import MCPServerConfig, TraeAgentConfig
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
 from trae_agent.utils.mcp_client import MCPClient
-
-TraeAgentToolNames = [
-    "str_replace_based_edit_tool",
-    "sequentialthinking",
-    "json_edit_tool",
-    "task_done",
-    "bash",
-]
-
 
 class TraeAgent(BaseAgent):
     """Trae Agent specialized for software engineering tasks."""
@@ -110,7 +101,7 @@ class TraeAgent(BaseAgent):
         self._task: str = task
 
         if tool_names is None and len(self._tools) == 0:
-            tool_names = TraeAgentToolNames
+            tool_names = iter_enabled_builtin_tool_names([])
 
             # Get the model provider from the LLM client
             provider = self._model_config.model_provider.provider
