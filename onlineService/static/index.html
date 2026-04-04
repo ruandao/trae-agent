@@ -423,6 +423,14 @@
       logEl.appendChild(t);
       logEl.scrollTop = logEl.scrollHeight;
     }
+    let _jobOutputListRefreshTimer = null;
+    function scheduleJobsListRefreshDebounced() {
+      if (_jobOutputListRefreshTimer) return;
+      _jobOutputListRefreshTimer = setTimeout(() => {
+        _jobOutputListRefreshTimer = null;
+        loadJobs();
+      }, 200);
+    }
     function appendCloneLog(chunk) {
       const el = document.getElementById('cloneOut');
       if (!el) return;
@@ -500,7 +508,20 @@
           }
           return;
         }
-        if (o.type === 'job_output') {
+        if (o.type === 'job_started') {
+          loadJobs();
+          sseAppend('job_started ' + (o.job_id || '').slice(0, 8) + '…');
+        } else if (o.type === 'job_output') {
+          if (o.chunk && o.job_id) {
+            const card = document.querySelector('.job-card[data-id="' + o.job_id + '"]');
+            const pre = card && card.querySelector('pre.out');
+            if (pre) {
+              pre.textContent += o.chunk;
+              pre.scrollTop = pre.scrollHeight;
+            } else {
+              scheduleJobsListRefreshDebounced();
+            }
+          }
           sseAppend('output ' + o.job_id.slice(0, 8) + '…');
         } else {
           sseAppend(ev.data.slice(0, 200));
