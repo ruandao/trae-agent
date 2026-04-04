@@ -15,7 +15,14 @@ from pydantic import BaseModel, Field
 from .auth import AuthDep
 from .git_clone import clone_into_new_layer
 from .hub import hub
-from .layer_fs import list_layer_children, list_layer_files, list_layers, read_layer_file
+from .layer_fs import (
+    any_layer_has_git_repo,
+    list_layer_children,
+    list_layer_files,
+    list_layers,
+    read_layer_file,
+)
+from .layer_git import list_branches as list_layer_git_branches
 from .jobs import store
 from .paths import config_file_path, service_root
 
@@ -25,6 +32,16 @@ app = FastAPI(title="Trae Online Service", version="1.0.0")
 class JobCreateBody(BaseModel):
     command: str = Field(..., min_length=1)
     parent_job_id: str | None = None
+    repo_layer_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="无父任务时从该层复制工作区（含 .git），用于在已克隆仓库上开任务。",
+    )
+    git_branch: str | None = Field(
+        default=None,
+        max_length=256,
+        description="任务开始前在工作区内执行 git checkout。",
+    )
 
 
 class CloneRepoBody(BaseModel):
@@ -153,7 +170,12 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
 @app.post("/api/jobs")
 async def create_job(_: AuthDep, body: JobCreateBody) -> dict[str, Any]:
     try:
-        rec = await store.create_job(body.command.strip(), body.parent_job_id)
+        rec = await store.create_job(
+            body.command.strip(),
+            body.parent_job_id,
+            repo_layer_id=body.repo_layer_id.strip() if body.repo_layer_id else None,
+            git_branch=body.git_branch.strip() if body.git_branch else None,
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
@@ -243,6 +265,18 @@ async def events_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/layers/{layer_id}/git/branches")
+async def api_layer_git_branches(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """列出该可写层内 git 仓库的分支（需存在 ``.git``）。"""
+    return await list_layer_git_branches(layer_id)
+
+
+@app.get("/api/requirements/task-gate")
+async def api_task_gate(_: AuthDep) -> dict[str, Any]:
+    """新建任务前是否已满足「至少成功克隆过一次」（存在含 ``.git`` 的可写层）。"""
+    return {"clone_done": any_layer_has_git_repo()}
 
 
 @app.get("/api/layers")

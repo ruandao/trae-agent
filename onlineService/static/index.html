@@ -123,6 +123,10 @@
     .tree-children { margin-left: 14px; margin-top: 0.25rem; }
     .tree-more { margin-left: 14px; margin-top: 0.25rem; }
     .tree-path-meta { margin-top: 0.45rem; }
+    section.task-gate-locked > .row,
+    section.task-gate-locked > p.meta {
+      opacity: 0.72;
+    }
   </style>
 </head>
 <body>
@@ -172,8 +176,9 @@
       <div class="err-msg" id="cloneErr"></div>
       <pre class="out" id="cloneOut" style="max-height: 200px; margin-top: 0.5rem;"></pre>
     </section>
-    <section>
+    <section id="newTaskSection">
       <h2>新建任务</h2>
+      <p id="taskGateMsg" class="err-msg" style="display: none; margin: 0 0 0.5rem"></p>
       <div class="row">
         <div>
           <label for="cmd">指令（trae-cli run）</label>
@@ -186,6 +191,21 @@
           </select>
         </div>
       </div>
+      <div class="row" style="margin-top: 0.75rem;">
+        <div id="jobRepoLayerWrap">
+          <label for="jobRepoLayer">工作区来源层（无父任务时从该层复制，含已克隆仓库）</label>
+          <select id="jobRepoLayer" title="选克隆完成的层，或留空表示空目录新层">
+            <option value="">（无）空目录 · 新根层</option>
+          </select>
+        </div>
+        <div>
+          <label for="jobGitBranch">检出分支（可选）</label>
+          <select id="jobGitBranch" title="来自当前选定层的 git 分支列表">
+            <option value="">（不切换分支）</option>
+          </select>
+        </div>
+      </div>
+      <p class="meta" style="margin: 0.35rem 0 0">有父任务时，分支列表来自父任务所在层；无父任务时来自上面「工作区来源层」。</p>
       <button type="button" id="btnRun">提交执行</button>
       <div class="err-msg" id="jobErr"></div>
     </section>
@@ -252,6 +272,7 @@
   <script>
     const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
     const CLONE_PERSIST_KEY = 'trae_online_clone_ui_v1';
+    let lastJobs = [];
     const MAX_CLONE_LOG_CHARS = 480000;
     let lastCloneForm = { url: '', branch: '', depth: '' };
     let currentStreamingLayerId = null;
@@ -287,6 +308,29 @@
       try {
         sessionStorage.removeItem(CLONE_PERSIST_KEY);
       } catch (_) {}
+    }
+
+    /** 重置「克隆仓库」区块：本地缓存、表单、日志与进行中状态（与服务器清空可写层一致） */
+    function resetCloneSectionUi() {
+      clearClonePersistState();
+      lastCloneForm = { url: '', branch: '', depth: '' };
+      currentStreamingLayerId = null;
+      if (clonePersistDebounce) {
+        clearTimeout(clonePersistDebounce);
+        clonePersistDebounce = null;
+      }
+      const u = document.getElementById('cloneUrl');
+      if (u) u.value = '';
+      const br = document.getElementById('cloneBranch');
+      if (br) br.value = '';
+      const dep = document.getElementById('cloneDepth');
+      if (dep) dep.value = '';
+      const out = document.getElementById('cloneOut');
+      if (out) out.textContent = '';
+      const errEl = document.getElementById('cloneErr');
+      if (errEl) errEl.textContent = '';
+      const btn = document.getElementById('btnClone');
+      if (btn) btn.disabled = false;
     }
 
     function snapshotClonePersist(status, extra) {
@@ -341,6 +385,35 @@
         },
       });
     };
+
+    async function applyTaskGate() {
+      const r = await api('/api/requirements/task-gate');
+      let ok = false;
+      if (r.ok) {
+        try {
+          const j = await r.json();
+          ok = !!j.clone_done;
+        } catch (_) {}
+      }
+      const ids = ['cmd', 'parentId', 'jobRepoLayer', 'jobGitBranch', 'btnRun'];
+      for (const id of ids) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !ok;
+      }
+      const msg = document.getElementById('taskGateMsg');
+      if (msg) {
+        if (ok) {
+          msg.style.display = 'none';
+          msg.textContent = '';
+        } else {
+          msg.style.display = 'block';
+          msg.textContent =
+            '请先在上方的「克隆仓库」中成功克隆一个项目后，再新建任务。';
+        }
+      }
+      const sec = document.getElementById('newTaskSection');
+      if (sec) sec.classList.toggle('task-gate-locked', !ok);
+    }
     const logEl = document.getElementById('sseLog');
     function sseAppend(line) {
       const t = document.createElement('div');
@@ -432,8 +505,8 @@
         }
         if (o.type === 'job_finished' || o.type === 'job_created') loadJobs();
         if (o.type === 'jobs_reset') {
+          resetCloneSectionUi();
           loadJobs();
-          clearClonePersistState();
           // jobs_reset 后可写层也会被清理，刷新树形 UI
           loadLayers();
           reloadLayerTree();
@@ -564,15 +637,97 @@
       if (prev && [...sel.options].some((opt) => opt.value === prev)) sel.value = prev;
     }
 
+    function updateJobRepoLayerVisibility() {
+      const wrap = document.getElementById('jobRepoLayerWrap');
+      const sel = document.getElementById('jobRepoLayer');
+      const hasParent = !!document.getElementById('parentId').value.trim();
+      if (wrap) wrap.style.display = hasParent ? 'none' : 'block';
+      if (sel) sel.disabled = hasParent;
+    }
+
+    async function fillJobRepoLayerSelect(preferredLayerId) {
+      const sel = document.getElementById('jobRepoLayer');
+      if (!sel) return;
+      const prev = sel.value;
+      const r = await api('/api/layers');
+      sel.replaceChildren();
+      const empty = document.createElement('option');
+      empty.value = '';
+      empty.textContent = '（空目录）不基于已有层';
+      sel.appendChild(empty);
+      if (!r.ok) return;
+      const j = await r.json();
+      const layers = j.layers || [];
+      for (const l of layers) {
+        const opt = document.createElement('option');
+        opt.value = l.layer_id;
+        const created = l.created_at ? `${l.created_at}` : '';
+        const cmd = l.command ? ` · ${l.command}` : '';
+        const txt = created ? `${l.layer_id} · ${created}${cmd}` : `${l.layer_id}${cmd}`;
+        opt.textContent = txt.length > 120 ? txt.slice(0, 120) + '…' : txt;
+        sel.appendChild(opt);
+      }
+      let pick = '';
+      if (preferredLayerId && layers.some((x) => x.layer_id === preferredLayerId)) {
+        pick = preferredLayerId;
+      } else if (prev && layers.some((x) => x.layer_id === prev)) {
+        pick = prev;
+      }
+      if (pick) sel.value = pick;
+      updateJobRepoLayerVisibility();
+    }
+
+    async function refreshJobBranches() {
+      const branchSel = document.getElementById('jobGitBranch');
+      if (!branchSel) return;
+      const prev = branchSel.value;
+      branchSel.replaceChildren();
+      const def = document.createElement('option');
+      def.value = '';
+      def.textContent = '（不切换分支）';
+      branchSel.appendChild(def);
+
+      const parentId = document.getElementById('parentId').value.trim();
+      let layerId = '';
+      if (parentId) {
+        const pj = lastJobs.find((x) => x.id === parentId);
+        layerId = pj ? pj.layer_id : '';
+      } else {
+        const rs = document.getElementById('jobRepoLayer');
+        layerId = (rs && rs.value) ? rs.value.trim() : '';
+      }
+      if (!layerId) return;
+
+      const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/git/branches');
+      if (!r.ok) return;
+      const data = await r.json();
+      if (!data.is_git) return;
+      const branches = data.branches || [];
+      for (const b of branches) {
+        const o = document.createElement('option');
+        o.value = b;
+        o.textContent = data.current === b ? b + '（当前）' : b;
+        branchSel.appendChild(o);
+      }
+      if (prev && [...branchSel.options].some((opt) => opt.value === prev)) {
+        branchSel.value = prev;
+      }
+    }
+
     async function loadJobs() {
       const r = await api('/api/jobs');
       const box = document.getElementById('jobs');
       if (!r.ok) {
         box.innerHTML = '<p class="err-msg">' + (await r.text()) + '</p>';
+        await applyTaskGate();
         return;
       }
       const { jobs } = await r.json();
+      lastJobs = jobs;
       fillParentJobSelect(jobs);
+      await fillJobRepoLayerSelect();
+      updateJobRepoLayerVisibility();
+      await refreshJobBranches();
       box.innerHTML = jobs
         .map(
           (j) => `
@@ -580,7 +735,7 @@
           <div class="meta">层: ${j.layer_id} · ${j.created_at}</div>
           <div><strong>${escapeHtml(j.command)}</strong></div>
           <div class="status ${j.status}">${j.status} ${j.exit_code != null ? '(exit ' + j.exit_code + ')' : ''}</div>
-          <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}</div>
+          <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}${j.git_branch ? ' · 分支: ' + escapeHtml(j.git_branch) : ''}</div>
           <pre class="out">${escapeHtml(j.output || '')}</pre>
           <button class="danger" data-interrupt="${j.id}" ${j.status !== 'running' ? 'disabled' : ''}>中断</button>
         </div>`
@@ -593,6 +748,7 @@
           loadJobs();
         };
       });
+      await applyTaskGate();
     }
     function escapeHtml(s) {
       return s
@@ -751,6 +907,7 @@
       const r = await api('/api/layers');
       if (!r.ok) {
         errEl.textContent = await r.text();
+        await applyTaskGate();
         return;
       }
       const j = await r.json();
@@ -761,6 +918,9 @@
         opt.textContent = '（无可写层）';
         sel.appendChild(opt);
         updateLayerCommandMeta();
+        await fillJobRepoLayerSelect();
+        await refreshJobBranches();
+        await applyTaskGate();
         return;
       }
 
@@ -783,7 +943,10 @@
       }
       sel.value = pick;
       updateLayerCommandMeta();
+      await fillJobRepoLayerSelect(preferredLayerId);
+      await refreshJobBranches();
       await reloadLayerTree();
+      await applyTaskGate();
     }
 
     async function loadDirPage(dirRelPath, childrenEl, moreEl, offset, append) {
@@ -925,6 +1088,15 @@
       }
     }
 
+    document.getElementById('parentId').onchange = () => {
+      updateJobRepoLayerVisibility();
+      refreshJobBranches();
+    };
+    document.getElementById('jobRepoLayer').onchange = () => {
+      if (!document.getElementById('parentId').value.trim()) {
+        refreshJobBranches();
+      }
+    };
     document.getElementById('btnLoadLayerFiles').onclick = reloadLayerTree;
     document.getElementById('layerSelect').onchange = reloadLayerTree;
     document.getElementById('filePrefix').onchange = reloadLayerTree;
@@ -942,8 +1114,10 @@
           return;
         }
         await r.json().catch(() => null);
-        loadJobs();
-        reloadLayerTree();
+        resetCloneSectionUi();
+        await loadJobs();
+        await loadLayers();
+        await reloadLayerTree();
       } finally {
         btn.disabled = false;
       }
@@ -952,10 +1126,14 @@
       document.getElementById('jobErr').textContent = '';
       const command = document.getElementById('cmd').value.trim();
       const parent_job_id = document.getElementById('parentId').value.trim() || null;
+      const repo_layer_id = parent_job_id
+        ? null
+        : (document.getElementById('jobRepoLayer').value.trim() || null);
+      const git_branch = document.getElementById('jobGitBranch').value.trim() || null;
       const r = await api('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command, parent_job_id }),
+        body: JSON.stringify({ command, parent_job_id, repo_layer_id, git_branch }),
       });
       if (!r.ok) {
         document.getElementById('jobErr').textContent = await r.text();
@@ -971,6 +1149,7 @@
       pre.textContent = JSON.stringify(await r.json(), null, 2);
     };
     const __persistedClone = readClonePersistState();
+    applyTaskGate();
     loadJobs();
     loadLayers(__persistedClone && __persistedClone.layer_id).then(() => {
       applyPersistedCloneUi(__persistedClone);

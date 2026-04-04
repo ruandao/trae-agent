@@ -8,7 +8,8 @@ from pathlib import Path
 
 from .paths import layers_root
 
-_SKIP_NAMES = {".git", "__pycache__", ".DS_Store"}
+# 保留 .git，便于子任务工作区内执行 git checkout / 分支相关操作。
+_SKIP_NAMES = {"__pycache__", ".DS_Store"}
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 
 

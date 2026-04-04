@@ -68,6 +68,20 @@ def list_layers() -> list[dict[str, Any]]:
     return layers
 
 
+def any_layer_has_git_repo() -> bool:
+    """是否存在至少一个可写层根目录下含 ``.git``（通常表示已成功克隆过仓库）。"""
+    for item in list_layers():
+        lid = item.get("layer_id")
+        if not lid:
+            continue
+        try:
+            if (layer_path(lid) / ".git").is_dir():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _validate_safe_rel_posix(rel_posix: str) -> PurePosixPath:
     # Empty is not allowed (must point to something within the layer).
     if not rel_posix:

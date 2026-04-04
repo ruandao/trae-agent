@@ -13,7 +13,9 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .hub import hub
-from .layers import cleanup_layers, create_root_layer, create_stacked_layer, new_layer_id
+from .layer_fs import any_layer_has_git_repo
+from .layer_git import git_checkout
+from .layers import cleanup_layers, create_root_layer, create_stacked_layer, layer_path, new_layer_id
 from .paths import config_file_path, jobs_state_path, venv_activate_path
 
 
@@ -31,6 +33,7 @@ class JobRecord:
     created_at: str
     exit_code: int | None = None
     output: str = ""
+    git_branch: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -52,6 +55,7 @@ class JobStore:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             for row in data.get("jobs", []):
+                row.setdefault("git_branch", None)
                 rec = JobRecord(**row)
                 if rec.status == "running":
                     rec.status = "interrupted"
@@ -74,7 +78,14 @@ class JobStore:
     def list_jobs(self) -> list[JobRecord]:
         return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
 
-    async def create_job(self, command: str, parent_job_id: str | None) -> JobRecord:
+    async def create_job(
+        self,
+        command: str,
+        parent_job_id: str | None,
+        *,
+        repo_layer_id: str | None = None,
+        git_branch: str | None = None,
+    ) -> JobRecord:
         from datetime import datetime
 
         cfg = config_file_path()
@@ -86,12 +97,25 @@ class JobStore:
         if not act.is_file():
             raise FileNotFoundError(f"venv activate script not found: {act}")
 
+        if not any_layer_has_git_repo():
+            raise ValueError("请先完成「克隆仓库」后再创建任务。")
+
+        if parent_job_id and repo_layer_id:
+            raise ValueError("repo_layer_id is only valid when parent_job_id is empty")
+        if git_branch and not parent_job_id and not repo_layer_id:
+            raise ValueError("git_branch requires parent_job_id or repo_layer_id")
+
         layer_id = new_layer_id()
         if parent_job_id:
             parent_rec = self._jobs.get(parent_job_id)
             if not parent_rec:
                 raise ValueError(f"parent_job_id not found: {parent_job_id}")
             lp = create_stacked_layer(layer_id, Path(parent_rec.layer_path))
+        elif repo_layer_id:
+            src = layer_path(repo_layer_id)
+            if not src.is_dir():
+                raise ValueError(f"repo_layer_id not found: {repo_layer_id}")
+            lp = create_stacked_layer(layer_id, src.resolve())
         else:
             lp = create_root_layer(layer_id)
 
@@ -104,6 +128,7 @@ class JobStore:
             parent_job_id=parent_job_id,
             status="pending",
             created_at=datetime.now().isoformat(timespec="seconds"),
+            git_branch=git_branch,
         )
         async with self._lock:
             self._jobs[jid] = rec
@@ -133,6 +158,24 @@ class JobStore:
         rec.output = ""
         await self._save()
         await hub.publish({"type": "job_started", "job_id": job_id})
+
+        if rec.git_branch:
+            co_out, co_code = await git_checkout(Path(rec.layer_path), rec.git_branch)
+            banner = f"[git checkout {rec.git_branch}]\n{co_out}"
+            rec.output += banner
+            await hub.publish(
+                {
+                    "type": "job_output",
+                    "job_id": job_id,
+                    "chunk": banner,
+                }
+            )
+            if co_code != 0:
+                rec.status = "failed"
+                rec.exit_code = co_code
+                await self._save()
+                await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
+                return
 
         try:
             proc = await asyncio.create_subprocess_exec(
