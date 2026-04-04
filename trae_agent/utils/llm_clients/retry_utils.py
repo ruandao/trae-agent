@@ -10,6 +10,24 @@ from typing import Any, Callable, TypeVar
 T = TypeVar("T")
 
 
+def _should_retry_api_error(exc: Exception) -> bool:
+    """Retry only on rate limits and transient server/network failures — not on bad requests."""
+    try:
+        from openai import APIStatusError
+
+        if isinstance(exc, APIStatusError) and exc.status_code is not None:
+            code = exc.status_code
+            if code == 429:
+                return True
+            if code >= 500:
+                return True
+            if 400 <= code < 500:
+                return False
+    except ImportError:
+        pass
+    return True
+
+
 def retry_with(
     func: Callable[..., T],
     provider_name: str = "OpenAI",
@@ -39,6 +57,9 @@ def retry_with(
 
                 if attempt == max_retries:
                     # Last attempt, re-raise the exception
+                    raise
+
+                if not _should_retry_api_error(e):
                     raise
 
                 # Exponential backoff with jitter (cap ~60s) — faster recovery than flat 3–30s random
