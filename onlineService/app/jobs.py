@@ -143,27 +143,37 @@ class JobStore:
         task.add_done_callback(lambda _t, job_id=jid: self._runner_tasks.pop(job_id, None))
         return rec
 
-    async def _run_job(self, job_id: str) -> None:
+    async def _run_job(
+        self,
+        job_id: str,
+        *,
+        run_command: str | None = None,
+        preserve_output: bool = False,
+    ) -> None:
         rec = self._jobs.get(job_id)
         if not rec:
             return
         cfg = config_file_path()
         act = venv_activate_path()
         work = rec.layer_path
+        cmd_text = run_command if run_command is not None else rec.command
         script = (
             f"source {shlex.quote(str(act))} && "
-            f"trae-cli run {shlex.quote(rec.command)} "
+            f"trae-cli run {shlex.quote(cmd_text)} "
             f"--config-file={shlex.quote(str(cfg))} "
             f"--working-dir={shlex.quote(work)}"
         )
         cmd = ["bash", "-lc", script]
 
         rec.status = "running"
-        rec.output = ""
+        if preserve_output:
+            rec.output += "\n\n--- 继续执行（指令：继续）---\n"
+        else:
+            rec.output = ""
         await self._save()
         await hub.publish({"type": "job_started", "job_id": job_id})
 
-        if rec.git_branch:
+        if rec.git_branch and not preserve_output:
             co_out, co_code = await git_checkout(Path(rec.layer_path), rec.git_branch)
             banner = f"[git checkout {rec.git_branch}]\n{co_out}"
             rec.output += banner
@@ -192,7 +202,8 @@ class JobStore:
             )
         except Exception as e:
             rec.status = "failed"
-            rec.output = f"spawn error: {e}\n"
+            err_line = f"spawn error: {e}\n"
+            rec.output = err_line if not preserve_output else rec.output + err_line
             rec.exit_code = -1
             await self._save()
             await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
@@ -312,6 +323,30 @@ class JobStore:
         await hub.publish({"type": "job_redone", "job_id": job_id, "job": rec.to_dict()})
 
         task = asyncio.create_task(self._run_job(job_id))
+        self._runner_tasks[job_id] = task
+        task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
+        return rec
+
+    async def continue_job(self, job_id: str) -> JobRecord:
+        """在中断状态下保留当前可写层，以指令「继续」重新执行 trae-cli。"""
+        async with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                raise ValueError("Job not found")
+            if rec.status != "interrupted":
+                raise ValueError("Only interrupted jobs can be continued")
+            runner_task = self._runner_tasks.get(job_id)
+            if runner_task and not runner_task.done():
+                raise ValueError("Job runner is still active")
+            rec.status = "pending"
+            rec.exit_code = None
+
+        await self._save()
+        await hub.publish({"type": "job_continued", "job_id": job_id, "job": rec.to_dict()})
+
+        task = asyncio.create_task(
+            self._run_job(job_id, run_command="继续", preserve_output=True)
+        )
         self._runner_tasks[job_id] = task
         task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
         return rec

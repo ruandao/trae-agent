@@ -762,6 +762,11 @@
           <div class="job-log-actions">
             <button type="button" class="secondary copy-job-log" data-copy-log="${j.id}">复制日志</button>
             <button type="button" data-redo="${j.id}">重新执行</button>
+            ${
+              j.status === 'interrupted'
+                ? '<button type="button" data-continue="' + j.id + '">继续</button>'
+                : ''
+            }
           </div>
           <pre class="out">${escapeHtml(j.output || '')}</pre>
           <button class="danger" data-interrupt="${j.id}" ${j.status !== 'running' ? 'disabled' : ''}>中断</button>
@@ -814,6 +819,34 @@
             await loadJobs();
           } catch (e) {
             alert('重新执行失败：' + (e && e.message ? e.message : String(e)));
+          } finally {
+            btn.disabled = false;
+            btn.textContent = label;
+          }
+        };
+      });
+      box.querySelectorAll('[data-continue]').forEach((btn) => {
+        btn.onclick = async () => {
+          const id = btn.getAttribute('data-continue');
+          const label = btn.textContent;
+          btn.disabled = true;
+          try {
+            const r = await api('/api/jobs/' + encodeURIComponent(id) + '/continue', {
+              method: 'POST',
+            });
+            if (!r.ok) {
+              const t = await r.text();
+              let msg = t;
+              try {
+                const j = JSON.parse(t);
+                if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+              } catch (_) {}
+              alert('继续执行失败：' + msg);
+              return;
+            }
+            await loadJobs();
+          } catch (e) {
+            alert('继续执行失败：' + (e && e.message ? e.message : String(e)));
           } finally {
             btn.disabled = false;
             btn.textContent = label;
