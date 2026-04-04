@@ -77,13 +77,11 @@ class TraeAgent(BaseAgent):
                     )
                     # Store client for later cleanup
                     self.mcp_clients.append(mcp_client)
-                except Exception:
-                    # Clean up failed client
+                except asyncio.CancelledError:
                     with contextlib.suppress(Exception):
                         await mcp_client.cleanup(mcp_server_name)
-                    continue
-                except asyncio.CancelledError:
-                    # If the task is cancelled, clean up and skip this server
+                    raise
+                except Exception:
                     with contextlib.suppress(Exception):
                         await mcp_client.cleanup(mcp_server_name)
                     continue

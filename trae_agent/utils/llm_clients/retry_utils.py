@@ -41,12 +41,13 @@ def retry_with(
                     # Last attempt, re-raise the exception
                     raise
 
-                sleep_time = random.randint(3, 30)
+                # Exponential backoff with jitter (cap ~60s) — faster recovery than flat 3–30s random
+                base = min(60.0, float(2**attempt))
+                sleep_time = base + random.uniform(0, min(4.0, base * 0.25))
                 this_error_message = str(e)
                 print(
-                    f"{provider_name} API call failed: {this_error_message}. Will sleep for {sleep_time} seconds and will retry.\n{traceback.format_exc()}"
+                    f"{provider_name} API call failed: {this_error_message}. Will sleep for {sleep_time:.1f} seconds and will retry.\n{traceback.format_exc()}"
                 )
-                # Randomly sleep for 3-30 seconds
                 time.sleep(sleep_time)
 
         # This should never be reached, but just in case

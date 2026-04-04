@@ -3,8 +3,10 @@
 
 """Base Agent class for LLM-based agents."""
 
+import asyncio
 import contextlib
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Union
 
@@ -146,8 +148,6 @@ class BaseAgent(ABC):
 
     async def execute_task(self) -> AgentExecution:
         """Execute a task using the agent."""
-        import time
-
         if self.docker_manager:
             self.docker_manager.start()
 
@@ -181,6 +181,8 @@ class BaseAgent(ABC):
                 execution.agent_state = AgentState.ERROR
 
         except Exception as e:
+            execution.agent_state = AgentState.ERROR
+            execution.success = False
             execution.final_result = f"Agent execution failed: {str(e)}"
 
         finally:
@@ -212,8 +214,10 @@ class BaseAgent(ABC):
         # Display thinking state
         step.state = AgentStepState.THINKING
         self._update_cli_console(step, execution)
-        # Get LLM response
-        llm_response = self._llm_client.chat(messages, self._model_config, self._tools)
+        # Run sync HTTP client off the event loop so MCP / console stay responsive
+        llm_response = await asyncio.to_thread(
+            self._llm_client.chat, messages, self._model_config, self._tools
+        )
         step.llm_response = llm_response
 
         # Display step with LLM response
