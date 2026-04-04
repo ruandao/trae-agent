@@ -4,6 +4,7 @@
 """OpenRouter provider configuration."""
 
 import os
+from typing import override
 
 import openai
 
@@ -53,11 +54,18 @@ class OpenRouterProvider(ProviderConfig):
             "gpt-4",
             "gpt-3.5-turbo",
             "claude-3",
+            "claude-4",
             "claude-2",
             "gemini",
             "mistral",
             "llama-3",
             "command-r",
+            "qwen",
+            "glm",
+            "minimax",
+            "kimi",
+            "moonshotai",
+            "deepseek",
         ]
         return any(pattern in model_name.lower() for pattern in tool_capable_patterns)
 
@@ -72,3 +80,10 @@ class OpenRouterClient(OpenAICompatibleClient):
         ):
             model_config.model_provider.base_url = "https://openrouter.ai/api/v1"
         super().__init__(model_config, OpenRouterProvider())
+
+    @override
+    def supports_tool_calling(self, model_config: ModelConfig) -> bool:
+        """Delegate to provider heuristics; honor explicit opt-out on ModelConfig."""
+        if not model_config.supports_tool_calling:
+            return False
+        return self.provider_config.supports_tool_calling(model_config.model)

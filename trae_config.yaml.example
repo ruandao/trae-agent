@@ -1,6 +1,18 @@
+# 以下模型通过 OpenRouter 统一接入时使用「供应商前缀/模型名」格式（与 https://openrouter.ai/models 页面一致；若某 ID 有更新，请以站点为准）。
+# 常见对应关系：
+#   qwen3.5-plus          -> qwen/qwen3.5-plus（或带日期的快照，如 qwen/qwen3.5-plus-02-15）
+#   qwen3-coder-plus      -> qwen/qwen3-coder-plus
+#   qwen3-coder-next      -> qwen/qwen3-coder-next
+#   qwen3-max-2026-01-23   -> qwen/qwen3-max-2026-01-23（若不存在请改用 qwen/qwen3-max 等当前页列出的 ID）
+#   glm-4.7               -> z-ai/glm-4.7
+#   glm-5                 -> z-ai/glm-5
+#   MiniMax-M2.5          -> minimax/minimax-m2.5
+#   kimi-k2.5             -> moonshotai/kimi-k2.5
+
 agents:
     trae_agent:
         enable_lakeview: true
+        # 在下方 models 中任选其一，将名称填到这里
         model: trae_agent_model
         max_steps: 200
         tools:
@@ -22,6 +34,10 @@ model_providers:
     anthropic:
         api_key: your_anthropic_api_key
         provider: anthropic
+    openrouter:
+        api_key: your_openrouter_api_key
+        provider: openrouter
+        base_url: https://openrouter.ai/api/v1
 
 models:
     trae_agent_model:
@@ -33,10 +49,93 @@ models:
         top_k: 0
         max_retries: 10
         parallel_tool_calls: true
+
     lakeview_model:
         model_provider: anthropic
         model: claude-3.5-sonnet
         max_tokens: 4096
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    # --- OpenRouter：按需将 agents.trae_agent.model 改为下列任一名称 ---
+
+    trae_openrouter_qwen35_plus:
+        model_provider: openrouter
+        model: qwen/qwen3.5-plus
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_qwen3_coder_plus:
+        model_provider: openrouter
+        model: qwen/qwen3-coder-plus
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_qwen3_coder_next:
+        model_provider: openrouter
+        model: qwen/qwen3-coder-next
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_qwen3_max_2026_01_23:
+        model_provider: openrouter
+        model: qwen/qwen3-max-2026-01-23
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_glm_4_7:
+        model_provider: openrouter
+        model: z-ai/glm-4.7
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_glm_5:
+        model_provider: openrouter
+        model: z-ai/glm-5
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_minimax_m2_5:
+        model_provider: openrouter
+        model: minimax/minimax-m2.5
+        max_tokens: 8192
+        temperature: 0.5
+        top_p: 1
+        top_k: 0
+        max_retries: 10
+        parallel_tool_calls: true
+
+    trae_openrouter_kimi_k2_5:
+        model_provider: openrouter
+        model: moonshotai/kimi-k2.5
+        max_tokens: 8192
         temperature: 0.5
         top_p: 1
         top_k: 0
