@@ -84,6 +84,8 @@
     }
     .job-card { border-top: 1px solid var(--border); padding-top: 0.75rem; margin-top: 0.75rem; }
     .job-card:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+    .job-log-actions { margin-top: 0.35rem; }
+    .job-log-actions button { margin-top: 0; }
     .meta { font-size: 0.78rem; color: var(--muted); }
     #sseLog {
       font-family: ui-monospace, monospace;
@@ -736,6 +738,9 @@
           <div><strong>${escapeHtml(j.command)}</strong></div>
           <div class="status ${j.status}">${j.status} ${j.exit_code != null ? '(exit ' + j.exit_code + ')' : ''}</div>
           <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}${j.git_branch ? ' · 分支: ' + escapeHtml(j.git_branch) : ''}</div>
+          <div class="job-log-actions">
+            <button type="button" class="secondary copy-job-log" data-copy-log="${j.id}">复制日志</button>
+          </div>
           <pre class="out">${escapeHtml(j.output || '')}</pre>
           <button class="danger" data-interrupt="${j.id}" ${j.status !== 'running' ? 'disabled' : ''}>中断</button>
         </div>`
@@ -746,6 +751,23 @@
           const id = btn.getAttribute('data-interrupt');
           await api('/api/jobs/' + id + '/interrupt', { method: 'POST' });
           loadJobs();
+        };
+      });
+      box.querySelectorAll('.copy-job-log').forEach((btn) => {
+        btn.onclick = async () => {
+          const id = btn.getAttribute('data-copy-log');
+          const job = lastJobs.find((x) => x.id === id);
+          const text = job != null && job.output != null ? String(job.output) : '';
+          const label = btn.textContent;
+          try {
+            await navigator.clipboard.writeText(text);
+            btn.textContent = '已复制';
+            setTimeout(() => {
+              btn.textContent = label;
+            }, 1600);
+          } catch (e) {
+            alert('复制失败：' + (e && e.message ? e.message : String(e)));
+          }
         };
       });
       await applyTaskGate();
