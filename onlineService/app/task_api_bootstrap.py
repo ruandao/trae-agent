@@ -30,7 +30,13 @@ def _task_api_prefix() -> str | None:
     return f"{base}/api/tenant/{tenant}/workspace/{workspace}/task/{task}/cloud"
 
 
-def _post_json(url: str, body: dict, timeout: float = 120.0) -> dict:
+def _post_json(
+    url: str,
+    body: dict,
+    *,
+    step: str,
+    timeout: float = 5.0,
+) -> dict:
     data = json.dumps(body).encode("utf-8")
     req = Request(
         url,
@@ -41,11 +47,17 @@ def _post_json(url: str, body: dict, timeout: float = 120.0) -> dict:
     try:
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
+    except TimeoutError as e:
+        raise RuntimeError(
+            f"[{step}] 请求超时（{timeout:g}s）: {url}"
+        ) from e
     except HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"请求失败 HTTP {e.code} {url}: {err_body}") from e
+        raise RuntimeError(
+            f"[{step}] 请求失败 HTTP {e.code} {url}: {err_body}"
+        ) from e
     except URLError as e:
-        raise RuntimeError(f"请求失败 {url}: {e}") from e
+        raise RuntimeError(f"[{step}] 请求失败 {url}: {e}") from e
     return json.loads(raw) if raw else {}
 
 
@@ -61,12 +73,20 @@ def bootstrap_container_config() -> None:
             "已配置任务云 API 路径但 ACCESS_TOKEN 为空，无法进行 exchange-refresh"
         )
 
-    ex = _post_json(f"{prefix}/server-container-token/exchange-refresh/", {"access_token": initial})
+    ex = _post_json(
+        f"{prefix}/server-container-token/exchange-refresh/",
+        {"access_token": initial},
+        step="exchange-refresh",
+    )
     refresh_token = ex.get("refresh_token")
     if not refresh_token:
         raise RuntimeError(f"exchange-refresh 响应缺少 refresh_token: {ex!r}")
 
-    ref = _post_json(f"{prefix}/server-container-token/refresh-access/", {"refresh_token": refresh_token})
+    ref = _post_json(
+        f"{prefix}/server-container-token/refresh-access/",
+        {"refresh_token": refresh_token},
+        step="refresh-access",
+    )
     new_access = ref.get("access_token")
     if not new_access:
         raise RuntimeError(f"refresh-access 响应缺少 access_token: {ref!r}")
@@ -76,6 +96,7 @@ def bootstrap_container_config() -> None:
     y = _post_json(
         f"{prefix}/server-container-token/feature-params-yaml/",
         {"access_token": new_access},
+        step="feature-params-yaml",
     )
     yaml_text = y.get("yaml")
     if yaml_text is None:
