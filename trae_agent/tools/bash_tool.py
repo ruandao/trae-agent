@@ -10,6 +10,7 @@
 # This modified file is released under the same license.
 
 import asyncio
+import contextlib
 import os
 from typing import override
 
@@ -63,28 +64,31 @@ class _BashSession:
         self._started = True
 
     async def stop(self) -> None:
-        """Terminate the bash shell."""
-        if not self._started:
-            raise ToolError("Session has not started.")
-        if self._process is None:
+        """Terminate the bash shell and close pipe transports (avoids GC __del__ on a closed loop)."""
+        if not self._started or self._process is None:
             return
-        if self._process.returncode is not None:
-            return
+        proc = self._process
+        self._process = None
+        self._started = False
         try:
-            self._process.terminate()
-
-            # Wait until the process has truly terminated.
-            stdout, stderr = await asyncio.wait_for(self._process.communicate(), timeout=5.0)
-        except asyncio.TimeoutError:
-            self._process.kill()
+            if proc.returncode is None:
+                proc.terminate()
             try:
-                # Set a shorter timeout for the cleanup process
-                stdout, stderr = await asyncio.wait_for(self._process.communicate(), timeout=2.0)
+                await asyncio.wait_for(proc.communicate(), timeout=5.0)
             except asyncio.TimeoutError:
-                # If it still timeout, return None.
-                return None
+                if proc.returncode is None:
+                    proc.kill()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        except (ProcessLookupError, BrokenPipeError, ConnectionResetError):
+            pass
         except Exception:
-            return None
+            pass
+        finally:
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                proc.stdin.close()
+                with contextlib.suppress(Exception):
+                    await proc.stdin.wait_closed()
 
     async def run(self, command: str) -> ToolExecResult:
         """Execute a command in the bash shell."""
@@ -228,6 +232,7 @@ class BashTool(Tool):
                 self._session = _BashSession()
                 await self._session.start()
             except Exception as e:
+                self._session = None
                 return ToolExecResult(error=f"Error starting bash session: {e}", error_code=-1)
 
         command = str(arguments["command"]) if "command" in arguments else None

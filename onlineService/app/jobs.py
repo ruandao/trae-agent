@@ -18,8 +18,15 @@ from uuid import uuid4
 from .hub import hub
 from .layer_fs import any_layer_has_git_repo
 from .layer_git import git_checkout
-from .layers import cleanup_layers, create_root_layer, create_stacked_layer, layer_path, new_layer_id
-from .paths import config_file_path, jobs_state_path, venv_activate_path
+from .layers import (
+    _LAYER_ID_RE,
+    cleanup_layers,
+    create_root_layer,
+    create_stacked_layer,
+    layer_path,
+    new_layer_id,
+)
+from .paths import config_file_path, jobs_state_path, layers_root, venv_activate_path
 
 
 JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
@@ -441,6 +448,64 @@ class JobStore:
             "runner_tasks_cancelled": len(runner_items),
             "layers_removed": layers_stat.get("removed", 0),
         }
+
+    def _child_job_ids(self, job_id: str) -> list[str]:
+        return [j.id for j in self._jobs.values() if j.parent_job_id == job_id]
+
+    def _is_managed_layer_dir(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+            root = layers_root().resolve()
+            if resolved.parent != root:
+                return False
+        except OSError:
+            return False
+        return bool(_LAYER_ID_RE.match(resolved.name))
+
+    async def delete_job(self, job_id: str) -> dict[str, Any]:
+        """从列表中移除任务；若存在则删除其可写层目录。存在子任务时拒绝删除。"""
+        async with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                raise ValueError("Job not found")
+            if self._child_job_ids(job_id):
+                raise ValueError("存在子任务，请先删除子任务后再删除该任务")
+            runner_task = self._runner_tasks.get(job_id)
+
+        if rec.status == "running" and runner_task and not runner_task.done():
+            _ = await self.interrupt(job_id)
+        elif rec.status == "pending" and runner_task and not runner_task.done():
+            runner_task.cancel()
+            try:
+                await runner_task
+            except asyncio.CancelledError:
+                pass
+        elif runner_task and not runner_task.done():
+            try:
+                await asyncio.wait_for(runner_task, timeout=120.0)
+            except TimeoutError:
+                runner_task.cancel()
+                try:
+                    await runner_task
+                except asyncio.CancelledError:
+                    pass
+
+        layer_path_obj = Path(rec.layer_path)
+        async with self._lock:
+            if job_id not in self._jobs:
+                raise ValueError("Job not found")
+            if self._child_job_ids(job_id):
+                raise ValueError("存在子任务，请先删除子任务后再删除该任务")
+            del self._jobs[job_id]
+            self._running.pop(job_id, None)
+            self._runner_tasks.pop(job_id, None)
+
+        if self._is_managed_layer_dir(layer_path_obj) and layer_path_obj.is_dir():
+            await asyncio.to_thread(shutil.rmtree, layer_path_obj, True)
+
+        await self._save()
+        await hub.publish({"type": "job_deleted", "job_id": job_id})
+        return {"job_id": job_id, "status": "deleted"}
 
 
 store = JobStore()

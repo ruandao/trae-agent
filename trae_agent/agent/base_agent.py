@@ -186,11 +186,13 @@ class BaseAgent(ABC):
             execution.final_result = f"Agent execution failed: {str(e)}"
 
         finally:
+            # Must run in finally: KeyboardInterrupt/BaseException skips code after try/finally,
+            # but still executes this block while the event loop is active — avoids asyncio
+            # subprocess transports being garbage-collected after the loop closes.
+            with contextlib.suppress(Exception):
+                await self._close_tools()
             if self.docker_manager and not self.docker_keep:
                 self.docker_manager.stop()
-
-        # Ensure tool resources are released whether an exception occurs or not.
-        await self._close_tools()
 
         execution.execution_time = time.time() - start_time
 

@@ -9,6 +9,7 @@
 """Trajectory recording functionality for Trae Agent."""
 
 import json
+import os
 from dataclasses import is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,57 @@ from typing import Any
 
 from trae_agent.tools.base import ToolCall, ToolResult
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
+
+
+def _truncate_summary_line(text: str, max_len: int = 180) -> str:
+    t = text.strip().replace("\r\n", "\n").replace("\r", "\n")
+    line = t.split("\n", 1)[0].strip()
+    if len(line) > max_len:
+        return line[: max_len - 1] + "…"
+    return line
+
+
+def _tool_call_hint(arguments: object) -> str:
+    if not isinstance(arguments, dict):
+        return ""
+    args = arguments
+    cmd = args.get("command")
+    if cmd is not None and str(cmd).strip():
+        return " " + str(cmd).strip()
+    for key in ("path", "file_path", "file"):
+        v = args.get(key)
+        if v is not None and str(v).strip():
+            base = os.path.basename(str(v).strip()) or str(v).strip()
+            return " " + base
+    return ""
+
+
+def compute_step_delivery_summary(
+    state: str,
+    tool_calls: list[ToolCall] | None,
+    tool_results: list[ToolResult] | None,
+    llm_response: LLMResponse | None,
+    reflection: str | None,
+    error: str | None,
+) -> str:
+    """Human-readable one-line summary of what this step delivered (for UI titles)."""
+    if error:
+        return _truncate_summary_line(f"错误: {error}", 200)
+    if reflection and str(reflection).strip():
+        return _truncate_summary_line(str(reflection).strip(), 200)
+    if tool_calls:
+        parts: list[str] = []
+        for tc in tool_calls:
+            name = tc.name or "tool"
+            hint = _tool_call_hint(tc.arguments)
+            parts.append(f"{name}{hint}".strip())
+        summary = " · ".join(parts)
+        if tool_results and any(not tr.success for tr in tool_results):
+            summary += "（含失败）"
+        return _truncate_summary_line(summary, 220)
+    if llm_response and llm_response.content and str(llm_response.content).strip():
+        return _truncate_summary_line(str(llm_response.content).strip(), 200)
+    return _truncate_summary_line(f"步骤 · {state}", 120) if state else "步骤"
 
 
 class TrajectoryRecorder:
@@ -185,6 +237,14 @@ class TrajectoryRecorder:
             else None,
             "reflection": reflection,
             "error": error,
+            "delivery_summary": compute_step_delivery_summary(
+                state,
+                tool_calls,
+                tool_results,
+                llm_response,
+                reflection,
+                error,
+            ),
         }
 
         self.trajectory_data["agent_steps"].append(step_data)

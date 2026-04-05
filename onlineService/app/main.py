@@ -23,6 +23,7 @@ from .layer_fs import (
     read_layer_file,
 )
 from .layer_git import list_branches as list_layer_git_branches
+from .job_trajectory import load_agent_steps_for_layer
 from .jobs import store
 from .paths import config_file_path, service_root
 
@@ -197,6 +198,19 @@ async def get_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     return rec.to_dict()
 
 
+@app.get("/api/jobs/{job_id}/steps")
+async def job_agent_steps(_: AuthDep, job_id: str) -> dict[str, Any]:
+    """从任务可写层 `.trajectories/trajectory_*.json` 读取最新轨迹中的 ``agent_steps``。"""
+    rec = store.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        payload = load_agent_steps_for_layer(rec.layer_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"job_id": job_id, "layer_id": rec.layer_id, **payload}
+
+
 @app.get("/api/jobs/{job_id}/parent")
 async def get_job_parent(_: AuthDep, job_id: str) -> dict[str, Any]:
     rec = store.get(job_id)
@@ -242,6 +256,17 @@ async def continue_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return rec.to_dict()
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(_: AuthDep, job_id: str) -> dict[str, Any]:
+    try:
+        return await store.delete_job(job_id)
+    except ValueError as e:
+        msg = str(e)
+        if msg == "Job not found":
+            raise HTTPException(status_code=404, detail=msg) from e
+        raise HTTPException(status_code=400, detail=msg) from e
 
 
 @app.post("/api/jobs/reset")
