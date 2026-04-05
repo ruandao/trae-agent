@@ -17,6 +17,18 @@ from typing import override
 from trae_agent.tools.base import Tool, ToolCallArguments, ToolError, ToolExecResult, ToolParameter
 
 
+def _close_reader_transport(reader: asyncio.StreamReader | None) -> None:
+    """Close subprocess stdout/stderr transports while the loop is still running.
+
+    Avoids BaseSubprocessTransport.__del__ scheduling work after the loop has closed.
+    """
+    if reader is None:
+        return
+    transport = getattr(reader, "_transport", None)
+    if transport is not None and not transport.is_closing():
+        transport.close()
+
+
 class _BashSession:
     """A session of a bash shell."""
 
@@ -89,6 +101,11 @@ class _BashSession:
                 proc.stdin.close()
                 with contextlib.suppress(Exception):
                     await proc.stdin.wait_closed()
+            for reader in (proc.stdout, proc.stderr):
+                _close_reader_transport(reader)
+            # Let scheduled transport callbacks run before asyncio.run() tears down the loop.
+            with contextlib.suppress(Exception):
+                await asyncio.sleep(0)
 
     async def run(self, command: str) -> ToolExecResult:
         """Execute a command in the bash shell."""

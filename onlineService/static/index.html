@@ -132,6 +132,36 @@
     .tree-children { margin-left: 14px; margin-top: 0.25rem; }
     .tree-more { margin-left: 14px; margin-top: 0.25rem; }
     .tree-path-meta { margin-top: 0.45rem; }
+    .layer-relation-tree { margin-top: 0.35rem; max-height: 360px; }
+    .layer-relation-tree .tree-node.layer-graph-root > .tree-layer-id { color: var(--ok); }
+    .layer-relation-tree .tree-layer-id { font-weight: 600; }
+    .layer-relation-tree .tree-children {
+      margin-left: 12px;
+      padding-left: 8px;
+      border-left: 1px dashed var(--border);
+    }
+    button.tree-layer-commit {
+      margin-left: 0.45rem;
+      padding: 0.12rem 0.45rem;
+      font-size: 0.72rem;
+      vertical-align: middle;
+      margin-top: 0;
+      margin-right: 0;
+    }
+    .tree-layer-commit-done {
+      margin-left: 0.45rem;
+      color: var(--ok);
+      font-weight: 700;
+      font-size: 0.85rem;
+      user-select: none;
+      display: inline-block;
+      min-width: 1.75rem;
+    }
+    .tree-layer-commit-na {
+      margin-left: 0.45rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
     section.task-gate-locked > .row,
     section.task-gate-locked > p.meta {
       opacity: 0.72;
@@ -302,6 +332,12 @@
           </select>
         </div>
       </div>
+      <div style="margin: 0.85rem 0 0.5rem;">
+        <label>可写层关联（树形）</label>
+        <p class="meta" style="margin: 0.25rem 0 0.35rem;">由工作区 <code>.git</code> 符号链接或任务记录推断父层；点击行可选中下方「选择层」并刷新文件树。每行「提交」会按<strong>关联任务指令</strong>与<strong>暂存区变更</strong>自动生成提交说明，并执行 <code>git add -A</code> / <code>git commit</code>（不 push）。</p>
+        <div id="layerRelationTree" class="tree layer-relation-tree"></div>
+        <p class="meta" id="layerRelationMeta" style="margin-top:0.35rem;"></p>
+      </div>
       <p class="meta" style="margin: 0.35rem 0 0">有父任务时，分支列表来自父任务所在层；无父任务时来自上面「工作区来源层」。</p>
       <button type="button" id="btnRun">提交执行</button>
       <div class="err-msg" id="jobErr"></div>
@@ -370,6 +406,8 @@
     const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
     const CLONE_PERSIST_KEY = 'trae_online_clone_ui_v1';
     let lastJobs = [];
+    /** 丢弃过期的 refreshJobBranches 异步结果，避免并行 loadJobs/loadLayers 等把分支选项追加两遍。 */
+    let _jobBranchRefreshSeq = 0;
     const MAX_CLONE_LOG_CHARS = 480000;
     let lastCloneForm = { url: '', branch: '', depth: '' };
     let currentStreamingLayerId = null;
@@ -1030,9 +1068,11 @@
       }
       if (pick) sel.value = pick;
       updateJobRepoLayerVisibility();
+      renderLayerRelationTree(layers);
     }
 
     async function refreshJobBranches() {
+      const seq = ++_jobBranchRefreshSeq;
       const branchSel = document.getElementById('jobGitBranch');
       if (!branchSel) return;
       const prev = branchSel.value;
@@ -1054,8 +1094,10 @@
       if (!layerId) return;
 
       const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/git/branches');
+      if (seq !== _jobBranchRefreshSeq) return;
       if (!r.ok) return;
       const data = await r.json();
+      if (seq !== _jobBranchRefreshSeq) return;
       if (!data.is_git) return;
       const branches = data.branches || [];
       for (const b of branches) {
@@ -1084,17 +1126,29 @@
       updateJobRepoLayerVisibility();
       await refreshJobBranches();
       box.innerHTML = jobs
-        .map(
-          (j) => `
+        .map((j) => {
+          const gitLock = j.git_destructive_locked === true;
+          const lockTitle = '该可写层在任务开始后已有 git 提交（HEAD 已变化），不可中断、重新执行或删除';
+          const disRedo = gitLock ? 'disabled title="' + lockTitle + '"' : '';
+          const disDel = gitLock ? 'disabled title="' + lockTitle + '"' : '';
+          const disInt =
+            j.status !== 'running' || gitLock
+              ? 'disabled' + (gitLock ? ' title="' + lockTitle + '"' : '')
+              : '';
+          const lockNote = gitLock
+            ? '<div class="meta" style="color:var(--warn);margin-top:0.35rem;">已检测到 git 提交，已禁止中断、重新执行与删除。</div>'
+            : '';
+          return `
         <div class="job-card" data-id="${j.id}">
           <div class="meta">层: ${j.layer_id} · ${j.created_at}</div>
           <div><strong>${escapeHtml(j.command)}</strong></div>
           <div class="status ${j.status}">${j.status} ${j.exit_code != null ? '(exit ' + j.exit_code + ')' : ''}</div>
           <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}${j.git_branch ? ' · 分支: ' + escapeHtml(j.git_branch) : ''}</div>
+          ${lockNote}
           <div class="job-log-actions">
             <button type="button" class="secondary copy-job-log" data-copy-log="${j.id}">复制日志</button>
-            <button type="button" data-redo="${j.id}">重新执行</button>
-            <button type="button" class="danger" data-delete="${j.id}">删除</button>
+            <button type="button" data-redo="${j.id}" ${disRedo}>重新执行</button>
+            <button type="button" class="danger" data-delete="${j.id}" ${disDel}>删除</button>
             ${
               j.status === 'interrupted'
                 ? '<button type="button" data-continue="' + j.id + '">继续</button>'
@@ -1108,9 +1162,9 @@
             <summary>原始控制台日志</summary>
             <pre class="out job-raw-pre">${escapeHtml(j.output || '')}</pre>
           </details>
-          <button class="danger" data-interrupt="${j.id}" ${j.status !== 'running' ? 'disabled' : ''}>中断</button>
-        </div>`
-        )
+          <button class="danger" data-interrupt="${j.id}" ${disInt}>中断</button>
+        </div>`;
+        })
         .join('');
       box.querySelectorAll('[data-interrupt]').forEach((btn) => {
         btn.onclick = async () => {
@@ -1369,6 +1423,206 @@
       return row;
     }
 
+    function selectLayerFromGraph(layerId) {
+      const sel = document.getElementById('layerSelect');
+      if (!sel || !layerId) return;
+      if (![...sel.options].some((o) => o.value === layerId)) return;
+      sel.value = layerId;
+      updateLayerCommandMeta();
+      void reloadLayerTree();
+    }
+
+    function renderLayerRelationTree(layers) {
+      const el = document.getElementById('layerRelationTree');
+      const meta = document.getElementById('layerRelationMeta');
+      if (!el) return;
+      el.replaceChildren();
+      if (meta) meta.textContent = '';
+      if (!layers || !layers.length) {
+        const empty = document.createElement('div');
+        empty.className = 'meta';
+        empty.textContent = '（暂无可写层）';
+        el.appendChild(empty);
+        return;
+      }
+      const byId = new Map(layers.map((l) => [l.layer_id, l]));
+      const childMap = new Map();
+      for (const l of layers) {
+        const p = l.parent_layer_id;
+        if (p && byId.has(p)) {
+          if (!childMap.has(p)) childMap.set(p, []);
+          childMap.get(p).push(l);
+        }
+      }
+      for (const arr of childMap.values()) {
+        arr.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      }
+      const roots = layers.filter((l) => {
+        const p = l.parent_layer_id;
+        return !p || !byId.has(p);
+      });
+      roots.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+      /** 本层 git 干净，或任一子孙层在接口上为干净（已提交），则本行显示 ✓ */
+      function effectiveClean(layer) {
+        if (layer.git_worktree_dirty === false) return true;
+        if (layer.git_worktree_dirty === null) return false;
+        const kids = childMap.get(layer.layer_id) || [];
+        for (const k of kids) {
+          if (effectiveClean(k)) return true;
+        }
+        return false;
+      }
+
+      function mkNode(layer, pathVisited) {
+        if (pathVisited.has(layer.layer_id)) {
+          const w = document.createElement('div');
+          w.className = 'meta';
+          w.style.color = 'var(--err)';
+          w.textContent = '（循环: ' + layer.layer_id + '）';
+          return w;
+        }
+        const nextVisited = new Set(pathVisited);
+        nextVisited.add(layer.layer_id);
+
+        const kidsArr = childMap.get(layer.layer_id) || [];
+        const wrap = document.createElement('div');
+        wrap.style.marginTop = '0.12rem';
+
+        const row = document.createElement('div');
+        row.className = 'tree-node';
+        const isRoot = !layer.parent_layer_id || !byId.has(layer.parent_layer_id);
+        if (isRoot) row.classList.add('layer-graph-root');
+
+        const toggle = document.createElement('span');
+        toggle.className = 'tree-toggle';
+        toggle.textContent = kidsArr.length ? '+' : '·';
+
+        const name = document.createElement('span');
+        name.className = 'tree-layer-id';
+        name.textContent = layer.layer_id;
+
+        const muted = document.createElement('span');
+        muted.style.marginLeft = '0.45rem';
+        muted.style.color = 'var(--muted)';
+        muted.style.fontSize = '0.72rem';
+        const bits = [];
+        if (layer.created_at) bits.push(layer.created_at);
+        if (layer.command) {
+          const c = layer.command;
+          bits.push(c.length > 40 ? c.slice(0, 40) + '…' : c);
+        }
+        muted.textContent = bits.join(' · ');
+
+        const dirty = layer.git_worktree_dirty;
+        const showSubmitted = effectiveClean(layer);
+        if (dirty === null) {
+          const na = document.createElement('span');
+          na.className = 'tree-layer-commit-na';
+          na.textContent = '—';
+          na.title = '该目录下无 git 仓库';
+          row.appendChild(toggle);
+          row.appendChild(name);
+          row.appendChild(muted);
+          row.appendChild(na);
+        } else if (showSubmitted) {
+          const ok = document.createElement('span');
+          ok.className = 'tree-layer-commit-done';
+          ok.textContent = '✓';
+          const propagated = showSubmitted && dirty !== false && dirty !== null;
+          ok.title = propagated
+            ? '下层已有可写层提交完毕（工作区干净），本层在树中一并视为已提交'
+            : '工作区干净，当前无未提交变更';
+          ok.setAttribute('aria-label', propagated ? '因下层已提交而视为已提交' : '已同步提交状态');
+          row.appendChild(toggle);
+          row.appendChild(name);
+          row.appendChild(muted);
+          row.appendChild(ok);
+        } else {
+          const commitBtn = document.createElement('button');
+          commitBtn.type = 'button';
+          commitBtn.className = 'secondary tree-layer-commit';
+          commitBtn.textContent = '提交';
+          commitBtn.title = '自动生成提交说明：任务指令 + 暂存区 diff（git add -A && git commit，不 push）';
+          commitBtn.onclick = async (e) => {
+            e.stopPropagation();
+            commitBtn.disabled = true;
+            try {
+              const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/commit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: null }),
+              });
+              const rawText = await r.text();
+              let j = null;
+              try {
+                j = JSON.parse(rawText);
+              } catch (_) {}
+              if (!r.ok) {
+                let msg = rawText;
+                if (j && j.detail !== undefined) {
+                  msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                }
+                alert('提交失败：' + msg);
+                return;
+              }
+              if (j && j.status === 'noop') {
+                alert(j.detail || '工作区无变更，未创建提交');
+              } else if (j && j.status === 'ok') {
+                const cm = j.commit_message || '';
+                const preview = cm.length > 900 ? cm.slice(0, 900) + '\n…（说明过长，完整内容见 git log）' : cm;
+                alert('已提交。\n\n' + preview);
+              } else {
+                alert('已完成：' + rawText);
+              }
+              await loadJobs();
+              const sel = document.getElementById('layerSelect');
+              await loadLayers(sel && sel.value ? sel.value : null);
+            } finally {
+              commitBtn.disabled = false;
+            }
+          };
+          row.appendChild(toggle);
+          row.appendChild(name);
+          row.appendChild(muted);
+          row.appendChild(commitBtn);
+        }
+
+        const childrenEl = document.createElement('div');
+        childrenEl.className = 'tree-children';
+        childrenEl.style.display = 'none';
+
+        let expanded = false;
+        row.onclick = () => {
+          selectLayerFromGraph(layer.layer_id);
+          if (kidsArr.length) {
+            expanded = !expanded;
+            childrenEl.style.display = expanded ? 'block' : 'none';
+            toggle.textContent = expanded ? '-' : '+';
+          }
+        };
+
+        wrap.appendChild(row);
+        for (const kid of kidsArr) {
+          childrenEl.appendChild(mkNode(kid, nextVisited));
+        }
+        wrap.appendChild(childrenEl);
+        return wrap;
+      }
+
+      for (const root of roots) {
+        el.appendChild(mkNode(root, new Set()));
+      }
+      if (meta) {
+        meta.textContent =
+          '共 ' +
+          layers.length +
+          ' 个目录 · 根节点 ' +
+          roots.length +
+          ' 个（无父或父层目录已不存在）';
+      }
+    }
+
     async function loadLayers(preferredLayerId) {
       const errEl = document.getElementById('layerFilesErr');
       errEl.textContent = '';
@@ -1383,6 +1637,7 @@
       const r = await api('/api/layers');
       if (!r.ok) {
         errEl.textContent = await r.text();
+        renderLayerRelationTree([]);
         await applyTaskGate();
         return;
       }
@@ -1394,6 +1649,7 @@
         opt.textContent = '（无可写层）';
         sel.appendChild(opt);
         updateLayerCommandMeta();
+        renderLayerRelationTree([]);
         await fillJobRepoLayerSelect();
         await refreshJobBranches();
         await applyTaskGate();
@@ -1419,6 +1675,7 @@
       }
       sel.value = pick;
       updateLayerCommandMeta();
+      renderLayerRelationTree(layers);
       await fillJobRepoLayerSelect(preferredLayerId);
       await refreshJobBranches();
       await reloadLayerTree();

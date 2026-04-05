@@ -17,17 +17,28 @@ from .git_clone import clone_into_new_layer
 from .hub import hub
 from .layer_fs import (
     any_layer_has_git_repo,
+    infer_layer_parent_from_workspace,
     list_layer_children,
     list_layer_files,
     list_layers,
     read_layer_file,
 )
-from .layer_git import list_branches as list_layer_git_branches
+from .layer_git import (
+    commit_layer_worktree,
+    git_worktree_dirty,
+    list_branches as list_layer_git_branches,
+)
 from .job_trajectory import load_agent_steps_for_layer
-from .jobs import store
+from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .paths import config_file_path, service_root
 
 app = FastAPI(title="Trae Online Service", version="1.0.0")
+
+
+def _job_to_api_dict(rec: JobRecord) -> dict[str, Any]:
+    d = rec.to_dict()
+    d["git_destructive_locked"] = job_layer_git_destructive_locked(rec)
+    return d
 
 
 class JobCreateBody(BaseModel):
@@ -36,7 +47,7 @@ class JobCreateBody(BaseModel):
     repo_layer_id: str | None = Field(
         default=None,
         max_length=128,
-        description="无父任务时从该层复制工作区（含 .git），用于在已克隆仓库上开任务。",
+        description="无父任务时从该层复制工作区；.git 以符号链接共享，不逐层复制。",
     )
     git_branch: str | None = Field(
         default=None,
@@ -51,6 +62,22 @@ class CloneRepoBody(BaseModel):
     url: str = Field(..., min_length=1, max_length=4096)
     branch: str | None = None
     depth: int | None = Field(default=None, ge=1, le=10_000)
+
+
+class LayerGitCommitBody(BaseModel):
+    """在工作区内执行 ``git add -A`` 与 ``git commit``。
+
+    ``message`` 为空时由服务端根据关联任务指令与暂存区 diff 自动生成提交说明。
+    """
+
+    message: str | None = Field(default=None, max_length=4096)
+
+
+def _command_for_layer_id(layer_id: str) -> str | None:
+    for j in store.list_jobs():
+        if j.layer_id == layer_id:
+            return j.command
+    return None
 
 
 @app.get("/skill.md", include_in_schema=False)
@@ -181,12 +208,12 @@ async def create_job(_: AuthDep, body: JobCreateBody) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return rec.to_dict()
+    return _job_to_api_dict(rec)
 
 
 @app.get("/api/jobs")
 async def list_jobs(_: AuthDep) -> dict[str, Any]:
-    jobs = [j.to_dict() for j in store.list_jobs()]
+    jobs = [_job_to_api_dict(j) for j in store.list_jobs()]
     return {"jobs": jobs}
 
 
@@ -195,7 +222,7 @@ async def get_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     rec = store.get(job_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Job not found")
-    return rec.to_dict()
+    return _job_to_api_dict(rec)
 
 
 @app.get("/api/jobs/{job_id}/steps")
@@ -234,7 +261,10 @@ async def get_job_parent(_: AuthDep, job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs/{job_id}/interrupt")
 async def interrupt_job(_: AuthDep, job_id: str) -> dict[str, Any]:
-    ok = await store.interrupt(job_id)
+    try:
+        ok = await store.interrupt(job_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if not ok:
         raise HTTPException(status_code=400, detail="Job not running or unknown")
     return {"job_id": job_id, "status": "interrupt_requested"}
@@ -246,7 +276,7 @@ async def redo_job(_: AuthDep, job_id: str) -> dict[str, Any]:
         rec = await store.redo_job(job_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return rec.to_dict()
+    return _job_to_api_dict(rec)
 
 
 @app.post("/api/jobs/{job_id}/continue")
@@ -255,7 +285,7 @@ async def continue_job(_: AuthDep, job_id: str) -> dict[str, Any]:
         rec = await store.continue_job(job_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return rec.to_dict()
+    return _job_to_api_dict(rec)
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -316,22 +346,64 @@ async def api_layer_git_branches(_: AuthDep, layer_id: str) -> dict[str, Any]:
     return await list_layer_git_branches(layer_id)
 
 
+@app.post("/api/layers/{layer_id}/git/commit")
+async def api_layer_git_commit(
+    _: AuthDep,
+    layer_id: str,
+    body: LayerGitCommitBody,
+) -> dict[str, Any]:
+    """将当前可写层工作区全部暂存并提交到本地仓库（不 push）。"""
+    return await commit_layer_worktree(
+        layer_id,
+        body.message,
+        command_hint=_command_for_layer_id(layer_id),
+    )
+
+
 @app.get("/api/requirements/task-gate")
 async def api_task_gate(_: AuthDep) -> dict[str, Any]:
     """新建任务前是否已满足「至少成功克隆过一次」（存在含 ``.git`` 的可写层）。"""
     return {"clone_done": any_layer_has_git_repo()}
 
 
+def _layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
+    """无 ``.git`` 符号链接时（例如旧版逐层复制），用任务记录推断父层。"""
+    job_by_layer: dict[str, Any] = {}
+    for j in jobs:
+        if j.layer_id not in job_by_layer:
+            job_by_layer[j.layer_id] = j
+    by_id = {j.id: j for j in jobs}
+    j = job_by_layer.get(layer_id)
+    if not j:
+        return None
+    if j.parent_job_id:
+        p = by_id.get(j.parent_job_id)
+        return str(p.layer_id) if p else None
+    if j.repo_layer_id:
+        return str(j.repo_layer_id)
+    return None
+
+
 @app.get("/api/layers")
 async def api_list_layers(_: AuthDep) -> dict[str, Any]:
     layers = list_layers()
+    jobs = store.list_jobs()
     # 将 layer_id 映射到 jobs 记录的执行命令（用于 UI 展示）。
     # 如果某个 layer 目录存在但 jobs 状态里已不存在，则不返回 command。
-    cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in store.list_jobs()}
+    cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in jobs}
+    known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
     for item in layers:
         lid = item.get("layer_id")
-        if lid and lid in cmd_by_layer_id:
+        if not lid:
+            continue
+        if lid in cmd_by_layer_id:
             item["command"] = cmd_by_layer_id[lid]
+        p = infer_layer_parent_from_workspace(str(lid)) or _layer_parent_from_jobs(str(lid), jobs)
+        if p and p in known_ids:
+            item["parent_layer_id"] = p
+        else:
+            item["parent_layer_id"] = None
+        item["git_worktree_dirty"] = git_worktree_dirty(str(lid))
     return {"layers": layers}
 
 

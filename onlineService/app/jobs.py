@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,10 +27,41 @@ from .layers import (
     layer_path,
     new_layer_id,
 )
-from .paths import config_file_path, jobs_state_path, layers_root, venv_activate_path
+from .paths import (
+    commands_log_path,
+    config_file_path,
+    jobs_state_path,
+    layers_root,
+    venv_activate_path,
+)
 
 
 JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
+
+_GIT_LOCK_MSG = (
+    "该任务可写层在运行开始后已有 git 提交（HEAD 已变化），已禁止中断、重新执行与删除。"
+)
+
+
+def _git_rev_parse_head_sync(workdir: Path) -> str | None:
+    if not (workdir / ".git").exists():
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(workdir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if r.returncode != 0:
+            return None
+        out = (r.stdout or "").strip()
+        return out or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
 
 # Rich 需要有限列宽，无法用「无限」；用极大值近似不折行，避免长路径/JSON 在管道下被 80 列切碎。
 # TRAE_JOB_COLUMNS=0 / unlimited / max 等均表示使用该默认值；也可设具体正整数（上限见实现）。
@@ -95,10 +127,30 @@ class JobRecord:
     output: str = ""
     git_branch: str | None = None
     repo_layer_id: str | None = None  # 无父任务时从该层复制工作区
+    git_head_at_run_start: str | None = None  # 本次 trae-cli 启动前 HEAD（用于检测是否已有新提交）
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         return d
+
+
+def job_layer_git_destructive_locked(rec: JobRecord) -> bool:
+    """相对任务开始执行时所记录 HEAD，若当前 HEAD 不同则视为已有新提交，锁定破坏性操作。
+
+    无 baseline 时不再兼容旧状态文件：除仍处于 pending、或已 failed（如 checkout 失败未记下 HEAD）外，一律锁定。
+    """
+    if rec.status == "pending":
+        return False
+    baseline = (rec.git_head_at_run_start or "").strip()
+    if not baseline:
+        return rec.status != "failed"
+    work = Path(rec.layer_path)
+    if not work.is_dir():
+        return False
+    cur = _git_rev_parse_head_sync(work)
+    if not cur:
+        return True
+    return cur != baseline
 
 
 class JobStore:
@@ -116,8 +168,6 @@ class JobStore:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             for row in data.get("jobs", []):
-                row.setdefault("git_branch", None)
-                row.setdefault("repo_layer_id", None)
                 rec = JobRecord(**row)
                 if rec.status == "running":
                     rec.status = "interrupted"
@@ -224,18 +274,11 @@ class JobStore:
         )
         cmd = ["bash", "-lc", script]
 
-        rec.status = "running"
-        if preserve_output:
-            rec.output += "\n\n--- 继续执行（指令：继续）---\n"
-        else:
-            rec.output = ""
-        await self._save()
-        await hub.publish({"type": "job_started", "job_id": job_id})
-
         if rec.git_branch and not preserve_output:
             co_out, co_code = await git_checkout(Path(rec.layer_path), rec.git_branch)
             banner = f"[git checkout {rec.git_branch}]\n{co_out}"
-            rec.output += banner
+            rec.output = banner
+            await self._save()
             await hub.publish(
                 {
                     "type": "job_output",
@@ -249,6 +292,18 @@ class JobStore:
                 await self._save()
                 await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
                 return
+
+        head0 = await asyncio.to_thread(_git_rev_parse_head_sync, Path(work))
+        rec.git_head_at_run_start = head0
+        await self._save()
+
+        rec.status = "running"
+        if preserve_output:
+            rec.output += "\n\n--- 继续执行（指令：继续）---\n"
+        elif not (rec.git_branch and rec.output.strip()):
+            rec.output = ""
+        await self._save()
+        await hub.publish({"type": "job_started", "job_id": job_id})
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -307,6 +362,8 @@ class JobStore:
         rec = self._jobs.get(job_id)
         if not rec or rec.status != "running":
             return False
+        if job_layer_git_destructive_locked(rec):
+            raise ValueError(_GIT_LOCK_MSG)
         proc = self._running.get(job_id)
         if not proc:
             return False
@@ -326,6 +383,9 @@ class JobStore:
             if not rec:
                 raise ValueError("Job not found")
             runner_task = self._runner_tasks.get(job_id)
+
+        if job_layer_git_destructive_locked(rec):
+            raise ValueError(_GIT_LOCK_MSG)
 
         if rec.status == "running" and runner_task and not runner_task.done():
             _ = await self.interrupt(job_id)
@@ -373,6 +433,7 @@ class JobStore:
             rec.status = "pending"
             rec.output = ""
             rec.exit_code = None
+            rec.git_head_at_run_start = None
 
         await self._save()
         await hub.publish({"type": "job_redone", "job_id": job_id, "job": rec.to_dict()})
@@ -441,6 +502,15 @@ class JobStore:
         layers_stat = cleanup_layers()
 
         await self._save()
+
+        def _unlink_commands_log() -> None:
+            try:
+                commands_log_path().unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        await asyncio.to_thread(_unlink_commands_log)
+
         await hub.publish({"type": "jobs_reset"})
         return {
             "jobs_cleared": len(all_job_ids),
@@ -470,6 +540,8 @@ class JobStore:
                 raise ValueError("Job not found")
             if self._child_job_ids(job_id):
                 raise ValueError("存在子任务，请先删除子任务后再删除该任务")
+            if job_layer_git_destructive_locked(rec):
+                raise ValueError(_GIT_LOCK_MSG)
             runner_task = self._runner_tasks.get(job_id)
 
         if rec.status == "running" and runner_task and not runner_task.done():

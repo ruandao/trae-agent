@@ -8,8 +8,8 @@ from pathlib import Path
 
 from .paths import layers_root
 
-# 保留 .git，便于子任务工作区内执行 git checkout / 分支相关操作。
-_SKIP_NAMES = {"__pycache__", ".DS_Store"}
+# 不复制 .git：在 create_stacked_layer 末尾用符号链接指向父层 .git，各可写层共享同一仓库元数据。
+_SKIP_NAMES = {"__pycache__", ".DS_Store", ".git"}
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 
 
@@ -21,6 +21,24 @@ def new_layer_id() -> str:
 
 def layer_path(layer_id: str) -> Path:
     return layers_root() / layer_id
+
+
+def _link_shared_git(child: Path, parent: Path) -> None:
+    """若父层存在 .git，则在子层建立相对符号链接 child/.git -> ../<parent_id>/.git。"""
+    git_src = parent / ".git"
+    if not git_src.exists():
+        return
+    dest = child / ".git"
+    try:
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+    except OSError:
+        return
+    try:
+        rel_target = Path("..") / parent.name / ".git"
+        dest.symlink_to(rel_target, target_is_directory=git_src.is_dir())
+    except OSError:
+        pass
 
 
 def create_root_layer(layer_id: str) -> Path:
@@ -48,6 +66,7 @@ def create_stacked_layer(layer_id: str, parent_layer_path: Path) -> Path:
                 shutil.copytree(item, dest, symlinks=True, ignore_dangling_symlinks=True)
         except OSError:
             continue
+    _link_shared_git(child, parent)
     return child.resolve()
 
 

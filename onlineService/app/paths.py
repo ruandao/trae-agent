@@ -28,6 +28,11 @@ def jobs_state_path() -> Path:
     return runtime_dir() / "jobs_state.json"
 
 
+def commands_log_path() -> Path:
+    """历史/旁路命令日志（若有）；与 jobs_state 独立，重置任务时需一并清理。"""
+    return runtime_dir() / "commands.json"
+
+
 def layers_root() -> Path:
     root = Path(os.environ.get("ONLINE_PROJECT_LAYERS", repo_root() / "onlineProject" / "layers"))
     root.mkdir(parents=True, exist_ok=True)

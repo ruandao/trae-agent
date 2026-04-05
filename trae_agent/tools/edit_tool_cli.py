@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -63,8 +64,10 @@ async def run(command: str, timeout: int = 300) -> tuple[int, str, str]:
         stderr = stderr_bytes.decode("utf-8", errors="ignore")
         return proc.returncode if proc.returncode is not None else -1, stdout, stderr
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(ProcessLookupError, asyncio.TimeoutError):
+            await asyncio.wait_for(proc.communicate(), timeout=10.0)
         return -1, "", f"Command timed out after {timeout} seconds."
 
 

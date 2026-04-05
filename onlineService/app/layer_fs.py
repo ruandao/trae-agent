@@ -82,6 +82,40 @@ def any_layer_has_git_repo() -> bool:
     return False
 
 
+def infer_layer_parent_from_workspace(layer_id: str) -> str | None:
+    """若该层根目录下 ``.git`` 为指向兄弟层 ``../<parent>/.git`` 的符号链接，返回父层 *layer_id*。"""
+    if not _LAYER_ID_RE.match(layer_id):
+        return None
+    root = layers_root().resolve()
+    lp = (root / layer_id).resolve()
+    try:
+        if not lp.is_dir():
+            return None
+        lp.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    g = lp / ".git"
+    if not g.is_symlink():
+        return None
+    try:
+        resolved = (lp / g.readlink()).resolve()
+    except OSError:
+        return None
+    if resolved.name != ".git":
+        return None
+    parent_dir = resolved.parent
+    try:
+        parent_dir.relative_to(root)
+    except ValueError:
+        return None
+    parent_id = parent_dir.name
+    if parent_id == layer_id or not _LAYER_ID_RE.match(parent_id):
+        return None
+    if not (root / parent_id).is_dir():
+        return None
+    return parent_id
+
+
 def _validate_safe_rel_posix(rel_posix: str) -> PurePosixPath:
     # Empty is not allowed (must point to something within the layer).
     if not rel_posix:
