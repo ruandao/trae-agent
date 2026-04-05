@@ -165,8 +165,17 @@ class LakeView:
 
             content = "<tags>" + llm_response.content.lstrip()
 
-            matched_tags: list[str] = tags_re.findall(content)
-            tags: list[str] = [tag.strip() for tag in matched_tags[0].split(",")]
+            match = tags_re.search(content)
+            if not match:
+                retry += 1
+                continue
+
+            tags: list[str] = [
+                t.strip() for t in match.group(1).split(",") if t.strip()
+            ]
+            if not tags:
+                retry += 1
+                continue
             if all(tag in KNOWN_TAGS for tag in tags):
                 return tags
 
