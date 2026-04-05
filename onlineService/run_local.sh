@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+# 本机 Task API（localhost）若继承全局 HTTP(S)_PROXY，urllib 会走代理导致 exchange-refresh 等超时
+_local_no_proxy="localhost,127.0.0.1,::1"
+export NO_PROXY="${_local_no_proxy}${NO_PROXY:+,${NO_PROXY}}"
+export no_proxy="${_local_no_proxy}${no_proxy:+,${no_proxy}}"
 export ACCESS_TOKEN="${ACCESS_TOKEN:-dev-local-token}"
 export REPO_ROOT="${REPO_ROOT:-$ROOT}"
 export TRAE_VENV="${TRAE_VENV:-$ROOT/.venv}"
