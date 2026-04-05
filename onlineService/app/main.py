@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 import yaml
@@ -31,8 +32,16 @@ from .layer_git import (
 from .job_trajectory import load_agent_steps_for_layer
 from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .paths import config_file_path, service_root
+from .task_api_bootstrap import bootstrap_container_config
 
-app = FastAPI(title="Trae Online Service", version="1.0.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    await asyncio.to_thread(bootstrap_container_config)
+    yield
+
+
+app = FastAPI(title="Trae Online Service", version="1.0.0", lifespan=_lifespan)
 
 
 def _job_to_api_dict(rec: JobRecord) -> dict[str, Any]:

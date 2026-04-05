@@ -22,6 +22,15 @@ ENV REPO_ROOT=/app
 ENV TRAE_VENV=/app/.venv
 ARG ACCESS_TOKEN=""
 ENV ACCESS_TOKEN="${ACCESS_TOKEN}"
+# 任务云容器换票与功能参数（见 machine_container.md）；留空则跳过启动引导，仅本地 ACCESS_TOKEN 生效
+ARG TaskApiEndPoint=""
+ENV TaskApiEndPoint="${TaskApiEndPoint}"
+ARG tenantId=""
+ENV tenantId="${tenantId}"
+ARG workspaceId=""
+ENV workspaceId="${workspaceId}"
+ARG taskId=""
+ENV taskId="${taskId}"
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8765
