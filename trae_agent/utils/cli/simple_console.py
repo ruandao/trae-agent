@@ -4,6 +4,9 @@
 """Simple CLI Console implementation."""
 
 import asyncio
+import os
+import shutil
+import sys
 from typing import override
 
 from rich.console import Console
@@ -21,6 +24,26 @@ from trae_agent.utils.cli.cli_console import (
 )
 from trae_agent.utils.config import LakeviewConfig
 
+# 与 onlineService 子进程默认一致：Rich 无「无限宽」，用大整数近似不折行。
+_WIDE_CONSOLE_FALLBACK = 999_999
+
+
+def _simple_console_width() -> int | None:
+    """Rich 在非 TTY 上默认 80 列；优先用环境 COLUMNS（正整数），否则用大宽度近似不限制折行。"""
+    cols = os.environ.get("COLUMNS")
+    if cols:
+        s = cols.strip()
+        if s.isdigit():
+            n = int(s)
+            if n > 0:
+                return None
+    try:
+        if sys.stdout.isatty():
+            return None
+    except (AttributeError, ValueError, OSError):
+        pass
+    return _WIDE_CONSOLE_FALLBACK
+
 
 class SimpleCLIConsole(CLIConsole):
     """Simple text-based CLI console that prints agent execution trace."""
@@ -35,7 +58,8 @@ class SimpleCLIConsole(CLIConsole):
             mode: Console operation mode
         """
         super().__init__(mode, lakeview_config)
-        self.console: Console = Console()
+        cw = _simple_console_width()
+        self.console: Console = Console(width=cw) if cw is not None else Console()
 
     @override
     def update_status(
@@ -128,17 +152,12 @@ class SimpleCLIConsole(CLIConsole):
         self.console.print("[bold green]Execution Summary[/bold green]")
         self.console.print("=" * 60)
 
-        # Create summary table
-        table = Table(show_header=False, width=60)
-        table.add_column("Metric", style="cyan", width=20)
-        table.add_column("Value", style="green", width=40)
+        # Create summary table（不限制宽度，避免长任务描述被折行或省略号截断）
+        table = Table(show_header=False)
+        table.add_column("Metric", style="cyan", no_wrap=True)
+        table.add_column("Value", style="green", no_wrap=True, overflow="ignore")
 
-        table.add_row(
-            "Task",
-            self.agent_execution.task[:50] + "..."
-            if len(self.agent_execution.task) > 50
-            else self.agent_execution.task,
-        )
+        table.add_row("Task", self.agent_execution.task)
         table.add_row("Success", "✅ Yes" if self.agent_execution.success else "❌ No")
         table.add_row("Steps", str(len(self.agent_execution.steps)))
         table.add_row("Execution Time", f"{self.agent_execution.execution_time:.2f}s")

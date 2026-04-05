@@ -82,6 +82,13 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    /* 任务列表日志：保留 Rich/ASCII 表格列对齐；pre-wrap+word-break 会在行中断行，右侧列像被截断 */
+    .job-card pre.out {
+      white-space: pre;
+      overflow-x: auto;
+      word-break: normal;
+      overflow-wrap: normal;
+    }
     .job-card { border-top: 1px solid var(--border); padding-top: 0.75rem; margin-top: 0.75rem; }
     .job-card:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
     .job-log-actions { margin-top: 0.35rem; }

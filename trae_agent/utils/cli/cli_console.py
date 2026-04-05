@@ -127,10 +127,12 @@ def generate_agent_step_table(agent_step: AgentStep) -> Table:
     """Log an agent step to the console."""
     color, emoji = AGENT_STATE_INFO.get(agent_step.state, ("white", "❓"))
 
-    # Print the step state in a table
-    table = Table(show_header=False, width=120)
-    table.add_column("Step Number", style="cyan", width=15)
-    table.add_column(f"{agent_step.step_number}", style="green", width=105)
+    # 不设 table/column 固定 width，避免 Rich 在窄宽度下折行或 ellipsis 切碎长路径/JSON
+    table = Table(show_header=False)
+    table.add_column("Step Number", style="cyan", no_wrap=True)
+    table.add_column(
+        f"{agent_step.step_number}", style="green", no_wrap=True, overflow="ignore"
+    )
 
     # Add status row
     table.add_row(
@@ -149,9 +151,11 @@ def generate_agent_step_table(agent_step: AgentStep) -> Table:
 
         for tool_call in agent_step.tool_calls:
             # Build a tool call table with tool name, arguments and result
-            tool_call_table = Table(show_header=False, width=100)
-            tool_call_table.add_column("Arguments", style="green", width=50)
-            tool_call_table.add_column("Result", style="green", width=50)
+            tool_call_table = Table(show_header=False)
+            tool_call_table.add_column(
+                "Arguments", style="green", no_wrap=True, overflow="ignore"
+            )
+            tool_call_table.add_column("Result", style="green", no_wrap=True, overflow="ignore")
             tool_result_str = ""
             for tool_result in agent_step.tool_results or []:
                 if tool_result.call_id == tool_call.call_id:

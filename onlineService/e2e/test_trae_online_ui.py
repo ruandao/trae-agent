@@ -45,13 +45,102 @@ def click_reset(page: Page) -> None:
 
 
 @pytest.fixture(autouse=True)
-def reset_before_each_test(page: Page) -> None:
+def reset_before_each_test(request: pytest.FixtureRequest, page: Page) -> None:
     """每个测试前先打开页面并执行重置。"""
+    if request.node.get_closest_marker("skip_reset"):
+        return
     # SSE 长连接会使 networkidle 无法达成，只等待 DOM 与关键控件
     page.goto(_ui_url(), wait_until="domcontentloaded")
     page.locator("#btnReset").wait_for(state="visible", timeout=15_000)
     click_reset(page)
     page.locator("#btnClone").wait_for(state="visible", timeout=10_000)
+
+
+@pytest.mark.skip_reset
+def test_event_source_patch_and_large_chunk_like_batched_sse(page: Page) -> None:
+    """在首屏加载前包装 EventSource；向任务 pre 写入大块多行文本，模拟后端合并后的单条 chunk。"""
+    page.add_init_script(
+        """
+        window.__traeJobOutputChunks = 0;
+        const RawES = window.EventSource;
+        window.EventSource = function (url, cfg) {
+          const es = new RawES(url, cfg);
+          es.addEventListener('message', (ev) => {
+            try {
+              const o = JSON.parse(ev.data);
+              if (o.type === 'job_output') window.__traeJobOutputChunks += 1;
+            } catch (e) {}
+          });
+          return es;
+        };
+        """
+    )
+    page.goto(_ui_url(), wait_until="domcontentloaded")
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    page.wait_for_function("() => typeof window.__traeJobOutputChunks === 'number'", timeout=8_000)
+    wide_row = "│ Status │ " + ("█" * 180) + " │ TAIL │"
+    block = "\n".join(f"{wide_row}  line {i}" for i in range(80))
+    page.evaluate(
+        """(text) => {
+          const box = document.getElementById('jobs');
+          const div = document.createElement('div');
+          div.className = 'job-card';
+          div.setAttribute('data-id', 'e2e-batch-sim');
+          div.innerHTML = '<pre class="out"></pre>';
+          div.querySelector('pre').textContent = text;
+          box.insertBefore(div, box.firstChild);
+        }""",
+        block,
+    )
+    pre = page.locator('.job-card[data-id="e2e-batch-sim"] pre.out')
+    info = pre.evaluate(
+        """(el) => ({
+          len: el.textContent.length,
+          scrollWidth: el.scrollWidth,
+          clientWidth: el.clientWidth,
+          whiteSpace: getComputedStyle(el).whiteSpace,
+        })"""
+    )
+    assert info["len"] > 12_000
+    assert info["whiteSpace"] == "pre"
+    assert info["scrollWidth"] > info["clientWidth"]
+    n = page.evaluate("() => window.__traeJobOutputChunks")
+    assert isinstance(n, int)
+
+
+def test_job_log_wide_rich_table_scrolls_horizontally(page: Page) -> None:
+    """任务列表 pre 对超长行不强制换行断字，应出现横向滚动条以查看完整 Rich 表格。"""
+    page.set_viewport_size({"width": 420, "height": 700})
+    page.goto(_ui_url(), wait_until="domcontentloaded")
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    long_line = "│ Status │ " + ("█" * 220) + " │ RIGHT_TAIL │"
+    page.evaluate(
+        """(line) => {
+          const box = document.getElementById('jobs');
+          const div = document.createElement('div');
+          div.className = 'job-card';
+          div.setAttribute('data-id', 'e2e-wide-log');
+          div.innerHTML = '<pre class="out"></pre>';
+          div.querySelector('pre').textContent = line;
+          box.insertBefore(div, box.firstChild);
+        }""",
+        long_line,
+    )
+    pre = page.locator(".job-card pre.out").first
+    info = pre.evaluate(
+        """(el) => {
+          const cs = getComputedStyle(el);
+          return {
+            scrollWidth: el.scrollWidth,
+            clientWidth: el.clientWidth,
+            whiteSpace: cs.whiteSpace,
+            wordBreak: cs.wordBreak,
+          };
+        }"""
+    )
+    assert info["whiteSpace"] == "pre"
+    assert info["wordBreak"] == "normal"
+    assert info["scrollWidth"] > info["clientWidth"]
 
 
 def test_after_reset_new_task_is_locked(page: Page) -> None:

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 在开发机从仓库根目录的 .venv 启动服务
+# 在开发机从仓库根目录的 .venv 启动服务（默认开启代码热重载）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 export ACCESS_TOKEN="${ACCESS_TOKEN:-dev-local-token}"
 export REPO_ROOT="${REPO_ROOT:-$ROOT}"
 export TRAE_VENV="${TRAE_VENV:-$ROOT/.venv}"
@@ -11,4 +12,20 @@ if command -v uv >/dev/null 2>&1; then
 else
   "$ROOT/.venv/bin/python" -m pip install -q -r requirements.txt
 fi
-exec "$ROOT/.venv/bin/python" -m uvicorn app.main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8765}"
+# 确保 runtime 目录存在，便于 --reload-exclude 将其识别为排除目录（避免 jobs_state 等写入触发重启）
+mkdir -p "$SCRIPT_DIR/runtime"
+# 关闭热重载：UVICORN_RELOAD=0 ./run_local.sh
+RELOAD_ARGS=()
+if [[ "${UVICORN_RELOAD:-1}" != "0" ]]; then
+  RELOAD_ARGS=(
+    --reload
+    --reload-dir "$SCRIPT_DIR"
+    --reload-exclude "$SCRIPT_DIR/runtime"
+    --reload-include "*.html"
+    --reload-include "*.md"
+  )
+fi
+exec "$ROOT/.venv/bin/python" -m uvicorn app.main:app \
+  --host "${HOST:-0.0.0.0}" \
+  --port "${PORT:-8765}" \
+  "${RELOAD_ARGS[@]}"

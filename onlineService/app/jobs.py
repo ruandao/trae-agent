@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import os
 import shlex
 import shutil
 import signal
+from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -21,6 +23,56 @@ from .paths import config_file_path, jobs_state_path, venv_activate_path
 
 
 JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
+
+# Rich 需要有限列宽，无法用「无限」；用极大值近似不折行，避免长路径/JSON 在管道下被 80 列切碎。
+# TRAE_JOB_COLUMNS=0 / unlimited / max 等均表示使用该默认值；也可设具体正整数（上限见实现）。
+_DEFAULT_JOB_WIDE_COLUMNS = 999_999
+_MAX_JOB_COLUMNS = 9_999_999
+
+# 按块读取 stdout，减少「一行一条 SSE」的风暴（仍保持 UTF-8 边界正确）。
+
+
+def _stdout_chunk_bytes() -> int:
+    raw = os.environ.get("TRAE_JOB_STDOUT_CHUNK_BYTES", "16384")
+    try:
+        # 下限避免过小导致频繁 await；测试可用 64 验证多分块
+        return max(int(raw), 64)
+    except ValueError:
+        return 16384
+
+
+async def _iter_stdout_text(stream: asyncio.StreamReader) -> AsyncIterator[str]:
+    """Decode subprocess stdout in fixed-size binary chunks (not line-based)."""
+    chunk_sz = _stdout_chunk_bytes()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        block = await stream.read(chunk_sz)
+        if not block:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield tail
+            break
+        text = decoder.decode(block)
+        if text:
+            yield text
+
+
+def _job_subprocess_columns() -> str:
+    raw = (os.environ.get("TRAE_JOB_COLUMNS") or "").strip().lower()
+    if not raw or raw in ("0", "unlimited", "none", "max", "inf"):
+        return str(_DEFAULT_JOB_WIDE_COLUMNS)
+    if raw.isdigit():
+        n = int(raw)
+        if n <= 0:
+            return str(_DEFAULT_JOB_WIDE_COLUMNS)
+        return str(min(n, _MAX_JOB_COLUMNS))
+    return str(_DEFAULT_JOB_WIDE_COLUMNS)
+
+
+def _job_subprocess_env() -> dict[str, str]:
+    base = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    base["COLUMNS"] = _job_subprocess_columns()
+    return base
 
 
 @dataclass
@@ -197,7 +249,7 @@ class JobStore:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=work,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=_job_subprocess_env(),
                 start_new_session=True,
             )
         except Exception as e:
@@ -212,11 +264,7 @@ class JobStore:
         self._running[job_id] = proc
         assert proc.stdout is not None
         try:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                text = line.decode(errors="replace")
+            async for text in _iter_stdout_text(proc.stdout):
                 rec.output += text
                 await hub.publish(
                     {
