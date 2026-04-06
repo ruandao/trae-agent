@@ -308,7 +308,10 @@
           <input type="number" id="cloneDepth" placeholder="例如 1" min="1" max="10000" />
         </div>
       </div>
-      <button type="button" id="btnClone">克隆到新建层</button>
+      <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.25rem">
+        <button type="button" id="btnClone">克隆到新建层</button>
+        <button type="button" class="secondary" id="btnCopyCloneLog">复制日志</button>
+      </div>
       <div class="err-msg" id="cloneErr"></div>
       <pre class="out" id="cloneOut" style="max-height: 200px; margin-top: 0.5rem;"></pre>
     </section>
@@ -1060,6 +1063,22 @@
         }
       } finally {
         btn.disabled = false;
+      }
+    };
+
+    document.getElementById('btnCopyCloneLog').onclick = async () => {
+      const outEl = document.getElementById('cloneOut');
+      const text = outEl ? outEl.textContent : '';
+      const copyBtn = document.getElementById('btnCopyCloneLog');
+      const label = copyBtn.textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        copyBtn.textContent = '已复制';
+        setTimeout(() => {
+          copyBtn.textContent = label;
+        }, 1600);
+      } catch (e) {
+        alert('复制失败：' + (e && e.message ? e.message : String(e)));
       }
     };
 

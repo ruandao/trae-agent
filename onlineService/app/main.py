@@ -428,23 +428,43 @@ def _resolved_parent_layer_id(layer_id: str, known_ids: set[str], jobs: list[Any
     return None
 
 
+async def _layer_git_meta(lid: str) -> tuple[bool | None, dict[str, Any]]:
+    """在线程中跑 git 子进程，避免阻塞事件循环。"""
+    return await asyncio.gather(
+        asyncio.to_thread(git_worktree_dirty, lid),
+        asyncio.to_thread(git_ahead_of_upstream, lid),
+    )
+
+
 @app.get("/api/layers")
 async def api_list_layers(_: AuthDep) -> dict[str, Any]:
-    layers = list_layers()
-    jobs = store.list_jobs()
+    layers, jobs = await asyncio.gather(
+        asyncio.to_thread(list_layers),
+        asyncio.to_thread(store.list_jobs),
+    )
     # 将 layer_id 映射到 jobs 记录的执行命令（用于 UI 展示）。
     # 如果某个 layer 目录存在但 jobs 状态里已不存在，则不返回 command。
     cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in jobs}
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
+    with_git: list[tuple[dict[str, Any], str]] = []
     for item in layers:
         lid = item.get("layer_id")
         if not lid:
             continue
-        if lid in cmd_by_layer_id:
-            item["command"] = cmd_by_layer_id[lid]
-        item["parent_layer_id"] = _resolved_parent_layer_id(str(lid), known_ids, jobs)
-        item["git_worktree_dirty"] = git_worktree_dirty(str(lid))
-        item["git_remote"] = git_ahead_of_upstream(str(lid))
+        lid_s = str(lid)
+        if lid_s in cmd_by_layer_id:
+            item["command"] = cmd_by_layer_id[lid_s]
+        item["parent_layer_id"] = _resolved_parent_layer_id(lid_s, known_ids, jobs)
+        with_git.append((item, lid_s))
+
+    if with_git:
+        meta_list = await asyncio.gather(
+            *(_layer_git_meta(lid_s) for _item, lid_s in with_git)
+        )
+        for (item, _lid_s), (dirty, remote) in zip(with_git, meta_list, strict=True):
+            item["git_worktree_dirty"] = dirty
+            item["git_remote"] = remote
+
     return {"layers": layers}
 
 
