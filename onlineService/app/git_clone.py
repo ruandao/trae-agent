@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,7 @@ async def _drain_git_stdout(
 
 
 def _looks_like_transient_fetch_error(output: str) -> bool:
+    """HTTPS / LibreSSL 下偶发 SSL_ERROR_SYSCALL、握手被掐断等，与网络瞬断类似，应重试。"""
     needles = (
         "RPC failed",
         "curl 18",
@@ -112,8 +114,71 @@ def _looks_like_transient_fetch_error(output: str) -> bool:
         "Connection reset",
         "Connection timed out",
         "Empty reply from server",
+        "SSL_ERROR_SYSCALL",
+        "LibreSSL SSL_connect",
+        "OpenSSL SSL_read",
+        "OpenSSL SSL_connect",
+        "SSL routines:",
+        "gnutls_handshake",
+        "Could not resolve host",
     )
     return any(n in output for n in needles)
+
+
+def _retry_backoff_sec(attempt_index: int) -> float:
+    """第 attempt_index 次失败后、下一次尝试前的等待秒数（指数退避，上限可配）。"""
+    try:
+        cap = float(os.environ.get("GIT_CLONE_RETRY_BACKOFF_CAP_SEC", "30"))
+    except ValueError:
+        cap = 30.0
+    try:
+        base = float(os.environ.get("GIT_CLONE_RETRY_BACKOFF_BASE_SEC", "1.5"))
+    except ValueError:
+        base = 1.5
+    delay = base * (2**attempt_index)
+    return min(delay, max(0.0, cap))
+
+
+async def _sleep_before_retry(attempt_index: int) -> None:
+    sec = _retry_backoff_sec(attempt_index)
+    if sec > 0:
+        await asyncio.sleep(sec)
+
+
+def _clone_subprocess_env() -> dict[str, str]:
+    """子进程环境：默认继承；可选去掉代理（部分环境 HTTPS 代理会导致 GitHub SSL 握手失败）。"""
+    e = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    flag = os.environ.get("GIT_CLONE_UNSET_PROXY", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        for k in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            e.pop(k, None)
+    return e
+
+
+
+def _make_ipv4_curl_config_file() -> Path | None:
+    """返回含 ``ipv4`` 的 curl 配置文件路径，供 ``git -c http.curlConfig=…`` 使用；调用方负责删除。"""
+    flag = os.environ.get("GIT_HTTP_IPV4", "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return None
+    fd, path = tempfile.mkstemp(prefix="git-curl-ipv4-", suffix=".cfg", text=True)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("ipv4\n")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return Path(path)
 
 
 def _validate_url(url: str) -> str:
@@ -185,150 +250,165 @@ async def clone_into_new_layer(
     cfg = _git_config_prefix()
 
     for attempt in range(max_attempts):
-        layer_id = new_layer_id()
-        lp = create_root_layer(layer_id)
+        ipv4_curl_cfg: Path | None = None
         try:
-            lp_resolved = lp.resolve()
-            if root not in lp_resolved.parents and lp_resolved != root:
-                raise RuntimeError("layer path outside layers root")
-        except Exception:
-            _safe_rmtree(lp)
-            raise
+            ipv4_curl_cfg = _make_ipv4_curl_config_file()
+            layer_id = new_layer_id()
+            lp = create_root_layer(layer_id)
+            try:
+                lp_resolved = lp.resolve()
+                if root not in lp_resolved.parents and lp_resolved != root:
+                    raise RuntimeError("layer path outside layers root")
+            except Exception:
+                _safe_rmtree(lp)
+                raise
 
-        cmd: list[str] = list(cfg)
-        cmd.extend(["clone", "--progress"])
-        if dep is not None:
-            cmd.extend(["--depth", str(dep)])
-        if br is not None:
-            cmd.extend(["-b", br])
-        cmd.extend([u, "."])
+            cmd: list[str] = list(cfg)
+            if ipv4_curl_cfg is not None:
+                cmd.extend(["-c", f"http.curlConfig={ipv4_curl_cfg}"])
+            cmd.extend(["clone", "--progress"])
+            if dep is not None:
+                cmd.extend(["--depth", str(dep)])
+            if br is not None:
+                cmd.extend(["-b", br])
+            cmd.extend([u, "."])
 
-        if publish:
-            await publish(
-                {
-                    "type": "repo_clone_started",
-                    "layer_id": layer_id,
-                    "attempt": attempt + 1,
-                    "max_attempts": max_attempts,
-                    "url": u,
-                }
-            )
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(lp),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-        )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + float(tout)
-        acc: list[str] = []
-        try:
-            await _drain_git_stdout(
-                proc, deadline=deadline, layer_id=layer_id, publish=publish, acc=acc
-            )
-        except TimeoutError:
-            await _kill_git_proc(proc)
-            out = "".join(acc) + "\n[git clone timed out]\n"
             if publish:
                 await publish(
                     {
-                        "type": "repo_clone_output",
+                        "type": "repo_clone_started",
                         "layer_id": layer_id,
-                        "chunk": "\n[git clone timed out]\n",
-                    }
-                )
-            _safe_rmtree_if_under(lp, root)
-            if attempt < max_attempts - 1:
-                if publish:
-                    await publish(
-                        {
-                            "type": "repo_clone_retry",
-                            "layer_id": layer_id,
-                            "attempt": attempt + 2,
-                            "max_attempts": max_attempts,
-                            "message": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
-                        }
-                    )
-                continue
-            return layer_id, lp, out, -1
-
-        wleft = deadline - loop.time()
-        if wleft <= 0:
-            await _kill_git_proc(proc)
-            out = "".join(acc) + "\n[git clone timed out]\n"
-            if publish:
-                await publish(
-                    {
-                        "type": "repo_clone_output",
-                        "layer_id": layer_id,
-                        "chunk": "\n[git clone timed out]\n",
-                    }
-                )
-            _safe_rmtree_if_under(lp, root)
-            if attempt < max_attempts - 1:
-                if publish:
-                    await publish(
-                        {
-                            "type": "repo_clone_retry",
-                            "layer_id": layer_id,
-                            "attempt": attempt + 2,
-                            "max_attempts": max_attempts,
-                            "message": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
-                        }
-                    )
-                continue
-            return layer_id, lp, out, -1
-
-        try:
-            exit_code = await asyncio.wait_for(proc.wait(), timeout=wleft)
-        except TimeoutError:
-            await _kill_git_proc(proc)
-            out = "".join(acc) + "\n[git clone: process wait timed out]\n"
-            if publish:
-                await publish(
-                    {
-                        "type": "repo_clone_output",
-                        "layer_id": layer_id,
-                        "chunk": "\n[git clone: process wait timed out]\n",
-                    }
-                )
-            _safe_rmtree_if_under(lp, root)
-            if attempt < max_attempts - 1:
-                if publish:
-                    await publish(
-                        {
-                            "type": "repo_clone_retry",
-                            "layer_id": layer_id,
-                            "attempt": attempt + 2,
-                            "max_attempts": max_attempts,
-                            "message": f"等待进程超时，重试 {attempt + 2}/{max_attempts} …",
-                        }
-                    )
-                continue
-            return layer_id, lp, out, -1
-
-        code = exit_code if isinstance(exit_code, int) else -1
-        out = "".join(acc)
-
-        if code == 0:
-            return layer_id, lp, out, code
-
-        _safe_rmtree_if_under(lp, root)
-        if attempt < max_attempts - 1 and _looks_like_transient_fetch_error(out):
-            if publish:
-                await publish(
-                    {
-                        "type": "repo_clone_retry",
-                        "layer_id": layer_id,
-                        "attempt": attempt + 2,
+                        "attempt": attempt + 1,
                         "max_attempts": max_attempts,
-                        "message": f"网络错误，重试 {attempt + 2}/{max_attempts} …",
+                        "url": u,
                     }
                 )
-            continue
-        return layer_id, lp, out, code
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(lp),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=_clone_subprocess_env(),
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + float(tout)
+            acc: list[str] = []
+            try:
+                await _drain_git_stdout(
+                    proc, deadline=deadline, layer_id=layer_id, publish=publish, acc=acc
+                )
+            except TimeoutError:
+                await _kill_git_proc(proc)
+                out = "".join(acc) + "\n[git clone timed out]\n"
+                if publish:
+                    await publish(
+                        {
+                            "type": "repo_clone_output",
+                            "layer_id": layer_id,
+                            "chunk": "\n[git clone timed out]\n",
+                        }
+                    )
+                _safe_rmtree_if_under(lp, root)
+                if attempt < max_attempts - 1:
+                    if publish:
+                        await publish(
+                            {
+                                "type": "repo_clone_retry",
+                                "layer_id": layer_id,
+                                "attempt": attempt + 2,
+                                "max_attempts": max_attempts,
+                                "message": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
+                            }
+                        )
+                    await _sleep_before_retry(attempt)
+                    continue
+                return layer_id, lp, out, -1
+
+            wleft = deadline - loop.time()
+            if wleft <= 0:
+                await _kill_git_proc(proc)
+                out = "".join(acc) + "\n[git clone timed out]\n"
+                if publish:
+                    await publish(
+                        {
+                            "type": "repo_clone_output",
+                            "layer_id": layer_id,
+                            "chunk": "\n[git clone timed out]\n",
+                        }
+                    )
+                _safe_rmtree_if_under(lp, root)
+                if attempt < max_attempts - 1:
+                    if publish:
+                        await publish(
+                            {
+                                "type": "repo_clone_retry",
+                                "layer_id": layer_id,
+                                "attempt": attempt + 2,
+                                "max_attempts": max_attempts,
+                                "message": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
+                            }
+                        )
+                    await _sleep_before_retry(attempt)
+                    continue
+                return layer_id, lp, out, -1
+
+            try:
+                exit_code = await asyncio.wait_for(proc.wait(), timeout=wleft)
+            except TimeoutError:
+                await _kill_git_proc(proc)
+                out = "".join(acc) + "\n[git clone: process wait timed out]\n"
+                if publish:
+                    await publish(
+                        {
+                            "type": "repo_clone_output",
+                            "layer_id": layer_id,
+                            "chunk": "\n[git clone: process wait timed out]\n",
+                        }
+                    )
+                _safe_rmtree_if_under(lp, root)
+                if attempt < max_attempts - 1:
+                    if publish:
+                        await publish(
+                            {
+                                "type": "repo_clone_retry",
+                                "layer_id": layer_id,
+                                "attempt": attempt + 2,
+                                "max_attempts": max_attempts,
+                                "message": f"等待进程超时，重试 {attempt + 2}/{max_attempts} …",
+                            }
+                        )
+                    await _sleep_before_retry(attempt)
+                    continue
+                return layer_id, lp, out, -1
+
+            code = exit_code if isinstance(exit_code, int) else -1
+            out = "".join(acc)
+
+            if code == 0:
+                return layer_id, lp, out, code
+
+            _safe_rmtree_if_under(lp, root)
+            if attempt < max_attempts - 1 and _looks_like_transient_fetch_error(out):
+                if publish:
+                    await publish(
+                        {
+                            "type": "repo_clone_retry",
+                            "layer_id": layer_id,
+                            "attempt": attempt + 2,
+                            "max_attempts": max_attempts,
+                            "message": f"网络错误，重试 {attempt + 2}/{max_attempts} …",
+                        }
+                    )
+                await _sleep_before_retry(attempt)
+                continue
+            return layer_id, lp, out, code
+        finally:
+            if ipv4_curl_cfg is not None:
+                try:
+                    ipv4_curl_cfg.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _safe_rmtree(path: Path) -> None:

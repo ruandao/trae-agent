@@ -11,6 +11,11 @@ export no_proxy="${_local_no_proxy}${no_proxy:+,${no_proxy}}"
 export ACCESS_TOKEN="${ACCESS_TOKEN:-dev-local-token}"
 export REPO_ROOT="${REPO_ROOT:-$ROOT}"
 export TRAE_VENV="${TRAE_VENV:-$ROOT/.venv}"
+# macOS 自带 git 使用 LibreSSL，克隆 GitHub 时易出现 SSL_ERROR_SYSCALL；默认强制 IPv4 可缓解（需关闭时: GIT_HTTP_IPV4=0 ./run_local.sh）
+if [[ "$(uname -s)" == Darwin ]]; then
+  export GIT_HTTP_IPV4="${GIT_HTTP_IPV4:-1}"
+fi
+# 若克隆 GitHub 仍报 SSL/代理相关错误，可尝试：GIT_CLONE_UNSET_PROXY=1 ./run_local.sh（仅去掉 git 子进程的代理变量）
 if command -v uv >/dev/null 2>&1; then
   (cd "$ROOT" && uv pip install -q -r onlineService/requirements.txt)
 else
