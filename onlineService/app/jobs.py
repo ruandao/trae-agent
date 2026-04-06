@@ -134,6 +134,46 @@ class JobRecord:
         return d
 
 
+def _job_command_head(rec: JobRecord | None, max_len: int = 56) -> str:
+    if rec is None:
+        return ""
+    cmd = (rec.command or "").strip()
+    if len(cmd) <= max_len:
+        return cmd
+    return cmd[: max_len - 1] + "…"
+
+
+def sse_job_event(
+    event_type: str,
+    rec: JobRecord | None,
+    job_id: str,
+    *,
+    extra_title: str | None = None,
+) -> dict[str, Any]:
+    """轻量 SSE：仅 job_id + 标题，正文由前端按 ID 拉 REST。"""
+    jid = job_id if rec is None else rec.id
+    head = _job_command_head(rec)
+    titles = {
+        "job_created": "新任务已创建",
+        "job_started": "任务已开始",
+        "job_output": "控制台输出更新",
+        "job_finished": "任务已结束",
+        "job_interrupt_requested": "已请求中断",
+        "job_redone": "已重新执行（层已重建）",
+        "job_continued": "已继续执行",
+    }
+    base = titles.get(event_type, event_type)
+    if extra_title:
+        title = extra_title
+    elif head and event_type == "job_created":
+        title = f"{base} · {head}"
+    elif event_type == "job_finished" and rec is not None:
+        title = f"{base} · {rec.status}" + (f" · {head}" if head else "")
+    else:
+        title = base
+    return {"type": event_type, "job_id": jid, "title": title}
+
+
 def job_layer_git_destructive_locked(rec: JobRecord) -> bool:
     """相对任务开始执行时所记录 HEAD，若当前 HEAD 不同则视为已有新提交，锁定破坏性操作。
 
@@ -246,7 +286,7 @@ class JobStore:
         async with self._lock:
             self._jobs[jid] = rec
         await self._save()
-        await hub.publish({"type": "job_created", "job": rec.to_dict()})
+        await hub.publish(sse_job_event("job_created", rec, rec.id))
         task = asyncio.create_task(self._run_job(jid))
         self._runner_tasks[jid] = task
         task.add_done_callback(lambda _t, job_id=jid: self._runner_tasks.pop(job_id, None))
@@ -279,18 +319,12 @@ class JobStore:
             banner = f"[git checkout {rec.git_branch}]\n{co_out}"
             rec.output = banner
             await self._save()
-            await hub.publish(
-                {
-                    "type": "job_output",
-                    "job_id": job_id,
-                    "chunk": banner,
-                }
-            )
+            await hub.publish(sse_job_event("job_output", rec, job_id))
             if co_code != 0:
                 rec.status = "failed"
                 rec.exit_code = co_code
                 await self._save()
-                await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
+                await hub.publish(sse_job_event("job_finished", rec, job_id))
                 return
 
         head0 = await asyncio.to_thread(_git_rev_parse_head_sync, Path(work))
@@ -303,7 +337,7 @@ class JobStore:
         elif not (rec.git_branch and rec.output.strip()):
             rec.output = ""
         await self._save()
-        await hub.publish({"type": "job_started", "job_id": job_id})
+        await hub.publish(sse_job_event("job_started", rec, job_id))
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -320,7 +354,7 @@ class JobStore:
             rec.output = err_line if not preserve_output else rec.output + err_line
             rec.exit_code = -1
             await self._save()
-            await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
+            await hub.publish(sse_job_event("job_finished", rec, job_id))
             return
 
         self._running[job_id] = proc
@@ -328,13 +362,7 @@ class JobStore:
         try:
             async for text in _iter_stdout_text(proc.stdout):
                 rec.output += text
-                await hub.publish(
-                    {
-                        "type": "job_output",
-                        "job_id": job_id,
-                        "chunk": text,
-                    }
-                )
+                await hub.publish(sse_job_event("job_output", rec, job_id))
             code = await proc.wait()
             rec.exit_code = code
             if job_id in self._running:
@@ -356,7 +384,7 @@ class JobStore:
             if job_id in self._running:
                 del self._running[job_id]
             await self._save()
-            await hub.publish({"type": "job_finished", "job_id": job_id, "job": rec.to_dict()})
+            await hub.publish(sse_job_event("job_finished", rec, job_id))
 
     async def interrupt(self, job_id: str) -> bool:
         rec = self._jobs.get(job_id)
@@ -373,7 +401,7 @@ class JobStore:
             pass
         except PermissionError:
             proc.terminate()
-        await hub.publish({"type": "job_interrupt_requested", "job_id": job_id})
+        await hub.publish(sse_job_event("job_interrupt_requested", rec, job_id))
         return True
 
     async def redo_job(self, job_id: str) -> JobRecord:
@@ -436,7 +464,7 @@ class JobStore:
             rec.git_head_at_run_start = None
 
         await self._save()
-        await hub.publish({"type": "job_redone", "job_id": job_id, "job": rec.to_dict()})
+        await hub.publish(sse_job_event("job_redone", rec, job_id))
 
         task = asyncio.create_task(self._run_job(job_id))
         self._runner_tasks[job_id] = task
@@ -458,7 +486,7 @@ class JobStore:
             rec.exit_code = None
 
         await self._save()
-        await hub.publish({"type": "job_continued", "job_id": job_id, "job": rec.to_dict()})
+        await hub.publish(sse_job_event("job_continued", rec, job_id))
 
         task = asyncio.create_task(
             self._run_job(job_id, run_command="继续", preserve_output=True)
@@ -511,7 +539,7 @@ class JobStore:
 
         await asyncio.to_thread(_unlink_commands_log)
 
-        await hub.publish({"type": "jobs_reset"})
+        await hub.publish({"type": "jobs_reset", "title": "任务与可写层已重置"})
         return {
             "jobs_cleared": len(all_job_ids),
             "running_interrupted": len(running_items),
@@ -576,7 +604,9 @@ class JobStore:
             await asyncio.to_thread(shutil.rmtree, layer_path_obj, True)
 
         await self._save()
-        await hub.publish({"type": "job_deleted", "job_id": job_id})
+        await hub.publish(
+            {"type": "job_deleted", "job_id": job_id, "title": "任务已删除"}
+        )
         return {"job_id": job_id, "status": "deleted"}
 
 

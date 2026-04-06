@@ -14,7 +14,11 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .auth import AuthDep
-from .git_clone import clone_into_new_layer
+from .git_clone import (
+    clear_clone_layer_log,
+    clone_into_new_layer,
+    get_clone_layer_log_text,
+)
 from .hub import hub
 from .layer_fs import (
     any_layer_has_git_repo,
@@ -90,6 +94,26 @@ def _command_for_layer_id(layer_id: str) -> str | None:
         if j.layer_id == layer_id:
             return j.command
     return None
+
+
+def _valid_layer_id_param(layer_id: str) -> str:
+    if (
+        ".." in layer_id
+        or "/" in layer_id
+        or "\\" in layer_id
+        or not layer_id.strip()
+        or len(layer_id) > 256
+    ):
+        raise HTTPException(status_code=400, detail="invalid layer_id")
+    return layer_id
+
+
+async def _schedule_clear_clone_log(layer_id: str, delay: float = 4.0) -> None:
+    async def _run() -> None:
+        await asyncio.sleep(delay)
+        await clear_clone_layer_log(layer_id)
+
+    asyncio.create_task(_run())
 
 
 @app.get("/skill.md", include_in_schema=False)
@@ -170,11 +194,11 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
             {
                 "type": "repo_clone_finished",
                 "layer_id": layer_id,
-                "layer_path": str(lp),
+                "title": f"克隆失败 (exit {code})",
                 "status": "error",
-                "exit_code": code,
             }
         )
+        await _schedule_clear_clone_log(layer_id)
         raise HTTPException(
             status_code=400,
             detail={
@@ -187,24 +211,32 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
         {
             "type": "repo_clone_finished",
             "layer_id": layer_id,
-            "layer_path": str(lp),
+            "title": "克隆成功",
             "status": "ok",
-            "exit_code": code,
         }
     )
     await hub.publish(
         {
             "type": "repo_cloned",
             "layer_id": layer_id,
-            "layer_path": str(lp),
+            "title": "仓库已就绪",
         }
     )
+    await _schedule_clear_clone_log(layer_id)
     return {
         "status": "ok",
         "layer_id": layer_id,
         "layer_path": str(lp),
         "output": out,
     }
+
+
+@app.get("/api/repos/clone-log/{layer_id}")
+async def api_clone_log(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """轮询克隆进度：正文在服务端缓冲，SSE 仅通知 layer_id。"""
+    lid = _valid_layer_id_param(layer_id)
+    text = await get_clone_layer_log_text(lid)
+    return {"layer_id": lid, "text": text}
 
 
 @app.post("/api/jobs")

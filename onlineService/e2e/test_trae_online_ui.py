@@ -58,7 +58,7 @@ def reset_before_each_test(request: pytest.FixtureRequest, page: Page) -> None:
 
 @pytest.mark.skip_reset
 def test_event_source_patch_and_large_chunk_like_batched_sse(page: Page) -> None:
-    """在首屏加载前包装 EventSource；向任务 pre 写入大块多行文本，模拟后端合并后的单条 chunk。"""
+    """在首屏加载前包装 EventSource；统计轻量 ``job_output`` SSE（无 chunk，前端按 job_id 拉取）。"""
     page.add_init_script(
         """
         window.__traeJobOutputChunks = 0;
@@ -68,7 +68,7 @@ def test_event_source_patch_and_large_chunk_like_batched_sse(page: Page) -> None
           es.addEventListener('message', (ev) => {
             try {
               const o = JSON.parse(ev.data);
-              if (o.type === 'job_output') window.__traeJobOutputChunks += 1;
+              if (o.type === 'job_output' && o.job_id) window.__traeJobOutputChunks += 1;
             } catch (e) {}
           });
           return es;

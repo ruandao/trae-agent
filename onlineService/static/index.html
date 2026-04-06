@@ -502,6 +502,7 @@
 
     /** 重置「克隆仓库」区块：本地缓存、表单、日志与进行中状态（与服务器清空可写层一致） */
     function resetCloneSectionUi() {
+      stopCloneLogPoll();
       clearClonePersistState();
       lastCloneForm = { url: '', branch: '', depth: '' };
       currentStreamingLayerId = null;
@@ -611,13 +612,52 @@
       logEl.appendChild(t);
       logEl.scrollTop = logEl.scrollHeight;
     }
-    let _jobOutputListRefreshTimer = null;
-    function scheduleJobsListRefreshDebounced() {
-      if (_jobOutputListRefreshTimer) return;
-      _jobOutputListRefreshTimer = setTimeout(() => {
-        _jobOutputListRefreshTimer = null;
-        loadJobs();
-      }, 200);
+
+    const ssePendingJobIds = new Set();
+    let sseFullListPending = false;
+    let sseFlushTimer = null;
+    let sseNeedLayersAfterFull = false;
+    let cloneLogPollInterval = null;
+
+    function ensureCloneLogPoll(layerId) {
+      if (!layerId) return;
+      currentStreamingLayerId = layerId;
+      if (cloneLogPollInterval) return;
+      cloneLogPollInterval = setInterval(async () => {
+        const lid = currentStreamingLayerId;
+        if (!lid) return;
+        try {
+          const r = await api('/api/repos/clone-log/' + encodeURIComponent(lid));
+          if (!r.ok) return;
+          const data = await r.json();
+          const el = document.getElementById('cloneOut');
+          if (el && data.text != null) {
+            el.textContent = data.text;
+            el.scrollTop = el.scrollHeight;
+          }
+          if (clonePersistDebounce) clearTimeout(clonePersistDebounce);
+          clonePersistDebounce = setTimeout(() => {
+            clonePersistDebounce = null;
+            if (!currentStreamingLayerId) return;
+            const o = document.getElementById('cloneOut');
+            saveClonePersistState({
+              layer_id: currentStreamingLayerId,
+              clone_url: lastCloneForm.url,
+              branch: lastCloneForm.branch,
+              depth: lastCloneForm.depth,
+              output: o ? truncateCloneOutput(o.textContent) : '',
+              status: 'running',
+            });
+          }, 500);
+        } catch (_) {}
+      }, 480);
+    }
+
+    function stopCloneLogPoll() {
+      if (cloneLogPollInterval) {
+        clearInterval(cloneLogPollInterval);
+        cloneLogPollInterval = null;
+      }
     }
 
     const _jobStepsRefreshTimers = {};
@@ -849,65 +889,42 @@
       }
     }
 
-    function appendCloneLog(chunk) {
-      const el = document.getElementById('cloneOut');
-      if (!el) return;
-      el.textContent += chunk;
-      el.scrollTop = el.scrollHeight;
-      if (clonePersistDebounce) clearTimeout(clonePersistDebounce);
-      clonePersistDebounce = setTimeout(() => {
-        clonePersistDebounce = null;
-        if (!currentStreamingLayerId) return;
-        const o = document.getElementById('cloneOut');
-        saveClonePersistState({
-          layer_id: currentStreamingLayerId,
-          clone_url: lastCloneForm.url,
-          branch: lastCloneForm.branch,
-          depth: lastCloneForm.depth,
-          output: o ? truncateCloneOutput(o.textContent) : '',
-          status: 'running',
-        });
-      }, 500);
-    }
     const es = new EventSource(
       '/api/events/stream?access_token=' + encodeURIComponent(ACCESS_TOKEN)
     );
     es.onmessage = (ev) => {
       try {
         const o = JSON.parse(ev.data);
-        if (o.type === 'repo_clone_output') {
-          appendCloneLog(o.chunk || '');
+        if (o.type === 'connected') {
           return;
         }
         if (o.type === 'repo_clone_started') {
-          currentStreamingLayerId = o.layer_id || null;
-          if (o.url) lastCloneForm.url = o.url;
           const el = document.getElementById('cloneOut');
-          if (el) {
-            el.textContent = '';
-            appendCloneLog(
-              '开始克隆 (第 ' +
-                (o.attempt ?? '?') +
-                '/' +
-                (o.max_attempts ?? '?') +
-                ')\n' +
-                (o.url || '') +
-                '\n\n'
-            );
-          }
+          if (el) el.textContent = (o.title || '开始克隆') + '\n\n';
+          ensureCloneLogPoll(o.layer_id);
+          if (o.title) sseAppend('repo_clone_started · ' + o.title);
+          return;
+        }
+        if (o.type === 'repo_clone_delta') {
+          ensureCloneLogPoll(o.layer_id);
           return;
         }
         if (o.type === 'repo_clone_retry') {
-          appendCloneLog('\n━━ ' + (o.message || '重试') + ' ━━\n');
+          ensureCloneLogPoll(o.layer_id);
+          const el = document.getElementById('cloneOut');
+          if (el && o.title) el.textContent += '\n━━ ' + o.title + ' ━━\n';
+          if (o.title) sseAppend('repo_clone_retry · ' + o.title);
           return;
         }
         if (o.type === 'repo_clone_finished') {
+          stopCloneLogPoll();
           currentStreamingLayerId = null;
           if (o.status === 'ok' && o.layer_id) {
             snapshotClonePersist('ok', {
               layer_id: o.layer_id,
-              layer_path: o.layer_path,
+              layer_path: '',
             });
+            if (o.title) sseAppend('repo_clone_finished · ' + o.title);
             loadLayers(o.layer_id).then(() => {
               const sel = document.getElementById('layerSelect');
               if (sel && o.layer_id) sel.value = o.layer_id;
@@ -916,48 +933,61 @@
             });
           } else if (o.status === 'error') {
             const errEl = document.getElementById('cloneErr');
-            const msg = '克隆失败 (exit ' + (o.exit_code ?? '?') + ')';
+            const msg = o.title || '克隆失败';
             if (errEl) errEl.textContent = msg;
             snapshotClonePersist('error', {
               layer_id: o.layer_id,
-              layer_path: o.layer_path,
+              layer_path: '',
               errorMsg: msg,
             });
+            if (o.title) sseAppend('repo_clone_finished · ' + o.title);
           }
           return;
         }
-        if (o.type === 'job_started') {
-          loadJobs();
-          sseAppend('job_started ' + (o.job_id || '').slice(0, 8) + '…');
-        } else if (o.type === 'job_output') {
-          if (o.chunk && o.job_id) {
-            const card = document.querySelector('.job-card[data-id="' + o.job_id + '"]');
-            const pre = card && card.querySelector('pre.job-raw-pre');
-            if (pre) {
-              pre.textContent += o.chunk;
-              pre.scrollTop = pre.scrollHeight;
-            } else {
-              scheduleJobsListRefreshDebounced();
-            }
-            scheduleJobStepsRefresh(o.job_id);
-          }
-          sseAppend('output ' + o.job_id.slice(0, 8) + '…');
-        } else {
-          sseAppend(ev.data.slice(0, 200));
+        if (o.type === 'repo_cloned') {
+          if (o.title) sseAppend('repo_cloned · ' + o.title);
+          return;
+        }
+        if (o.type === 'jobs_reset') {
+          stopCloneLogPoll();
+          currentStreamingLayerId = null;
+          if (o.title) sseAppend('jobs_reset · ' + o.title);
+          resetCloneSectionUi();
+          void loadJobs();
+          void loadLayers();
+          void reloadLayerTree();
+          return;
         }
         if (
-          o.type === 'job_finished' ||
           o.type === 'job_created' ||
           o.type === 'job_redone' ||
+          o.type === 'job_continued' ||
           o.type === 'job_deleted'
-        )
-          loadJobs();
-        if (o.type === 'jobs_reset') {
-          resetCloneSectionUi();
-          loadJobs();
-          // jobs_reset 后可写层也会被清理，刷新树形 UI
-          loadLayers();
-          reloadLayerTree();
+        ) {
+          if (o.type === 'job_deleted') {
+            markSseFullList({ refreshLayers: true });
+          } else {
+            markSseFullList({});
+          }
+          if (o.title) sseAppend(o.type + ' · ' + o.title);
+          return;
+        }
+        if (
+          o.type === 'job_started' ||
+          o.type === 'job_output' ||
+          o.type === 'job_finished' ||
+          o.type === 'job_interrupt_requested'
+        ) {
+          markSseJob(o.job_id);
+          if (o.type !== 'job_output' && o.title) {
+            sseAppend(o.type + ' · ' + o.title);
+          }
+          return;
+        }
+        {
+          const line =
+            (o.type || 'event') + (o.title ? ' · ' + o.title : '') || ev.data.slice(0, 200);
+          sseAppend(line);
         }
       } catch (_) {
         sseAppend(ev.data.slice(0, 120));
@@ -1182,34 +1212,19 @@
       }
     }
 
-    async function loadJobs() {
-      const r = await api('/api/jobs');
-      const box = document.getElementById('jobs');
-      if (!r.ok) {
-        box.innerHTML = '<p class="err-msg">' + (await r.text()) + '</p>';
-        await applyTaskGate();
-        return;
-      }
-      const { jobs } = await r.json();
-      lastJobs = jobs;
-      fillParentJobSelect(jobs);
-      await fillJobRepoLayerSelect();
-      updateJobRepoLayerVisibility();
-      await refreshJobBranches();
-      box.innerHTML = jobs
-        .map((j) => {
-          const gitLock = j.git_destructive_locked === true;
-          const lockTitle = '该可写层在任务开始后已有 git 提交（HEAD 已变化），不可中断、重新执行或删除';
-          const disRedo = gitLock ? 'disabled title="' + lockTitle + '"' : '';
-          const disDel = gitLock ? 'disabled title="' + lockTitle + '"' : '';
-          const disInt =
-            j.status !== 'running' || gitLock
-              ? 'disabled' + (gitLock ? ' title="' + lockTitle + '"' : '')
-              : '';
-          const lockNote = gitLock
-            ? '<div class="meta" style="color:var(--warn);margin-top:0.35rem;">已检测到 git 提交，已禁止中断、重新执行与删除。</div>'
-            : '';
-          return `
+    function jobCardMarkup(j) {
+      const gitLock = j.git_destructive_locked === true;
+      const lockTitle = '该可写层在任务开始后已有 git 提交（HEAD 已变化），不可中断、重新执行或删除';
+      const disRedo = gitLock ? 'disabled title="' + lockTitle + '"' : '';
+      const disDel = gitLock ? 'disabled title="' + lockTitle + '"' : '';
+      const disInt =
+        j.status !== 'running' || gitLock
+          ? 'disabled' + (gitLock ? ' title="' + lockTitle + '"' : '')
+          : '';
+      const lockNote = gitLock
+        ? '<div class="meta" style="color:var(--warn);margin-top:0.35rem;">已检测到 git 提交，已禁止中断、重新执行与删除。</div>'
+        : '';
+      return `
         <div class="job-card" data-id="${j.id}">
           <div class="meta">层: ${j.layer_id} · ${j.created_at}</div>
           <div><strong>${escapeHtml(j.command)}</strong></div>
@@ -1235,16 +1250,17 @@
           </details>
           <button class="danger" data-interrupt="${j.id}" ${disInt}>中断</button>
         </div>`;
-        })
-        .join('');
-      box.querySelectorAll('[data-interrupt]').forEach((btn) => {
+    }
+
+    function wireJobCardButtons(container) {
+      container.querySelectorAll('[data-interrupt]').forEach((btn) => {
         btn.onclick = async () => {
           const id = btn.getAttribute('data-interrupt');
           await api('/api/jobs/' + id + '/interrupt', { method: 'POST' });
           loadJobs();
         };
       });
-      box.querySelectorAll('.copy-job-log').forEach((btn) => {
+      container.querySelectorAll('.copy-job-log').forEach((btn) => {
         btn.onclick = async () => {
           const id = btn.getAttribute('data-copy-log');
           const job = lastJobs.find((x) => x.id === id);
@@ -1261,7 +1277,7 @@
           }
         };
       });
-      box.querySelectorAll('[data-redo]').forEach((btn) => {
+      container.querySelectorAll('[data-redo]').forEach((btn) => {
         btn.onclick = async () => {
           const id = btn.getAttribute('data-redo');
           const label = btn.textContent;
@@ -1289,7 +1305,7 @@
           }
         };
       });
-      box.querySelectorAll('[data-continue]').forEach((btn) => {
+      container.querySelectorAll('[data-continue]').forEach((btn) => {
         btn.onclick = async () => {
           const id = btn.getAttribute('data-continue');
           const label = btn.textContent;
@@ -1317,7 +1333,7 @@
           }
         };
       });
-      box.querySelectorAll('[data-delete]').forEach((btn) => {
+      container.querySelectorAll('[data-delete]').forEach((btn) => {
         btn.onclick = async () => {
           const id = btn.getAttribute('data-delete');
           if (!id) return;
@@ -1348,6 +1364,87 @@
           }
         };
       });
+    }
+
+    async function refreshSingleJobFromApi(jobId) {
+      const r = await api('/api/jobs/' + encodeURIComponent(jobId));
+      if (!r.ok) {
+        markSseFullList({});
+        return;
+      }
+      const j = await r.json();
+      const ix = lastJobs.findIndex((x) => x.id === j.id);
+      if (ix >= 0) lastJobs[ix] = j;
+      else lastJobs.unshift(j);
+      lastJobs.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      const box = document.getElementById('jobs');
+      if (!box) return;
+      const wrap = document.createElement('div');
+      wrap.innerHTML = jobCardMarkup(j).trim();
+      const newCard = wrap.firstElementChild;
+      if (!newCard) return;
+      const old = box.querySelector('.job-card[data-id="' + j.id + '"]');
+      if (old) old.replaceWith(newCard);
+      else box.insertBefore(newCard, box.firstChild);
+      wireJobCardButtons(newCard);
+      scheduleJobStepsRefresh(j.id);
+    }
+
+    async function flushSseQueue() {
+      sseFlushTimer = null;
+      if (sseFullListPending) {
+        sseFullListPending = false;
+        ssePendingJobIds.clear();
+        await loadJobs();
+        if (sseNeedLayersAfterFull) {
+          sseNeedLayersAfterFull = false;
+          const sel = document.getElementById('layerSelect');
+          await loadLayers(sel && sel.value ? sel.value : null);
+          await reloadLayerTree();
+        }
+        return;
+      }
+      const ids = Array.from(ssePendingJobIds);
+      ssePendingJobIds.clear();
+      for (let i = 0; i < ids.length; i++) {
+        await refreshSingleJobFromApi(ids[i]);
+      }
+    }
+
+    function markSseFullList(opts) {
+      sseFullListPending = true;
+      if (opts && opts.refreshLayers) sseNeedLayersAfterFull = true;
+      scheduleSseFlush();
+    }
+
+    function markSseJob(jobId) {
+      if (jobId) ssePendingJobIds.add(jobId);
+      scheduleSseFlush();
+    }
+
+    function scheduleSseFlush() {
+      if (sseFlushTimer) return;
+      sseFlushTimer = setTimeout(() => {
+        void flushSseQueue();
+      }, 320);
+    }
+
+    async function loadJobs() {
+      const r = await api('/api/jobs');
+      const box = document.getElementById('jobs');
+      if (!r.ok) {
+        box.innerHTML = '<p class="err-msg">' + (await r.text()) + '</p>';
+        await applyTaskGate();
+        return;
+      }
+      const { jobs } = await r.json();
+      lastJobs = jobs;
+      fillParentJobSelect(jobs);
+      await fillJobRepoLayerSelect();
+      updateJobRepoLayerVisibility();
+      await refreshJobBranches();
+      box.innerHTML = jobs.map((j) => jobCardMarkup(j)).join('');
+      wireJobCardButtons(box);
       refreshAllJobSteps();
       await applyTaskGate();
     }

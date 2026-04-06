@@ -16,6 +16,41 @@ from .layers import create_root_layer, new_layer_id
 PublishFn = Callable[[dict[str, Any]], Awaitable[None]]
 from .paths import layers_root
 
+_clone_log_lock = asyncio.Lock()
+_clone_logs: dict[str, str] = {}
+
+try:
+    _MAX_CLONE_LOG_CHARS = max(10_000, int(os.environ.get("TRAE_CLONE_LOG_CAP", "2000000")))
+except ValueError:
+    _MAX_CLONE_LOG_CHARS = 2_000_000
+
+
+async def clear_clone_layer_log(layer_id: str) -> None:
+    async with _clone_log_lock:
+        _clone_logs.pop(layer_id, None)
+
+
+async def get_clone_layer_log_text(layer_id: str) -> str:
+    async with _clone_log_lock:
+        return _clone_logs.get(layer_id, "")
+
+
+async def append_clone_layer_log(layer_id: str, text: str) -> None:
+    if not text:
+        return
+    async with _clone_log_lock:
+        cur = _clone_logs.get(layer_id, "") + text
+        if len(cur) > _MAX_CLONE_LOG_CHARS:
+            cur = "\n…(日志过长，仅保留末尾)\n" + cur[-_MAX_CLONE_LOG_CHARS :]
+        _clone_logs[layer_id] = cur
+
+
+def _clone_title_url(u: str, max_len: int = 72) -> str:
+    s = u.strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
 _MAX_URL_LEN = 4096
 _MAX_BRANCH_LEN = 256
 _DEFAULT_TIMEOUT = int(os.environ.get("GIT_CLONE_TIMEOUT_SEC", "1800"))
@@ -99,7 +134,14 @@ async def _drain_git_stdout(
         text = chunk.decode(errors="replace")
         acc.append(text)
         if publish:
-            await publish({"type": "repo_clone_output", "layer_id": layer_id, "chunk": text})
+            await append_clone_layer_log(layer_id, text)
+            await publish(
+                {
+                    "type": "repo_clone_delta",
+                    "layer_id": layer_id,
+                    "title": "克隆输出更新",
+                }
+            )
 
 
 def _looks_like_transient_fetch_error(output: str) -> bool:
@@ -231,8 +273,9 @@ async def clone_into_new_layer(
 ) -> tuple[str, Path, str, int]:
     """Create a new layer and run ``git clone`` into it.
 
-    If ``publish`` is set, streams chunks as ``{"type": "repo_clone_output", "layer_id", "chunk"}``.
-    Also emits ``repo_clone_started`` / ``repo_clone_retry`` when applicable.
+    If ``publish`` is set, appends to an in-memory log and emits lightweight
+    ``{"type": "repo_clone_delta", "layer_id", "title"}`` for UI polling.
+    Also emits lightweight ``repo_clone_started`` / ``repo_clone_retry`` / ``repo_clone_delta`` when applicable.
 
     Returns ``(layer_id, resolved_layer_path, combined_output, exit_code)``.
     On non-zero exit, the layer directory is removed if it exists under ``layers_root``.
@@ -274,13 +317,14 @@ async def clone_into_new_layer(
             cmd.extend([u, "."])
 
             if publish:
+                await clear_clone_layer_log(layer_id)
                 await publish(
                     {
                         "type": "repo_clone_started",
                         "layer_id": layer_id,
-                        "attempt": attempt + 1,
-                        "max_attempts": max_attempts,
-                        "url": u,
+                        "title": "开始克隆 ({}/{}) · {}".format(
+                            attempt + 1, max_attempts, _clone_title_url(u)
+                        ),
                     }
                 )
 
@@ -302,11 +346,12 @@ async def clone_into_new_layer(
                 await _kill_git_proc(proc)
                 out = "".join(acc) + "\n[git clone timed out]\n"
                 if publish:
+                    await append_clone_layer_log(layer_id, "\n[git clone timed out]\n")
                     await publish(
                         {
-                            "type": "repo_clone_output",
+                            "type": "repo_clone_delta",
                             "layer_id": layer_id,
-                            "chunk": "\n[git clone timed out]\n",
+                            "title": "克隆超时",
                         }
                     )
                 _safe_rmtree_if_under(lp, root)
@@ -316,9 +361,7 @@ async def clone_into_new_layer(
                             {
                                 "type": "repo_clone_retry",
                                 "layer_id": layer_id,
-                                "attempt": attempt + 2,
-                                "max_attempts": max_attempts,
-                                "message": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
+                                "title": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
                             }
                         )
                     await _sleep_before_retry(attempt)
@@ -330,11 +373,12 @@ async def clone_into_new_layer(
                 await _kill_git_proc(proc)
                 out = "".join(acc) + "\n[git clone timed out]\n"
                 if publish:
+                    await append_clone_layer_log(layer_id, "\n[git clone timed out]\n")
                     await publish(
                         {
-                            "type": "repo_clone_output",
+                            "type": "repo_clone_delta",
                             "layer_id": layer_id,
-                            "chunk": "\n[git clone timed out]\n",
+                            "title": "克隆超时",
                         }
                     )
                 _safe_rmtree_if_under(lp, root)
@@ -344,9 +388,7 @@ async def clone_into_new_layer(
                             {
                                 "type": "repo_clone_retry",
                                 "layer_id": layer_id,
-                                "attempt": attempt + 2,
-                                "max_attempts": max_attempts,
-                                "message": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
+                                "title": f"克隆超时，重试 {attempt + 2}/{max_attempts} …",
                             }
                         )
                     await _sleep_before_retry(attempt)
@@ -359,11 +401,12 @@ async def clone_into_new_layer(
                 await _kill_git_proc(proc)
                 out = "".join(acc) + "\n[git clone: process wait timed out]\n"
                 if publish:
+                    await append_clone_layer_log(layer_id, "\n[git clone: process wait timed out]\n")
                     await publish(
                         {
-                            "type": "repo_clone_output",
+                            "type": "repo_clone_delta",
                             "layer_id": layer_id,
-                            "chunk": "\n[git clone: process wait timed out]\n",
+                            "title": "克隆进程等待超时",
                         }
                     )
                 _safe_rmtree_if_under(lp, root)
@@ -373,9 +416,7 @@ async def clone_into_new_layer(
                             {
                                 "type": "repo_clone_retry",
                                 "layer_id": layer_id,
-                                "attempt": attempt + 2,
-                                "max_attempts": max_attempts,
-                                "message": f"等待进程超时，重试 {attempt + 2}/{max_attempts} …",
+                                "title": f"等待进程超时，重试 {attempt + 2}/{max_attempts} …",
                             }
                         )
                     await _sleep_before_retry(attempt)
@@ -395,9 +436,7 @@ async def clone_into_new_layer(
                         {
                             "type": "repo_clone_retry",
                             "layer_id": layer_id,
-                            "attempt": attempt + 2,
-                            "max_attempts": max_attempts,
-                            "message": f"网络错误，重试 {attempt + 2}/{max_attempts} …",
+                            "title": f"网络错误，重试 {attempt + 2}/{max_attempts} …",
                         }
                     )
                 await _sleep_before_retry(attempt)
