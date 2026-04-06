@@ -323,3 +323,160 @@ async def commit_layer_worktree(
         "commit_message": msg,
         "output": out_commit.strip(),
     }
+
+
+def git_ahead_of_upstream(layer_id: str) -> dict[str, Any]:
+    """当前分支相对上游的领先提交数（共享 ``.git`` 的层结果一致）。"""
+    _ensure_layer_id(layer_id)
+    root = layer_path(layer_id)
+    if not root.is_dir() or not (root / ".git").exists():
+        return {
+            "is_git": False,
+            "ahead": None,
+            "branch": None,
+            "upstream": None,
+            "no_upstream": None,
+        }
+
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    r_head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    branch = r_head.stdout.strip() if r_head.returncode == 0 else None
+
+    r_u = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "@{u}"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if r_u.returncode != 0:
+        return {
+            "is_git": True,
+            "ahead": None,
+            "branch": branch,
+            "upstream": None,
+            "no_upstream": True,
+        }
+
+    upstream = r_u.stdout.strip()
+    r_cnt = subprocess.run(
+        ["git", "rev-list", "--count", f"{upstream}..HEAD"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    if r_cnt.returncode != 0:
+        return {
+            "is_git": True,
+            "ahead": None,
+            "branch": branch,
+            "upstream": upstream,
+            "no_upstream": False,
+        }
+    try:
+        ahead = int((r_cnt.stdout or "").strip())
+    except ValueError:
+        ahead = None
+    return {
+        "is_git": True,
+        "ahead": ahead,
+        "branch": branch,
+        "upstream": upstream,
+        "no_upstream": False,
+    }
+
+
+_MAX_PARENT_DIFF_CHARS = 400_000
+
+
+def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[str, Any]:
+    """对比子层工作区目录与父层目录（排除 ``.git``），使用系统 ``diff -ruN``。"""
+    _ensure_layer_id(layer_id)
+    _ensure_layer_id(parent_layer_id)
+    if parent_layer_id == layer_id:
+        raise HTTPException(status_code=400, detail="invalid parent/child pair")
+
+    parent_root = layer_path(parent_layer_id).resolve()
+    child_root = layer_path(layer_id).resolve()
+    if not parent_root.is_dir():
+        raise HTTPException(status_code=404, detail="parent layer not found")
+    if not child_root.is_dir():
+        raise HTTPException(status_code=404, detail="layer not found")
+
+    try:
+        proc = subprocess.run(
+            ["diff", "-ruN", "-x", ".git", str(parent_root), str(child_root)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
+        )
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail=f"diff timed out: {e}") from e
+
+    # diff 返回 1 表示有差异，0 表示相同，2 为错误
+    if proc.returncode not in (0, 1):
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise HTTPException(
+            status_code=400,
+            detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
+        )
+
+    out = proc.stdout or ""
+    if proc.stderr:
+        out = (out + "\n" + proc.stderr).strip()
+
+    truncated = False
+    if len(out) > _MAX_PARENT_DIFF_CHARS:
+        out = out[:_MAX_PARENT_DIFF_CHARS] + "\n\n…（输出已截断，可在本地对两层目录执行 diff -ruN -x .git）"
+        truncated = True
+
+    return {
+        "layer_id": layer_id,
+        "parent_layer_id": parent_layer_id,
+        "same": proc.returncode == 0,
+        "diff": out if proc.returncode != 0 else "",
+        "truncated": truncated,
+    }
+
+
+async def push_layer_worktree(layer_id: str) -> dict[str, Any]:
+    """将当前分支推送到已配置的上游（``git push``）。"""
+    _ensure_layer_id(layer_id)
+    root = layer_path(layer_id)
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail="layer not found")
+    if not (root / ".git").exists():
+        raise HTTPException(status_code=400, detail="layer has no .git")
+
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "push",
+        cwd=str(root),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    assert proc.stdout is not None
+    out_b = await proc.stdout.read()
+    code = await proc.wait()
+    out = out_b.decode(errors="replace").strip()
+
+    if code != 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "git push failed", "exit_code": code, "output": out},
+        )
+
+    return {"layer_id": layer_id, "status": "ok", "output": out}

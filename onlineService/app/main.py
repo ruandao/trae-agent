@@ -26,8 +26,11 @@ from .layer_fs import (
 )
 from .layer_git import (
     commit_layer_worktree,
+    diff_layer_worktree_vs_parent,
+    git_ahead_of_upstream,
     git_worktree_dirty,
     list_branches as list_layer_git_branches,
+    push_layer_worktree,
 )
 from .job_trajectory import load_agent_steps_for_layer
 from .jobs import JobRecord, job_layer_git_destructive_locked, store
@@ -369,6 +372,31 @@ async def api_layer_git_commit(
     )
 
 
+@app.post("/api/layers/{layer_id}/git/push")
+async def api_layer_git_push(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """将当前分支推送到已配置的上游远程。"""
+    return await push_layer_worktree(layer_id)
+
+
+@app.get("/api/layers/{layer_id}/diff/parent")
+async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """当前可写层工作区目录与已解析父层目录的差异（``diff -ruN -x .git``）。"""
+    layers = list_layers()
+    known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
+    jobs = store.list_jobs()
+    parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
+    if not parent:
+        return {
+            "layer_id": layer_id,
+            "parent_layer_id": None,
+            "same": None,
+            "diff": "",
+            "truncated": False,
+            "detail": "无父层可对比（根层或父层目录已不存在）",
+        }
+    return await asyncio.to_thread(diff_layer_worktree_vs_parent, parent, layer_id)
+
+
 @app.get("/api/requirements/task-gate")
 async def api_task_gate(_: AuthDep) -> dict[str, Any]:
     """新建任务前是否已满足「至少成功克隆过一次」（存在含 ``.git`` 的可写层）。"""
@@ -393,6 +421,13 @@ def _layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
     return None
 
 
+def _resolved_parent_layer_id(layer_id: str, known_ids: set[str], jobs: list[Any]) -> str | None:
+    p = infer_layer_parent_from_workspace(str(layer_id)) or _layer_parent_from_jobs(str(layer_id), jobs)
+    if p and p in known_ids:
+        return p
+    return None
+
+
 @app.get("/api/layers")
 async def api_list_layers(_: AuthDep) -> dict[str, Any]:
     layers = list_layers()
@@ -407,12 +442,9 @@ async def api_list_layers(_: AuthDep) -> dict[str, Any]:
             continue
         if lid in cmd_by_layer_id:
             item["command"] = cmd_by_layer_id[lid]
-        p = infer_layer_parent_from_workspace(str(lid)) or _layer_parent_from_jobs(str(lid), jobs)
-        if p and p in known_ids:
-            item["parent_layer_id"] = p
-        else:
-            item["parent_layer_id"] = None
+        item["parent_layer_id"] = _resolved_parent_layer_id(str(lid), known_ids, jobs)
         item["git_worktree_dirty"] = git_worktree_dirty(str(lid))
+        item["git_remote"] = git_ahead_of_upstream(str(lid))
     return {"layers": layers}
 
 

@@ -148,6 +148,15 @@
       margin-top: 0;
       margin-right: 0;
     }
+    button.tree-layer-push {
+      margin-left: 0.35rem;
+      padding: 0.12rem 0.45rem;
+      font-size: 0.72rem;
+      vertical-align: middle;
+      margin-top: 0;
+      margin-right: 0;
+      background: #2563eb;
+    }
     .tree-layer-commit-done {
       margin-left: 0.45rem;
       color: var(--ok);
@@ -334,9 +343,14 @@
       </div>
       <div style="margin: 0.85rem 0 0.5rem;">
         <label>可写层关联（树形）</label>
-        <p class="meta" style="margin: 0.25rem 0 0.35rem;">由工作区 <code>.git</code> 符号链接或任务记录推断父层；点击行可选中下方「选择层」并刷新文件树。每行「提交」会按<strong>关联任务指令</strong>与<strong>暂存区变更</strong>自动生成提交说明，并执行 <code>git add -A</code> / <code>git commit</code>（不 push）。</p>
+        <p class="meta" style="margin: 0.25rem 0 0.35rem;">由工作区 <code>.git</code> 符号链接或任务记录推断父层；点击行可选中下方「选择层」、刷新文件树，并显示<strong>与父层工作区目录的差异</strong>（<code>diff -ruN -x .git</code>）。每行「提交」会按<strong>关联任务指令</strong>与<strong>暂存区变更</strong>自动生成说明并执行 <code>git add -A</code> / <code>git commit</code>。若当前分支<strong>领先上游</strong>且有待推送的提交，会显示「推送」。</p>
         <div id="layerRelationTree" class="tree layer-relation-tree"></div>
         <p class="meta" id="layerRelationMeta" style="margin-top:0.35rem;"></p>
+        <div id="layerParentDiffWrap" style="margin-top: 0.65rem;">
+          <label class="meta" for="layerParentDiff" style="display:block;margin-bottom:0.3rem;">与上层可写层的差异</label>
+          <pre id="layerParentDiff" class="out" style="max-height: 280px; margin-top: 0;">（点击上方树中的某一层以加载）</pre>
+          <p class="meta" id="layerParentDiffMeta" style="margin-top:0.35rem;"></p>
+        </div>
       </div>
       <p class="meta" style="margin: 0.35rem 0 0">有父任务时，分支列表来自父任务所在层；无父任务时来自上面「工作区来源层」。</p>
       <button type="button" id="btnRun">提交执行</button>
@@ -412,6 +426,7 @@
     let lastCloneForm = { url: '', branch: '', depth: '' };
     let currentStreamingLayerId = null;
     let clonePersistDebounce = null;
+    let cloneFormDraftTimer = null;
 
     function truncateCloneOutput(text) {
       if (!text || text.length <= MAX_CLONE_LOG_CHARS) return text;
@@ -443,6 +458,43 @@
       try {
         sessionStorage.removeItem(CLONE_PERSIST_KEY);
       } catch (_) {}
+    }
+
+    /** 合并写入：保留已有克隆日志/状态，仅更新 URL/分支/depth（刷新前未点克隆也能保留输入）。 */
+    function persistCloneFormFieldsMerge() {
+      try {
+        const prev = readClonePersistState();
+        const u = document.getElementById('cloneUrl');
+        const br = document.getElementById('cloneBranch');
+        const dep = document.getElementById('cloneDepth');
+        if (!u) return;
+        const merged = Object.assign({}, prev || {}, {
+          clone_url: u.value,
+          branch: br ? br.value : '',
+          depth: dep ? dep.value : '',
+        });
+        saveClonePersistState(merged);
+        lastCloneForm = {
+          url: u.value.trim(),
+          branch: br ? br.value.trim() : '',
+          depth: dep ? dep.value.trim() : '',
+        };
+      } catch (_) {}
+    }
+
+    function scheduleCloneFormFieldsPersist() {
+      if (cloneFormDraftTimer) clearTimeout(cloneFormDraftTimer);
+      cloneFormDraftTimer = setTimeout(() => {
+        cloneFormDraftTimer = null;
+        persistCloneFormFieldsMerge();
+      }, 400);
+    }
+
+    function wireCloneFormInputPersist() {
+      ['cloneUrl', 'cloneBranch', 'cloneDepth'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', scheduleCloneFormFieldsPersist);
+      });
     }
 
     /** 重置「克隆仓库」区块：本地缓存、表单、日志与进行中状态（与服务器清空可写层一致） */
@@ -1432,6 +1484,45 @@
       void reloadLayerTree();
     }
 
+    async function loadLayerParentDiff(layerId) {
+      const pre = document.getElementById('layerParentDiff');
+      const meta = document.getElementById('layerParentDiffMeta');
+      if (!pre || !meta) return;
+      pre.textContent = '加载中…';
+      meta.textContent = '';
+      const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/diff/parent');
+      const raw = await r.text();
+      let j = null;
+      try {
+        j = JSON.parse(raw);
+      } catch (_) {}
+      if (!r.ok) {
+        pre.textContent = '';
+        let msg = raw;
+        if (j && j.detail !== undefined) {
+          msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+        }
+        meta.textContent = '加载失败：' + msg;
+        return;
+      }
+      if (j.parent_layer_id == null && j.detail) {
+        pre.textContent = '';
+        meta.textContent = j.detail;
+        return;
+      }
+      const pair =
+        j.parent_layer_id != null
+          ? '父层 ' + j.parent_layer_id + ' → 当前 ' + j.layer_id
+          : '';
+      meta.textContent =
+        pair + (j.truncated ? ' · 输出已截断' : '') + (j.same ? ' · 无文件差异' : '');
+      if (j.same) {
+        pre.textContent = '（无差异：除 .git 外，工作区文件与父层目录一致）';
+      } else {
+        pre.textContent = j.diff || '（diff 为空）';
+      }
+    }
+
     function renderLayerRelationTree(layers) {
       const el = document.getElementById('layerRelationTree');
       const meta = document.getElementById('layerRelationMeta');
@@ -1588,6 +1679,55 @@
           row.appendChild(commitBtn);
         }
 
+        const gr = layer.git_remote;
+        if (gr && gr.is_git && typeof gr.ahead === 'number' && gr.ahead > 0 && !gr.no_upstream) {
+          const pushBtn = document.createElement('button');
+          pushBtn.type = 'button';
+          pushBtn.className = 'tree-layer-push';
+          pushBtn.textContent = '推送';
+          pushBtn.title =
+            'git push：将本地领先上游的 ' +
+            gr.ahead +
+            ' 个提交推送到远程（' +
+            (gr.upstream || 'upstream') +
+            '）';
+          pushBtn.onclick = async (e) => {
+            e.stopPropagation();
+            pushBtn.disabled = true;
+            try {
+              const r = await api(
+                '/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/push',
+                { method: 'POST' },
+              );
+              const rawText = await r.text();
+              let j = null;
+              try {
+                j = JSON.parse(rawText);
+              } catch (_) {}
+              if (!r.ok) {
+                let msg = rawText;
+                if (j && j.detail !== undefined) {
+                  msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                }
+                alert('推送失败：' + msg);
+                return;
+              }
+              if (j && j.status === 'ok') {
+                const out = (j.output || '').trim();
+                alert(out ? '已推送。\n\n' + out : '已推送。');
+              } else {
+                alert('已完成：' + rawText);
+              }
+              await loadJobs();
+              const sel = document.getElementById('layerSelect');
+              await loadLayers(sel && sel.value ? sel.value : null);
+            } finally {
+              pushBtn.disabled = false;
+            }
+          };
+          row.appendChild(pushBtn);
+        }
+
         const childrenEl = document.createElement('div');
         childrenEl.className = 'tree-children';
         childrenEl.style.display = 'none';
@@ -1595,6 +1735,7 @@
         let expanded = false;
         row.onclick = () => {
           selectLayerFromGraph(layer.layer_id);
+          void loadLayerParentDiff(layer.layer_id);
           if (kidsArr.length) {
             expanded = !expanded;
             childrenEl.style.display = expanded ? 'block' : 'none';
@@ -1882,11 +2023,12 @@
       pre.textContent = JSON.stringify(await r.json(), null, 2);
     };
     const __persistedClone = readClonePersistState();
+    // 须立即恢复克隆表单：若等到 loadLayers 完成再写入，/api/layers 慢或失败时 URL 会一直为空。
+    applyPersistedCloneUi(__persistedClone);
+    wireCloneFormInputPersist();
     applyTaskGate();
     loadJobs();
-    loadLayers(__persistedClone && __persistedClone.layer_id).then(() => {
-      applyPersistedCloneUi(__persistedClone);
-    });
+    void loadLayers(__persistedClone && __persistedClone.layer_id);
   </script>
 </body>
 </html>
