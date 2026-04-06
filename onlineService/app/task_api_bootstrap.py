@@ -15,6 +15,16 @@ from .paths import config_file_path
 log = logging.getLogger(__name__)
 
 
+def _bootstrap_http_timeout_sec() -> float:
+    raw = os.environ.get("TASK_API_BOOTSTRAP_TIMEOUT_SEC", "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            log.warning("忽略无效的 TASK_API_BOOTSTRAP_TIMEOUT_SEC=%r，使用默认 5s", raw)
+    return 5.0
+
+
 def _task_api_prefix() -> str | None:
     endpoint = os.environ.get("TaskApiEndPoint", "").strip()
     if not endpoint:
@@ -67,6 +77,8 @@ def bootstrap_container_config() -> None:
     if not prefix:
         return
 
+    timeout = _bootstrap_http_timeout_sec()
+
     initial = os.environ.get("ACCESS_TOKEN", "").strip()
     if not initial:
         raise RuntimeError(
@@ -77,6 +89,7 @@ def bootstrap_container_config() -> None:
         f"{prefix}/server-container-token/exchange-refresh/",
         {"access_token": initial},
         step="exchange-refresh",
+        timeout=timeout,
     )
     refresh_token = ex.get("refresh_token")
     if not refresh_token:
@@ -86,6 +99,7 @@ def bootstrap_container_config() -> None:
         f"{prefix}/server-container-token/refresh-access/",
         {"refresh_token": refresh_token},
         step="refresh-access",
+        timeout=timeout,
     )
     new_access = ref.get("access_token")
     if not new_access:
@@ -97,6 +111,7 @@ def bootstrap_container_config() -> None:
         f"{prefix}/server-container-token/feature-params-yaml/",
         {"access_token": new_access},
         step="feature-params-yaml",
+        timeout=timeout,
     )
     yaml_text = y.get("yaml")
     if yaml_text is None:
