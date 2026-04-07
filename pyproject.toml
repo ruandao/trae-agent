@@ -40,6 +40,12 @@ evaluation = [
     "datasets>=3.6.0",
     "unidiff>=0.7.5",
 ]
+# onlineService（FastAPI / uvicorn）：与 onlineService/requirements.txt 同步，便于 Docker 单次安装、减少构建时重复访问 PyPI
+online = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.9",
+]
 
 [project.scripts]
 trae-cli = "trae_agent.cli:main"
