@@ -432,6 +432,8 @@
     let lastJobs = [];
     /** 丢弃过期的 refreshJobBranches 异步结果，避免并行 loadJobs/loadLayers 等把分支选项追加两遍。 */
     let _jobBranchRefreshSeq = 0;
+    /** 用户是否明确选了「不基于已有层」；为 false 时在无有效 prev/preferred 时默认选 API 返回的第一项（最新层）。 */
+    let jobRepoLayerUserChoseEmpty = false;
     const MAX_CLONE_LOG_CHARS = 480000;
     let lastCloneForm = { url: '', branch: '', depth: '' };
     let currentStreamingLayerId = null;
@@ -1082,6 +1084,7 @@
           currentStreamingLayerId = null;
           if (o.title) sseAppend('jobs_reset · ' + o.title);
           resetCloneSectionUi();
+          jobRepoLayerUserChoseEmpty = false;
           void loadJobs();
           void loadLayers();
           void reloadLayerTree();
@@ -1298,8 +1301,13 @@
       let pick = '';
       if (preferredLayerId && layers.some((x) => x.layer_id === preferredLayerId)) {
         pick = preferredLayerId;
+        jobRepoLayerUserChoseEmpty = false;
       } else if (prev && layers.some((x) => x.layer_id === prev)) {
         pick = prev;
+        jobRepoLayerUserChoseEmpty = false;
+      } else if (!jobRepoLayerUserChoseEmpty && layers.length > 0) {
+        // GET /api/layers 与 layerSelect 一致：created_at 降序，首项为最新层
+        pick = layers[0].layer_id;
       }
       if (pick) sel.value = pick;
       updateJobRepoLayerVisibility();
@@ -2231,6 +2239,8 @@
       refreshJobBranches();
     };
     document.getElementById('jobRepoLayer').onchange = () => {
+      const v = document.getElementById('jobRepoLayer').value.trim();
+      jobRepoLayerUserChoseEmpty = !v;
       if (!document.getElementById('parentId').value.trim()) {
         refreshJobBranches();
       }
@@ -2253,6 +2263,7 @@
         }
         await r.json().catch(() => null);
         resetCloneSectionUi();
+        jobRepoLayerUserChoseEmpty = false;
         await loadJobs();
         await loadLayers();
         await reloadLayerTree();
