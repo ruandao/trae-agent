@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import json
 import os
+import sys
 import shutil
 import signal
 import subprocess
@@ -122,13 +123,24 @@ def _venv_python_path() -> Path:
     return activate.parent / "python"
 
 
+def _is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
 def _build_trae_run_cmd(cfg: Path, work: str, cmd_text: str) -> list[str]:
     activate = venv_activate_path()
     trae_bin = activate.parent / "trae-cli"
-    if trae_bin.is_file():
+    py = _venv_python_path()
+    py3 = activate.parent / "python3"
+    if _is_executable_file(py):
+        base = [str(py), "-m", "trae_agent.cli"]
+    elif _is_executable_file(py3):
+        base = [str(py3), "-m", "trae_agent.cli"]
+    elif _is_executable_file(trae_bin):
+        # 最后兜底：某些环境仅有 entrypoint 脚本
         base = [str(trae_bin)]
     else:
-        base = [str(_venv_python_path()), "-m", "trae_agent.cli"]
+        base = [sys.executable, "-m", "trae_agent.cli"]
     return [
         *base,
         "run",
@@ -367,7 +379,7 @@ class JobStore:
             )
         except Exception as e:
             rec.status = "failed"
-            err_line = f"spawn error: {e}\n"
+            err_line = f"spawn error: {e} (cmd={cmd[0]!r}, cwd={work!r})\n"
             rec.output = err_line if not preserve_output else rec.output + err_line
             rec.exit_code = -1
             await self._save()
