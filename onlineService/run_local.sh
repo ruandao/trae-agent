@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 在开发机从仓库根目录的 .venv 启动服务（默认开启代码热重载）
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 固定项目根目录，避免在某些环境下被误判为上一级目录
+ROOT="/Users/task2app/gitClone/ramDisk/ram-mount/trae-agent"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 # 本机 Task API（localhost）若继承全局 HTTP(S)_PROXY，urllib 会走代理导致 exchange-refresh 等超时
@@ -20,9 +21,10 @@ if [[ "$(uname -s)" == Darwin ]]; then
 fi
 # 若克隆 GitHub 仍报 SSL/代理相关错误，可尝试：GIT_CLONE_UNSET_PROXY=1 ./run_local.sh（仅去掉 git 子进程的代理变量）
 if command -v uv >/dev/null 2>&1; then
-  (cd "$ROOT" && uv pip install -q -r onlineService/requirements.txt)
+  # requirements.txt 中使用了 `-e ..[online]`，需在 onlineService 目录执行
+  (cd "$SCRIPT_DIR" && uv pip install -q -r requirements.txt)
 else
-  "$ROOT/.venv/bin/python" -m pip install -q -r requirements.txt
+  "$ROOT/.venv/bin/python" -m pip install -q -r "$SCRIPT_DIR/requirements.txt"
 fi
 # 确保 runtime 目录存在，便于 --reload-exclude 将其识别为排除目录（避免 jobs_state 等写入触发重启）
 mkdir -p "$SCRIPT_DIR/runtime"
