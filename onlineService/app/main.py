@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -76,6 +76,10 @@ def _job_to_api_dict(rec: JobRecord) -> dict[str, Any]:
 
 class JobCreateBody(BaseModel):
     command: str = Field(..., min_length=1)
+    command_kind: Literal["trae", "shell"] = Field(
+        default="trae",
+        description="trae：经 trae-cli run；shell：在工作区内 bash -lc 执行原文。",
+    )
     parent_job_id: str | None = None
     repo_layer_id: str | None = Field(
         default=None,
@@ -265,6 +269,7 @@ async def create_job(_: AuthDep, body: JobCreateBody) -> dict[str, Any]:
             body.parent_job_id,
             repo_layer_id=body.repo_layer_id.strip() if body.repo_layer_id else None,
             git_branch=body.git_branch.strip() if body.git_branch else None,
+            command_kind=body.command_kind,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

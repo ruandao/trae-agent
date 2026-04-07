@@ -68,14 +68,48 @@ def list_layers() -> list[dict[str, Any]]:
     return layers
 
 
+def _dir_has_git_metadata(p: Path) -> bool:
+    """路径下是否存在 git 元数据（``.git`` 为目录或 worktree 用的文件）。"""
+    g = p / ".git"
+    try:
+        return g.exists() and (g.is_dir() or g.is_file())
+    except OSError:
+        return False
+
+
+def layer_root_or_child_has_git_repo(layer_dir: Path) -> bool:
+    """层目录根部或根下**直接子目录**内是否有 git 仓库。
+
+    - UI ``POST /api/repos/clone`` 使用 ``git clone … .``，``.git`` 在层根。
+    - 容器 bootstrap（``task_api_bootstrap``）把多个仓库克隆到同一层的子目录中，
+      ``.git`` 在 ``<layer>/<repo_name>/.git``，层根没有 ``.git``。
+    """
+    try:
+        if not layer_dir.is_dir():
+            return False
+        if _dir_has_git_metadata(layer_dir):
+            return True
+        for child in layer_dir.iterdir():
+            try:
+                if not child.is_dir() or child.name in _SKIP_PARTS:
+                    continue
+            except OSError:
+                continue
+            if _dir_has_git_metadata(child):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def any_layer_has_git_repo() -> bool:
-    """是否存在至少一个可写层根目录下含 ``.git``（通常表示已成功克隆过仓库）。"""
+    """是否存在至少一个可写层，表示已成功克隆过仓库（根或子目录含 ``.git``）。"""
     for item in list_layers():
         lid = item.get("layer_id")
         if not lid:
             continue
         try:
-            if (layer_path(lid) / ".git").is_dir():
+            if layer_root_or_child_has_git_repo(layer_path(lid)):
                 return True
         except OSError:
             continue

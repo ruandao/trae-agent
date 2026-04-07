@@ -330,6 +330,13 @@
           </select>
         </div>
       </div>
+      <div style="margin-top: 0.75rem;">
+        <label for="bashCmd">Shell 指令（bash -lc）</label>
+        <p class="meta" style="margin: 0.25rem 0 0.35rem;">
+          与上一行<strong>二选一</strong>：在此填写任意 shell 时，将锁定「trae-cli run」输入框；清空此处后可再填 trae 指令。本任务在仓库工作区内执行，不经 <code>trae-cli run</code>。
+        </p>
+        <textarea id="bashCmd" rows="3" placeholder="例如：ls -la&#10;pytest -q"></textarea>
+      </div>
       <div class="row" style="margin-top: 0.75rem;">
         <div id="jobRepoLayerWrap">
           <label for="jobRepoLayer">工作区来源层（无父任务时从该层复制，含已克隆仓库）</label>
@@ -592,10 +599,20 @@
           ok = !!j.clone_done;
         } catch (_) {}
       }
-      const ids = ['cmd', 'parentId', 'jobRepoLayer', 'jobGitBranch', 'btnRun'];
-      for (const id of ids) {
+      const gateIds = ['parentId', 'jobRepoLayer', 'jobGitBranch', 'btnRun'];
+      for (const id of gateIds) {
         const el = document.getElementById(id);
         if (el) el.disabled = !ok;
+      }
+      const cmdEl = document.getElementById('cmd');
+      const bashEl = document.getElementById('bashCmd');
+      if (!ok) {
+        if (cmdEl) cmdEl.disabled = true;
+        if (bashEl) bashEl.disabled = true;
+      } else {
+        if (cmdEl) cmdEl.disabled = false;
+        if (bashEl) bashEl.disabled = false;
+        syncTaskCommandFields();
       }
       const msg = document.getElementById('taskGateMsg');
       if (msg) {
@@ -611,6 +628,22 @@
       const sec = document.getElementById('newTaskSection');
       if (sec) sec.classList.toggle('task-gate-locked', !ok);
     }
+
+    /** trae-cli 自然语言指令 与 Shell 指令互斥：其一有内容则禁用另一方。 */
+    function syncTaskCommandFields() {
+      const cmdEl = document.getElementById('cmd');
+      const bashEl = document.getElementById('bashCmd');
+      if (!cmdEl || !bashEl) return;
+      const gateLocked =
+        document.getElementById('newTaskSection') &&
+        document.getElementById('newTaskSection').classList.contains('task-gate-locked');
+      if (gateLocked) return;
+      const hasTrae = cmdEl.value.trim().length > 0;
+      const hasBash = bashEl.value.trim().length > 0;
+      bashEl.disabled = hasTrae;
+      cmdEl.disabled = hasBash;
+    }
+
     const logEl = document.getElementById('sseLog');
     function sseAppend(line) {
       const t = document.createElement('div');
@@ -1325,10 +1358,11 @@
       const lockNote = gitLock
         ? '<div class="meta" style="color:var(--warn);margin-top:0.35rem;">已检测到 git 提交，已禁止中断、重新执行与删除。</div>'
         : '';
+      const shellTag = j.command_kind === 'shell' ? '<span class="meta">[shell]</span> ' : '';
       return `
         <div class="job-card" data-id="${j.id}">
           <div class="meta">层: ${j.layer_id} · ${j.created_at}</div>
-          <div><strong>${escapeHtml(j.command)}</strong></div>
+          <div>${shellTag}<strong>${escapeHtml(j.command)}</strong></div>
           <div class="status ${j.status}">${j.status} ${j.exit_code != null ? '(exit ' + j.exit_code + ')' : ''}</div>
           <div class="meta">任务 ID: ${j.id} · 父: ${j.parent_job_id || '—'}${j.git_branch ? ' · 分支: ' + escapeHtml(j.git_branch) : ''}</div>
           ${lockNote}
@@ -1337,7 +1371,7 @@
             <button type="button" data-redo="${j.id}" ${disRedo}>重新执行</button>
             <button type="button" class="danger" data-delete="${j.id}" ${disDel}>删除</button>
             ${
-              j.status === 'interrupted'
+              j.status === 'interrupted' && j.command_kind !== 'shell'
                 ? '<button type="button" data-continue="' + j.id + '">继续</button>'
                 : ''
             }
@@ -2228,7 +2262,22 @@
     };
     document.getElementById('btnRun').onclick = async () => {
       document.getElementById('jobErr').textContent = '';
-      const command = document.getElementById('cmd').value.trim();
+      const bashLine = document.getElementById('bashCmd').value.trim();
+      const traeLine = document.getElementById('cmd').value.trim();
+      let command;
+      let command_kind;
+      if (bashLine) {
+        command = bashLine;
+        command_kind = 'shell';
+      } else {
+        command = traeLine;
+        command_kind = 'trae';
+      }
+      if (!command) {
+        document.getElementById('jobErr').textContent =
+          '请填写「trae-cli run」指令或「Shell 指令」之一。';
+        return;
+      }
       const parent_job_id = document.getElementById('parentId').value.trim() || null;
       const repo_layer_id = parent_job_id
         ? null
@@ -2237,15 +2286,26 @@
       const r = await api('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command, parent_job_id, repo_layer_id, git_branch }),
+        body: JSON.stringify({
+          command,
+          command_kind,
+          parent_job_id,
+          repo_layer_id,
+          git_branch,
+        }),
       });
       if (!r.ok) {
         document.getElementById('jobErr').textContent = await r.text();
         return;
       }
       document.getElementById('cmd').value = '';
+      document.getElementById('bashCmd').value = '';
+      syncTaskCommandFields();
       loadJobs();
     };
+
+    document.getElementById('cmd').addEventListener('input', syncTaskCommandFields);
+    document.getElementById('bashCmd').addEventListener('input', syncTaskCommandFields);
     document.getElementById('btnParent').onclick = async () => {
       const id = document.getElementById('lookupJob').value.trim();
       const r = await api('/api/jobs/' + encodeURIComponent(id) + '/parent');

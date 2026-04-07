@@ -38,6 +38,7 @@ from .paths import (
 
 
 JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
+CommandKind = Literal["trae", "shell"]
 
 _GIT_LOCK_MSG = (
     "该任务可写层在运行开始后已有 git 提交（HEAD 已变化），已禁止中断、重新执行与删除。"
@@ -127,6 +128,11 @@ def _is_executable_file(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+def _build_shell_cmd(script: str) -> list[str]:
+    """在工作区目录下以 login shell 执行用户给出的整条命令行文本。"""
+    return ["bash", "-lc", script]
+
+
 def _build_trae_run_cmd(cfg: Path, work: str, cmd_text: str) -> list[str]:
     activate = venv_activate_path()
     trae_bin = activate.parent / "trae-cli"
@@ -164,6 +170,7 @@ class JobRecord:
     git_branch: str | None = None
     repo_layer_id: str | None = None  # 无父任务时从该层复制工作区
     git_head_at_run_start: str | None = None  # 本次 trae-cli 启动前 HEAD（用于检测是否已有新提交）
+    command_kind: CommandKind = "trae"  # shell：原样 bash -lc，不经 trae-cli
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -244,6 +251,8 @@ class JobStore:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             for row in data.get("jobs", []):
+                row = {**row}
+                row.setdefault("command_kind", "trae")
                 rec = JobRecord(**row)
                 if rec.status == "running":
                     rec.status = "interrupted"
@@ -273,17 +282,21 @@ class JobStore:
         *,
         repo_layer_id: str | None = None,
         git_branch: str | None = None,
+        command_kind: CommandKind = "trae",
     ) -> JobRecord:
         from datetime import datetime
 
         cfg = config_file_path()
-        if not cfg.is_file():
-            raise FileNotFoundError(
-                f"Config missing: {cfg}. Push config via POST /api/config first."
-            )
         act = venv_activate_path()
-        if not act.is_file():
-            raise FileNotFoundError(f"venv activate script not found: {act}")
+        if command_kind == "trae":
+            if not cfg.is_file():
+                raise FileNotFoundError(
+                    f"Config missing: {cfg}. Push config via POST /api/config first."
+                )
+            if not act.is_file():
+                raise FileNotFoundError(f"venv activate script not found: {act}")
+        elif command_kind != "shell":
+            raise ValueError(f"invalid command_kind: {command_kind!r}")
 
         if not any_layer_has_git_repo():
             raise ValueError("请先完成「克隆仓库」后再创建任务。")
@@ -318,6 +331,7 @@ class JobStore:
             created_at=datetime.now().isoformat(timespec="seconds"),
             git_branch=git_branch,
             repo_layer_id=repo_layer_id if not parent_job_id else None,
+            command_kind=command_kind,
         )
         async with self._lock:
             self._jobs[jid] = rec
@@ -341,7 +355,10 @@ class JobStore:
         cfg = config_file_path()
         work = rec.layer_path
         cmd_text = run_command if run_command is not None else rec.command
-        cmd = _build_trae_run_cmd(cfg, work, cmd_text)
+        if rec.command_kind == "shell":
+            cmd = _build_shell_cmd(cmd_text)
+        else:
+            cmd = _build_trae_run_cmd(cfg, work, cmd_text)
 
         if rec.git_branch and not preserve_output:
             co_out, co_code = await git_checkout(Path(rec.layer_path), rec.git_branch)
@@ -506,6 +523,8 @@ class JobStore:
             rec = self._jobs.get(job_id)
             if not rec:
                 raise ValueError("Job not found")
+            if rec.command_kind == "shell":
+                raise ValueError("Shell 任务不支持「继续」，请使用重新执行。")
             if rec.status != "interrupted":
                 raise ValueError("Only interrupted jobs can be continued")
             runner_task = self._runner_tasks.get(job_id)
