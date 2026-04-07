@@ -430,6 +430,14 @@
     const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
     const CLONE_PERSIST_KEY = 'trae_online_clone_ui_v1';
     let lastJobs = [];
+    function isJobStatusActive(status) {
+      return status === 'pending' || status === 'running';
+    }
+    /** 某 layer_id 上是否有排队/执行中的任务（与新建任务时「工作区来源层」门禁一致）。 */
+    function layerIdHasActiveJob(layerId) {
+      if (!layerId) return false;
+      return lastJobs.some((j) => j.layer_id === layerId && isJobStatusActive(j.status));
+    }
     /** 丢弃过期的 refreshJobBranches 异步结果，避免并行 loadJobs/loadLayers 等把分支选项追加两遍。 */
     let _jobBranchRefreshSeq = 0;
     /** 用户是否明确选了「不基于已有层」；为 false 时在无有效 prev/preferred 时默认选 API 返回的第一项（最新层）。 */
@@ -1262,10 +1270,19 @@
         o.value = j.id;
         const cmd = j.command || '';
         const short = cmd.length > 42 ? cmd.slice(0, 42) + '…' : cmd;
-        o.textContent = `${short || j.id} · 层 ${j.layer_id}`;
+        const busy = isJobStatusActive(j.status);
+        o.textContent =
+          `${short || j.id} · 层 ${j.layer_id}` +
+          (busy ? ' · （执行中）' : '');
+        if (busy) {
+          o.disabled = true;
+          o.title = '该任务仍在排队或执行中，无法作为父任务叠加新层';
+        }
         sel.appendChild(o);
       }
-      if (prev && [...sel.options].some((opt) => opt.value === prev)) sel.value = prev;
+      const prevOpt = prev ? [...sel.options].find((opt) => opt.value === prev) : null;
+      if (prevOpt && !prevOpt.disabled) sel.value = prev;
+      else if (prevOpt && prevOpt.disabled) sel.value = '';
     }
 
     function updateJobRepoLayerVisibility() {
@@ -1294,22 +1311,38 @@
         opt.value = l.layer_id;
         const created = l.created_at ? `${l.created_at}` : '';
         const cmd = l.command ? ` · ${l.command}` : '';
-        const txt = created ? `${l.layer_id} · ${created}${cmd}` : `${l.layer_id}${cmd}`;
+        let txt = created ? `${l.layer_id} · ${created}${cmd}` : `${l.layer_id}${cmd}`;
+        const busy = layerIdHasActiveJob(l.layer_id);
+        if (busy) {
+          txt += ' · （执行中）';
+          opt.disabled = true;
+          opt.title = '该层上有任务正在排队或执行中，不可作为工作区来源';
+        }
         opt.textContent = txt.length > 120 ? txt.slice(0, 120) + '…' : txt;
         sel.appendChild(opt);
       }
       let pick = '';
-      if (preferredLayerId && layers.some((x) => x.layer_id === preferredLayerId)) {
+      if (
+        preferredLayerId &&
+        layers.some((x) => x.layer_id === preferredLayerId) &&
+        !layerIdHasActiveJob(preferredLayerId)
+      ) {
         pick = preferredLayerId;
         jobRepoLayerUserChoseEmpty = false;
-      } else if (prev && layers.some((x) => x.layer_id === prev)) {
+      } else if (
+        prev &&
+        layers.some((x) => x.layer_id === prev) &&
+        !layerIdHasActiveJob(prev)
+      ) {
         pick = prev;
         jobRepoLayerUserChoseEmpty = false;
       } else if (!jobRepoLayerUserChoseEmpty && layers.length > 0) {
-        // GET /api/layers 与 layerSelect 一致：created_at 降序，首项为最新层
-        pick = layers[0].layer_id;
+        // GET /api/layers 与 layerSelect 一致：created_at 降序，优先第一个非繁忙层
+        const firstFree = layers.find((x) => !layerIdHasActiveJob(x.layer_id));
+        if (firstFree) pick = firstFree.layer_id;
       }
       if (pick) sel.value = pick;
+      else sel.value = '';
       updateJobRepoLayerVisibility();
       renderLayerRelationTree(layers);
     }
@@ -1874,6 +1907,11 @@
         if (layer.command) {
           const c = layer.command;
           bits.push(c.length > 40 ? c.slice(0, 40) + '…' : c);
+        }
+        if (layerIdHasActiveJob(layer.layer_id)) {
+          bits.push('执行中 · 不可作新建任务来源');
+          row.style.opacity = '0.62';
+          row.title = '该层有任务排队或执行中：不可作为「工作区来源层」，亦不可选为父任务';
         }
         muted.textContent = bits.join(' · ');
 

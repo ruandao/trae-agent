@@ -244,6 +244,13 @@ class JobStore:
         self._runner_tasks: dict[str, asyncio.Task[None]] = {}
         self._load()
 
+    def _active_job_for_layer(self, layer_id: str) -> JobRecord | None:
+        """若有任务正在该 layer_id 对应可写目录上排队或执行，返回该任务。"""
+        for j in self._jobs.values():
+            if j.layer_id == layer_id and j.status in ("pending", "running"):
+                return j
+        return None
+
     def _load(self) -> None:
         p = jobs_state_path()
         if not p.exists():
@@ -311,8 +318,18 @@ class JobStore:
             parent_rec = self._jobs.get(parent_job_id)
             if not parent_rec:
                 raise ValueError(f"parent_job_id not found: {parent_job_id}")
+            if parent_rec.status in ("pending", "running"):
+                raise ValueError(
+                    "父任务仍在排队或执行中，请待其结束后再基于该层新建任务。"
+                )
             lp = create_stacked_layer(layer_id, Path(parent_rec.layer_path))
         elif repo_layer_id:
+            busy = self._active_job_for_layer(repo_layer_id)
+            if busy:
+                raise ValueError(
+                    "该可写层已有任务进行中（"
+                    f"{busy.id}），请待其结束后再作为工作区来源。"
+                )
             src = layer_path(repo_layer_id)
             if not src.is_dir():
                 raise ValueError(f"repo_layer_id not found: {repo_layer_id}")
