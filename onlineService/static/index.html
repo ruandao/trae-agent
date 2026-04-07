@@ -757,7 +757,8 @@
 
     function wireStepAccordions(container) {
       if (!container || !container.querySelectorAll) return;
-      container.querySelectorAll('details.job-step-accordion').forEach((d) => {
+      container.querySelectorAll('details.job-step-accordion:not([data-accordion-wired])').forEach((d) => {
+        d.setAttribute('data-accordion-wired', '1');
         d.addEventListener('toggle', onStepAccordionToggle);
       });
     }
@@ -773,7 +774,7 @@
       });
     }
 
-    function renderOneStepTable(s, isLast) {
+    function renderOneStepTable(s) {
       const sn = s.step_number != null ? s.step_number : '?';
       const rows = [];
       rows.push(['状态', escapeHtml(stateLabel(s.state))]);
@@ -821,13 +822,10 @@
             '<tr><th scope="row">' + k + '</th><td class="job-step-td">' + v + '</td></tr>'
         )
         .join('');
-      const openAttr = isLast ? ' open' : '';
       return (
         '<details class="job-step-accordion" data-step="' +
         String(sn) +
-        '"' +
-        openAttr +
-        '>' +
+        '">' +
         '<summary class="job-step-summary">' +
         escapeHtml(stepAccordionSummary(s)) +
         '</summary>' +
@@ -853,15 +851,86 @@
           escapeHtml(data.trajectory_file) +
           '</p>';
       }
-      const n = data.steps.length;
-      const blocks = data.steps.map((s, i) => renderOneStepTable(s, i === n - 1)).join('');
+      const blocks = data.steps.map((s) => renderOneStepTable(s)).join('');
       return meta + '<div class="job-steps-tables">' + blocks + '</div>';
+    }
+
+    /** 已有步骤列表时增量合并：仅追加新 step 或替换同编号的更新，保留各手风琴 open 状态；不整表清空。 */
+    function mergeJobStepsIntoElement(el, data) {
+      if (!el) return;
+      if (!data || !data.steps || data.steps.length === 0) {
+        const hint =
+          data && data.note
+            ? escapeHtml(data.note)
+            : '暂无 agent_steps（运行中请稍后点刷新）';
+        if (!el.querySelector('.job-steps-tables')) {
+          el.innerHTML = '<p class="meta job-steps-empty">' + hint + '</p>';
+        }
+        return;
+      }
+
+      let metaHtml = '';
+      if (data.trajectory_file) {
+        metaHtml =
+          '<p class="meta job-steps-meta">轨迹: ' +
+          escapeHtml(data.trajectory_file) +
+          '</p>';
+      }
+      let tablesRoot = el.querySelector('.job-steps-tables');
+      if (!tablesRoot) {
+        el.innerHTML = (metaHtml || '') + '<div class="job-steps-tables"></div>';
+        tablesRoot = el.querySelector('.job-steps-tables');
+      }
+      if (metaHtml) {
+        let metaEl = el.querySelector('.job-steps-meta');
+        if (metaEl) {
+          metaEl.outerHTML = metaHtml;
+        } else {
+          const wrap = document.createElement('div');
+          wrap.innerHTML = metaHtml;
+          const first = wrap.firstElementChild;
+          if (first) el.insertBefore(first, tablesRoot);
+        }
+      }
+
+      const byStep = new Map();
+      tablesRoot.querySelectorAll('details.job-step-accordion[data-step]').forEach((d) => {
+        byStep.set(d.getAttribute('data-step'), d);
+      });
+
+      for (let i = 0; i < data.steps.length; i++) {
+        const s = data.steps[i];
+        const sn = String(s.step_number != null ? s.step_number : '?');
+        const newHtml = renderOneStepTable(s);
+        const tmp = document.createElement('div');
+        tmp.innerHTML = newHtml;
+        const newDetails = tmp.firstElementChild;
+        if (!newDetails) continue;
+
+        const existing = byStep.get(sn);
+        if (!existing) {
+          tablesRoot.appendChild(newDetails);
+          byStep.set(sn, newDetails);
+        } else {
+          const wasOpen = existing.open;
+          existing.replaceWith(newDetails);
+          newDetails.open = wasOpen;
+          byStep.set(sn, newDetails);
+        }
+      }
     }
 
     async function loadJobStepsIntoCard(jobId) {
       const el = document.querySelector('.job-steps[data-job-id="' + jobId + '"]');
       if (!el) return;
-      el.innerHTML = '<p class="meta job-steps-loading">加载步骤…</p>';
+      const hadTables = !!el.querySelector('.job-steps-tables');
+      if (
+        !hadTables &&
+        !el.querySelector('.job-steps-empty') &&
+        !el.querySelector('p.err-msg')
+      ) {
+        el.innerHTML = '<p class="meta job-steps-loading">加载步骤…</p>';
+      }
       try {
         const r = await api('/api/jobs/' + encodeURIComponent(jobId) + '/steps');
         if (!r.ok) {
@@ -871,7 +940,11 @@
           return;
         }
         const data = await r.json();
-        el.innerHTML = buildStepsMarkup(data);
+        if (!hadTables) {
+          el.innerHTML = buildStepsMarkup(data);
+        } else {
+          mergeJobStepsIntoElement(el, data);
+        }
         wireStepAccordions(el);
       } catch (e) {
         el.innerHTML =
@@ -1384,8 +1457,21 @@
       const newCard = wrap.firstElementChild;
       if (!newCard) return;
       const old = box.querySelector('.job-card[data-id="' + j.id + '"]');
+      let savedStepsEl = null;
+      if (old) {
+        const se = old.querySelector('.job-steps[data-job-id="' + j.id + '"]');
+        if (se) savedStepsEl = se.cloneNode(true);
+      }
       if (old) old.replaceWith(newCard);
       else box.insertBefore(newCard, box.firstChild);
+      if (savedStepsEl) {
+        savedStepsEl
+          .querySelectorAll('[data-accordion-wired]')
+          .forEach((n) => n.removeAttribute('data-accordion-wired'));
+        const placeholder = newCard.querySelector('.job-steps[data-job-id="' + j.id + '"]');
+        if (placeholder) placeholder.replaceWith(savedStepsEl);
+        wireStepAccordions(savedStepsEl);
+      }
       wireJobCardButtons(newCard);
       scheduleJobStepsRefresh(j.id);
     }
