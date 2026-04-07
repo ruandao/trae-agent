@@ -1,22 +1,21 @@
-"""任务容器启动时：换票、拉取任务详情（project_repos）、克隆仓库、再拉取 feature-params YAML。"""
+"""任务容器启动时：换票、拉取任务详情（project_repos）、克隆到同一个新建层、再拉取 YAML。"""
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
-from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import yaml
 
-from .paths import config_file_path, runtime_dir
+from .layers import create_root_layer, new_layer_id
+from .paths import config_file_path
 
 log = logging.getLogger(__name__)
 
@@ -94,27 +93,18 @@ def _post_json(
     return json.loads(raw) if raw else {}
 
 
-def _bootstrap_git_timeout_sec() -> float:
+def _bootstrap_git_clone_timeout_sec() -> int | None:
     raw = os.environ.get("TASK_API_BOOTSTRAP_GIT_TIMEOUT_SEC", "").strip()
-    if raw:
-        try:
-            return max(10.0, float(raw))
-        except ValueError:
-            log.warning(
-                "忽略无效的 TASK_API_BOOTSTRAP_GIT_TIMEOUT_SEC=%r，使用默认 1800s",
-                raw,
-            )
-    return 1800.0
-
-
-def _bootstrap_projects_root() -> Path:
-    raw = os.environ.get("TASK_PROJECTS_CLONE_DIR", "").strip()
-    if raw:
-        p = Path(raw).expanduser().resolve()
-    else:
-        p = (runtime_dir() / "task_projects").resolve()
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    if not raw:
+        return None
+    try:
+        return max(10, int(float(raw)))
+    except ValueError:
+        log.warning(
+            "忽略无效的 TASK_API_BOOTSTRAP_GIT_TIMEOUT_SEC=%r，使用 git_clone 默认超时",
+            raw,
+        )
+        return None
 
 
 def _extract_git_repo_urls(task_detail: dict) -> list[str]:
@@ -153,83 +143,76 @@ def _extract_git_repo_urls(task_detail: dict) -> list[str]:
     return out
 
 
-def _is_supported_git_url(url: str) -> bool:
-    if url.startswith("git@") and ":" in url:
-        return True
+def _repo_dir_name_from_url(url: str) -> str:
     parsed = urlsplit(url)
-    return parsed.scheme in {"http", "https", "ssh", "git"} and bool(parsed.netloc)
+    base = (parsed.path.rsplit("/", 1)[-1] or "").strip()
+    if base.endswith(".git"):
+        base = base[:-4]
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-._")
+    if not base:
+        base = "repo"
+    return base
 
 
-def _repo_name_from_url(url: str) -> str:
-    if url.startswith("git@"):
-        path_part = url.split(":", 1)[-1]
-    else:
-        path_part = urlsplit(url).path
-    name = path_part.rsplit("/", 1)[-1]
-    if name.endswith(".git"):
-        name = name[:-4]
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name or "").strip("-._")
-    return name or "repo"
-
-
-def _clone_projects_from_urls(project_urls: list[str]) -> None:
-    if not project_urls:
-        log.info("task-detail 中未提供项目地址列表，跳过克隆")
-        return
-    if shutil.which("git") is None:
-        raise RuntimeError("系统未安装 git，无法克隆项目地址列表")
-
-    root = _bootstrap_projects_root()
-    timeout = _bootstrap_git_timeout_sec()
-    cloned = 0
-    updated = 0
-    skipped = 0
-
-    for idx, url in enumerate(project_urls, start=1):
-        u = url.strip()
-        if not _is_supported_git_url(u):
-            log.warning("跳过不支持的项目地址: %s", u)
-            skipped += 1
+async def _clone_repos_into_shared_layer(urls: list[str]) -> None:
+    """多个仓库克隆到同一个新建层，不同仓库放在该层不同子目录。"""
+    tout = _bootstrap_git_clone_timeout_sec()
+    layer_id = new_layer_id()
+    layer_path = create_root_layer(layer_id)
+    n = len(urls)
+    log.info("bootstrap 创建共享层 layer_id=%s path=%s", layer_id, layer_path)
+    for i, raw in enumerate(urls, start=1):
+        u = raw.strip()
+        if not u:
             continue
-
-        suffix = hashlib.sha1(u.encode("utf-8")).hexdigest()[:8]
-        dest = root / f"{idx:02d}-{_repo_name_from_url(u)}-{suffix}"
-        git_dir = dest / ".git"
-        if git_dir.is_dir():
-            cmd = ["git", "-C", str(dest), "fetch", "--all", "--prune"]
-            step = "git-fetch"
-            updated += 1
-        elif dest.exists() and any(dest.iterdir()):
-            log.warning("目标目录非空且不是 Git 仓库，跳过: %s", dest)
-            skipped += 1
-            continue
-        else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            cmd = ["git", "clone", "--progress", u, str(dest)]
-            step = "git-clone"
-            cloned += 1
-
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        repo_dir = layer_path / _repo_dir_name_from_url(u)
+        # 子目录重名时自动追加序号，避免覆盖已克隆仓库。
+        if repo_dir.exists():
+            suffix = 2
+            candidate = repo_dir
+            while candidate.exists():
+                candidate = layer_path / f"{repo_dir.name}_{suffix}"
+                suffix += 1
+            repo_dir = candidate
+        log.info(
+            "bootstrap 克隆到共享层 (%d/%d): %s -> %s",
+            i,
+            n,
+            u[:512],
+            repo_dir.name,
         )
+        cmd = ["git", "clone", "--progress", u, str(repo_dir)]
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=tout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"[bootstrap-clone] git clone 超时 url={u} timeout={tout}s"
+            ) from e
         if proc.returncode != 0:
             out = (proc.stdout or "") + (proc.stderr or "")
-            short = out[-2000:] if len(out) > 2000 else out
+            tail = out[-2000:] if len(out) > 2000 else out
             raise RuntimeError(
-                f"[{step}] 执行失败（exit={proc.returncode}） url={u} dest={dest}: {short}"
+                f"[bootstrap-clone] git clone 失败 exit={proc.returncode} url={u} "
+                f"layer_id={layer_id} dir={repo_dir.name} output={tail}"
             )
+        log.info(
+            "bootstrap 克隆完成 layer_id=%s dir=%s",
+            layer_id,
+            repo_dir.name,
+        )
 
-    log.info(
-        "任务项目克隆完成：总数=%d，新增克隆=%d，已存在更新=%d，跳过=%d，目录=%s",
-        len(project_urls),
-        cloned,
-        updated,
-        skipped,
-        root,
-    )
+
+def _clone_projects_via_shared_layer(repo_urls: list[str]) -> None:
+    if not repo_urls:
+        log.info("task-detail 中未提供项目地址，跳过克隆")
+        return
+    asyncio.run(_clone_repos_into_shared_layer(repo_urls))
 
 
 def bootstrap_container_config() -> None:
@@ -279,7 +262,7 @@ def bootstrap_container_config() -> None:
         timeout=timeout,
     )
     repo_urls = _extract_git_repo_urls(detail)
-    _clone_projects_from_urls(repo_urls)
+    _clone_projects_via_shared_layer(repo_urls)
 
     y = _post_json(
         f"{prefix}/server-container-token/feature-params-yaml/",
