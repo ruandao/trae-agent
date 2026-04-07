@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -41,10 +42,26 @@ from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .paths import config_file_path, service_root
 from .task_api_bootstrap import bootstrap_container_config
 
+log = logging.getLogger(__name__)
+
+
+def _strict_bootstrap_enabled() -> bool:
+    """Whether Task API bootstrap failures should block service startup."""
+    raw = (os.environ.get("TASK_API_BOOTSTRAP_STRICT_STARTUP") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    await asyncio.to_thread(bootstrap_container_config)
+    try:
+        await asyncio.to_thread(bootstrap_container_config)
+    except Exception:
+        if _strict_bootstrap_enabled():
+            raise
+        log.exception(
+            "startup bootstrap failed; continue without refreshed token/config "
+            "(set TASK_API_BOOTSTRAP_STRICT_STARTUP=1 to fail-fast)"
+        )
     yield
 
 

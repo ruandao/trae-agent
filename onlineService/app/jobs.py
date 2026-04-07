@@ -6,7 +6,6 @@ import asyncio
 import codecs
 import json
 import os
-import shlex
 import shutil
 import signal
 import subprocess
@@ -32,6 +31,7 @@ from .paths import (
     config_file_path,
     jobs_state_path,
     layers_root,
+    repo_root,
     venv_activate_path,
 )
 
@@ -111,7 +111,31 @@ def _job_subprocess_columns() -> str:
 def _job_subprocess_env() -> dict[str, str]:
     base = {**os.environ, "PYTHONUNBUFFERED": "1"}
     base["COLUMNS"] = _job_subprocess_columns()
+    if not base.get("PYTHONPATH"):
+        # 允许在未安装 console script 时回退到 `python -m trae_agent.cli`
+        base["PYTHONPATH"] = str(repo_root())
     return base
+
+
+def _venv_python_path() -> Path:
+    activate = venv_activate_path()
+    return activate.parent / "python"
+
+
+def _build_trae_run_cmd(cfg: Path, work: str, cmd_text: str) -> list[str]:
+    activate = venv_activate_path()
+    trae_bin = activate.parent / "trae-cli"
+    if trae_bin.is_file():
+        base = [str(trae_bin)]
+    else:
+        base = [str(_venv_python_path()), "-m", "trae_agent.cli"]
+    return [
+        *base,
+        "run",
+        cmd_text,
+        f"--config-file={str(cfg)}",
+        f"--working-dir={work}",
+    ]
 
 
 @dataclass
@@ -303,16 +327,9 @@ class JobStore:
         if not rec:
             return
         cfg = config_file_path()
-        act = venv_activate_path()
         work = rec.layer_path
         cmd_text = run_command if run_command is not None else rec.command
-        script = (
-            f"source {shlex.quote(str(act))} && "
-            f"trae-cli run {shlex.quote(cmd_text)} "
-            f"--config-file={shlex.quote(str(cfg))} "
-            f"--working-dir={shlex.quote(work)}"
-        )
-        cmd = ["bash", "-lc", script]
+        cmd = _build_trae_run_cmd(cfg, work, cmd_text)
 
         if rec.git_branch and not preserve_output:
             co_out, co_code = await git_checkout(Path(rec.layer_path), rec.git_branch)
