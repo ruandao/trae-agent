@@ -22,7 +22,16 @@ class EventHub:
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                pass
+                # 队列满时丢弃最旧事件，尽量保留最新状态（避免 finished 等关键事件被吞）。
+                try:
+                    _ = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    # 极端并发下若再次满，放弃本次写入。
+                    pass
 
 
 hub = EventHub()

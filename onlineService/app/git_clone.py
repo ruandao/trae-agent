@@ -118,6 +118,8 @@ async def _drain_git_stdout(
     """Read combined stdout/stderr until EOF, bounded by ``deadline`` (monotonic)."""
     assert proc.stdout is not None
     loop = asyncio.get_running_loop()
+    last_publish_at = 0.0
+    publish_interval_sec = 0.25
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -135,13 +137,16 @@ async def _drain_git_stdout(
         acc.append(text)
         if publish:
             await append_clone_layer_log(layer_id, text)
-            await publish(
-                {
-                    "type": "repo_clone_delta",
-                    "layer_id": layer_id,
-                    "title": "克隆输出更新",
-                }
-            )
+            now = loop.time()
+            if (now - last_publish_at) >= publish_interval_sec:
+                await publish(
+                    {
+                        "type": "repo_clone_delta",
+                        "layer_id": layer_id,
+                        "title": "克隆输出更新",
+                    }
+                )
+                last_publish_at = now
 
 
 def _looks_like_transient_fetch_error(output: str) -> bool:

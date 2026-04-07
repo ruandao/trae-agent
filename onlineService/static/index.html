@@ -436,6 +436,12 @@
       return '\n…(日志过长，仅保留末尾)\n' + text.slice(-MAX_CLONE_LOG_CHARS);
     }
 
+    function normalizeCloneLogText(text) {
+      if (text == null) return '';
+      // git --progress 大量使用 \r 覆写同一行；在网页里转成换行更易读，也避免“看起来卡住”。
+      return String(text).replace(/\r/g, '\n');
+    }
+
     function saveClonePersistState(payload) {
       try {
         sessionStorage.setItem(
@@ -632,7 +638,7 @@
           const data = await r.json();
           const el = document.getElementById('cloneOut');
           if (el && data.text != null) {
-            el.textContent = data.text;
+            el.textContent = normalizeCloneLogText(data.text);
             el.scrollTop = el.scrollHeight;
           }
           if (clonePersistDebounce) clearTimeout(clonePersistDebounce);
@@ -651,6 +657,20 @@
           }, 500);
         } catch (_) {}
       }, 480);
+    }
+
+    async function fetchCloneLogOnce(layerId) {
+      if (!layerId) return;
+      try {
+        const r = await api('/api/repos/clone-log/' + encodeURIComponent(layerId));
+        if (!r.ok) return;
+        const data = await r.json();
+        const el = document.getElementById('cloneOut');
+        if (el && data.text != null) {
+          el.textContent = normalizeCloneLogText(data.text);
+          el.scrollTop = el.scrollHeight;
+        }
+      } catch (_) {}
     }
 
     function stopCloneLogPoll() {
@@ -990,6 +1010,9 @@
           return;
         }
         if (o.type === 'repo_clone_finished') {
+          if (o.layer_id) {
+            void fetchCloneLogOnce(o.layer_id);
+          }
           stopCloneLogPoll();
           currentStreamingLayerId = null;
           if (o.status === 'ok' && o.layer_id) {
@@ -1151,7 +1174,12 @@
         errEl.textContent = '';
         currentStreamingLayerId = null;
         if (j && j.layer_id && !document.getElementById('cloneOut').textContent.trim()) {
-          outEl.textContent = (j && j.output) || '';
+          outEl.textContent = normalizeCloneLogText((j && j.output) || '');
+        }
+        // 无论轮询区块当前是否已有内容，都用接口返回的完整输出做一次最终覆盖，避免竞态丢尾巴。
+        if (j && j.output != null) {
+          outEl.textContent = normalizeCloneLogText(j.output);
+          outEl.scrollTop = outEl.scrollHeight;
         }
         if (j && j.layer_id) {
           snapshotClonePersist('ok', {
