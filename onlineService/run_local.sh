@@ -11,6 +11,8 @@ export no_proxy="${_local_no_proxy}${no_proxy:+,${no_proxy}}"
 export ACCESS_TOKEN="${ACCESS_TOKEN:-dev-local-token}"
 export REPO_ROOT="${REPO_ROOT:-$ROOT}"
 export TRAE_VENV="${TRAE_VENV:-$ROOT/.venv}"
+# 允许从 onlineService 子目录启动时导入仓库根下的 `trae_agent` 包
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 # macOS 自带 git 使用 LibreSSL，克隆 GitHub 时易出现 SSL_ERROR_SYSCALL；默认强制 IPv4 可缓解（需关闭时: GIT_HTTP_IPV4=0 ./run_local.sh）
 if [[ "$(uname -s)" == Darwin ]]; then
   export GIT_HTTP_IPV4="${GIT_HTTP_IPV4:-1}"
@@ -34,7 +36,14 @@ if [[ "${UVICORN_RELOAD:-1}" != "0" ]]; then
     --reload-include "*.md"
   )
 fi
-exec "$ROOT/.venv/bin/python" -m uvicorn app.main:app \
-  --host "${HOST:-0.0.0.0}" \
-  --port "${PORT:-8765}" \
-  "${RELOAD_ARGS[@]}"
+CMD=(
+  "$ROOT/.venv/bin/python"
+  -m uvicorn
+  app.main:app
+  --host "${HOST:-0.0.0.0}"
+  --port "${PORT:-8765}"
+)
+if [[ "${#RELOAD_ARGS[@]}" -gt 0 ]]; then
+  CMD+=("${RELOAD_ARGS[@]}")
+fi
+exec "${CMD[@]}"

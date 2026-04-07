@@ -83,7 +83,8 @@ class CloneRepoBody(BaseModel):
 class LayerGitCommitBody(BaseModel):
     """在工作区内执行 ``git add -A`` 与 ``git commit``。
 
-    ``message`` 为空时由服务端根据关联任务指令与暂存区 diff 自动生成提交说明。
+    ``message`` 为空时由服务端自动生成说明：约定式主题行（type/scope）、
+    若存在 ``.trajectories/trajectory_*.json`` 则附带代理结论与步骤节选，以及变更统计与文件列表。
     """
 
     message: str | None = Field(default=None, max_length=4096)

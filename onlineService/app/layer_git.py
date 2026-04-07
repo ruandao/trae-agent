@@ -12,6 +12,11 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from trae_agent.utils.auto_commit_message import (
+    build_auto_commit_message,
+    load_latest_trajectory_data,
+)
+
 from .git_clone import _validate_branch
 from .layers import layer_path
 
@@ -141,50 +146,6 @@ def _strip_explicit_commit_message(message: str | None) -> str:
     return raw
 
 
-def _build_auto_commit_message(
-    *,
-    command_hint: str | None,
-    stat_text: str,
-    shortstat: str,
-    files: list[str],
-) -> str:
-    """根据任务指令与暂存区内容撰写多行提交说明。"""
-    cmd = (command_hint or "").strip()
-    if cmd:
-        first = cmd.replace("\r", "").split("\n", 1)[0].strip()
-        if len(first) > 72:
-            first = first[:69] + "..."
-        title = f"chore(online-layer): {first}"
-    else:
-        n = len(files)
-        title = f"chore(online-layer): 更新 {n} 个文件" if n else "chore(online-layer): 工作区变更"
-
-    lines: list[str] = [title, ""]
-    lines.append("【任务指令】")
-    lines.append(cmd if cmd else "（无关联任务记录，可能为克隆层或未通过本服务创建的任务）")
-    lines.append("")
-    lines.append("【变更统计】")
-    lines.append(shortstat.strip() or stat_text.strip() or "—")
-    lines.append("")
-    lines.append("【git diff --stat】")
-    st = stat_text.strip()
-    lines.append(st if st else "（空）")
-    lines.append("")
-    lines.append("【涉及文件】")
-    if files:
-        for name in files[:200]:
-            lines.append(f"  {name}")
-        if len(files) > 200:
-            lines.append(f"  … 共 {len(files)} 个文件，以上仅列出前 200 个")
-    else:
-        lines.append("  （无法列出文件）")
-
-    msg = "\n".join(lines)
-    if len(msg) > _MAX_COMMIT_MSG_LEN:
-        msg = msg[: _MAX_COMMIT_MSG_LEN - 24] + "\n…(说明已截断)"
-    return msg
-
-
 async def _git_diff_cached_text(
     root: Path,
     env: dict[str, str],
@@ -213,7 +174,7 @@ async def commit_layer_worktree(
     """暂存全部变更（``git add -A``）并提交到该层工作区所在仓库。
 
     * ``message`` 非空：作为完整提交说明（手动覆盖）。
-    * ``message`` 为空：根据 ``command_hint`` 与暂存区 ``git diff`` 自动生成说明。
+    * ``message`` 为空：根据 ``command_hint``、最新轨迹 JSON（若存在）与暂存区统计自动生成说明。
     """
     _ensure_layer_id(layer_id)
     root = layer_path(layer_id)
@@ -267,11 +228,14 @@ async def commit_layer_worktree(
     if explicit:
         msg = _strip_explicit_commit_message(explicit)
     else:
-        msg = _build_auto_commit_message(
+        traj = load_latest_trajectory_data(root)
+        msg = build_auto_commit_message(
             command_hint=command_hint,
             stat_text=stat_text,
             shortstat=shortstat,
             files=files,
+            trajectory=traj,
+            max_total_len=_MAX_COMMIT_MSG_LEN,
         )
 
     cenv = {
