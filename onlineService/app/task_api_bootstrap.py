@@ -7,14 +7,20 @@ import json
 import logging
 import os
 import re
-import subprocess
+import shutil
 from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import yaml
 
-from .git_clone import append_clone_layer_log, clear_clone_layer_log
+from .git_clone import (
+    _clone_subprocess_env,
+    _git_config_prefix,
+    append_clone_layer_log,
+    clear_clone_layer_log,
+    get_clone_layer_log_text,
+)
 from .layers import create_root_layer, new_layer_id
 from .paths import config_file_path
 
@@ -147,6 +153,154 @@ def _extract_git_repo_urls(task_detail: dict) -> list[str]:
     return out
 
 
+_GIT_PHASE_PCT = re.compile(
+    r"(?:Receiving objects|Resolving deltas|Compressing objects|Unpacking objects|Counting objects):\s*(\d+)%",
+    re.IGNORECASE,
+)
+
+
+def _max_git_phase_percent(text: str) -> int | None:
+    nums = [int(x) for x in _GIT_PHASE_PCT.findall(text)]
+    return max(nums) if nums else None
+
+
+def _overall_clone_percent(repo_index: int, repo_total: int, phase_pct: int) -> int:
+    if repo_total <= 0:
+        return min(99, phase_pct)
+    return min(
+        99,
+        int(((repo_index - 1) + phase_pct / 100.0) / repo_total * 100),
+    )
+
+
+async def _post_git_clone_progress_saas(
+    cloud_prefix: str,
+    access_token: str,
+    progress: int,
+    message: str,
+) -> None:
+    url = f"{cloud_prefix.rstrip('/')}/server-container-token/git-clone-progress/"
+    body = {
+        "access_token": access_token,
+        "progress": max(0, min(100, progress)),
+        "message": message,
+    }
+    try:
+        await asyncio.to_thread(
+            _post_json,
+            url,
+            body,
+            step="git-clone-progress",
+            timeout=8.0,
+        )
+    except Exception as e:
+        log.warning("git-clone-progress 上报 SaaS 失败: %s", e)
+
+
+async def _maybe_report_clone_progress(
+    *,
+    cloud_prefix: str,
+    access_token: str,
+    repo_index: int,
+    repo_total: int,
+    repo_url: str,
+    stderr_text: str,
+    last_sent: list,
+) -> None:
+    phase = _max_git_phase_percent(stderr_text)
+    if phase is None:
+        return
+    overall = _overall_clone_percent(repo_index, repo_total, phase)
+    now = asyncio.get_running_loop().time()
+    t_prev, p_prev = last_sent[0], last_sent[1]
+    if overall < p_prev:
+        return
+    if overall == p_prev and (now - t_prev) < 0.4:
+        return
+    if overall > p_prev and (now - t_prev) < 0.22 and (overall - p_prev) < 3:
+        return
+    last_sent[0] = now
+    last_sent[1] = overall
+    short = repo_url[:72] + ("…" if len(repo_url) > 72 else "")
+    msg = f"容器克隆 ({repo_index}/{repo_total}) 阶段 {phase}% · {short}"
+    await _post_git_clone_progress_saas(cloud_prefix, access_token, overall, msg)
+
+
+async def _kill_bootstrap_git_proc(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await proc.wait()
+    except OSError:
+        pass
+
+
+async def _run_git_clone_repo_streaming(
+    *,
+    cmd: list[str],
+    env: dict,
+    layer_id: str,
+    timeout_sec: int | None,
+    cloud_prefix: str,
+    access_token: str,
+    repo_index: int,
+    repo_total: int,
+    repo_url: str,
+) -> int:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    err_parts: list[str] = []
+    out_parts: list[str] = []
+    last_sent = [0.0, -1]
+
+    async def pump_stream(stream, parts: list[str], is_stderr: bool) -> None:
+        assert stream is not None
+        while True:
+            chunk = await stream.read(8192)
+            if not chunk:
+                break
+            t = chunk.decode(errors="replace")
+            parts.append(t)
+            await append_clone_layer_log(layer_id, t)
+            if is_stderr:
+                await _maybe_report_clone_progress(
+                    cloud_prefix=cloud_prefix,
+                    access_token=access_token,
+                    repo_index=repo_index,
+                    repo_total=repo_total,
+                    repo_url=repo_url,
+                    stderr_text="".join(err_parts),
+                    last_sent=last_sent,
+                )
+
+    assert proc.stdout is not None and proc.stderr is not None
+    try:
+        if timeout_sec is not None:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    pump_stream(proc.stdout, out_parts, False),
+                    pump_stream(proc.stderr, err_parts, True),
+                ),
+                timeout=float(timeout_sec),
+            )
+        else:
+            await asyncio.gather(
+                pump_stream(proc.stdout, out_parts, False),
+                pump_stream(proc.stderr, err_parts, True),
+            )
+    except asyncio.TimeoutError:
+        await _kill_bootstrap_git_proc(proc)
+        raise TimeoutError from None
+
+    return await proc.wait()
+
+
 def _repo_dir_name_from_url(url: str) -> str:
     parsed = urlsplit(url)
     base = (parsed.path.rsplit("/", 1)[-1] or "").strip()
@@ -158,12 +312,20 @@ def _repo_dir_name_from_url(url: str) -> str:
     return base
 
 
-async def _clone_repos_into_shared_layer(urls: list[str]) -> str:
+async def _clone_repos_into_shared_layer(
+    urls: list[str],
+    *,
+    cloud_prefix: str,
+    access_token: str,
+) -> str:
     """多个仓库克隆到同一个新建层，不同仓库放在该层不同子目录。
 
     将 git 输出写入与 UI 克隆相同的内存缓冲，便于页面加载后通过
-    ``GET /api/repos/bootstrap-clone-log`` 展示（引导阶段尚无 SSE 客户端）。
+    ``GET /api/repos/bootstrap-clone-log`` 展示；同时将解析出的百分比经 SaaS SSE 推到任务详情评论区。
     """
+    if shutil.which("git") is None:
+        raise RuntimeError("git executable not found on PATH")
+
     tout = _bootstrap_git_clone_timeout_sec()
     layer_id = new_layer_id()
     layer_path = create_root_layer(layer_id)
@@ -173,7 +335,14 @@ async def _clone_repos_into_shared_layer(urls: list[str]) -> str:
         "【容器启动引导】正在克隆任务关联仓库…\n\n",
     )
     n = len(urls)
+    await _post_git_clone_progress_saas(
+        cloud_prefix,
+        access_token,
+        0,
+        "【容器启动引导】开始克隆任务关联仓库…",
+    )
     log.info("bootstrap 创建共享层 layer_id=%s path=%s", layer_id, layer_path)
+    git_env = _clone_subprocess_env()
     for i, raw in enumerate(urls, start=1):
         u = raw.strip()
         if not u:
@@ -198,29 +367,33 @@ async def _clone_repos_into_shared_layer(urls: list[str]) -> str:
             layer_id,
             f"━━ ({i}/{n}) {u}\n→ {repo_dir.name}\n",
         )
-        cmd = ["git", "clone", "--progress", u, str(repo_dir)]
+        cmd = list(_git_config_prefix())
+        cmd.extend(["clone", "--progress", u, str(repo_dir)])
         try:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=tout,
+            code = await _run_git_clone_repo_streaming(
+                cmd=cmd,
+                env=git_env,
+                layer_id=layer_id,
+                timeout_sec=tout,
+                cloud_prefix=cloud_prefix,
+                access_token=access_token,
+                repo_index=i,
+                repo_total=n,
+                repo_url=u,
             )
-        except subprocess.TimeoutExpired as e:
+        except TimeoutError:
             await append_clone_layer_log(
                 layer_id,
                 f"\n[bootstrap-clone 超时] url={u!r} timeout={tout}s\n",
             )
             raise RuntimeError(
                 f"[bootstrap-clone] git clone 超时 url={u} timeout={tout}s"
-            ) from e
-        out = (proc.stdout or "") + (proc.stderr or "")
-        await append_clone_layer_log(layer_id, out + ("\n" if out and not out.endswith("\n") else ""))
-        if proc.returncode != 0:
-            tail = out[-2000:] if len(out) > 2000 else out
+            ) from None
+        if code != 0:
+            full = await get_clone_layer_log_text(layer_id)
+            tail = full[-2000:] if len(full) > 2000 else full
             raise RuntimeError(
-                f"[bootstrap-clone] git clone 失败 exit={proc.returncode} url={u} "
+                f"[bootstrap-clone] git clone 失败 exit={code} url={u} "
                 f"layer_id={layer_id} dir={repo_dir.name} output={tail}"
             )
         log.info(
@@ -229,14 +402,31 @@ async def _clone_repos_into_shared_layer(urls: list[str]) -> str:
             repo_dir.name,
         )
     await append_clone_layer_log(layer_id, "\n【容器启动引导】克隆完成。\n")
+    await _post_git_clone_progress_saas(
+        cloud_prefix,
+        access_token,
+        100,
+        "【容器启动引导】仓库克隆已完成",
+    )
     return layer_id
 
 
-def _clone_projects_via_shared_layer(repo_urls: list[str]) -> str | None:
+def _clone_projects_via_shared_layer(
+    repo_urls: list[str],
+    *,
+    cloud_prefix: str,
+    access_token: str,
+) -> str | None:
     if not repo_urls:
         log.info("task-detail 中未提供项目地址，跳过克隆")
         return None
-    return asyncio.run(_clone_repos_into_shared_layer(repo_urls))
+    return asyncio.run(
+        _clone_repos_into_shared_layer(
+            repo_urls,
+            cloud_prefix=cloud_prefix,
+            access_token=access_token,
+        )
+    )
 
 
 def bootstrap_container_config() -> None:
@@ -289,7 +479,11 @@ def bootstrap_container_config() -> None:
         timeout=timeout,
     )
     repo_urls = _extract_git_repo_urls(detail)
-    bootstrap_clone_layer_id = _clone_projects_via_shared_layer(repo_urls)
+    bootstrap_clone_layer_id = _clone_projects_via_shared_layer(
+        repo_urls,
+        cloud_prefix=prefix,
+        access_token=new_access,
+    )
 
     y = _post_json(
         f"{prefix}/server-container-token/feature-params-yaml/",
