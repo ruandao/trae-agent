@@ -440,7 +440,7 @@
     }
     /** 丢弃过期的 refreshJobBranches 异步结果，避免并行 loadJobs/loadLayers 等把分支选项追加两遍。 */
     let _jobBranchRefreshSeq = 0;
-    /** 用户是否明确选了「不基于已有层」；为 false 时在无有效 prev/preferred 时默认选 API 返回的第一项（最新层）。 */
+    /** 用户是否明确选了「不基于已有层」；为 false 时自动选时间最新的非繁忙层（见 fillJobRepoLayerSelect）。 */
     let jobRepoLayerUserChoseEmpty = false;
     const MAX_CLONE_LOG_CHARS = 480000;
     let lastCloneForm = { url: '', branch: '', depth: '' };
@@ -1025,10 +1025,15 @@
       }
     }
 
-    const es = new EventSource(
-      '/api/events/stream?access_token=' + encodeURIComponent(ACCESS_TOKEN)
-    );
-    es.onmessage = (ev) => {
+    /** 延后连接 SSE：避免与首屏 fetch 并发长连接，使 wait_until=networkidle 等探测可结束（否则刷新会“永远加载”）。 */
+    let sseStarted = false;
+    function connectSse() {
+      if (sseStarted) return;
+      sseStarted = true;
+      const es = new EventSource(
+        '/api/events/stream?access_token=' + encodeURIComponent(ACCESS_TOKEN)
+      );
+      es.onmessage = (ev) => {
       try {
         const o = JSON.parse(ev.data);
         if (o.type === 'connected') {
@@ -1132,8 +1137,9 @@
       } catch (_) {
         sseAppend(ev.data.slice(0, 120));
       }
-    };
-    es.onerror = () => sseAppend('[SSE error / reconnecting]');
+      };
+      es.onerror = () => sseAppend('[SSE error / reconnecting]');
+    }
 
     document.getElementById('btnPushCfg').onclick = async () => {
       document.getElementById('cfgErr').textContent = '';
@@ -1276,7 +1282,8 @@
           (busy ? ' · （执行中）' : '');
         if (busy) {
           o.disabled = true;
-          o.title = '该任务仍在排队或执行中，无法作为父任务叠加新层';
+          o.title =
+            '该任务所在层仍有指令在排队或执行中；请待当前层指令结束后再从此层叠建新层';
         }
         sel.appendChild(o);
       }
@@ -1293,10 +1300,36 @@
       if (sel) sel.disabled = hasParent;
     }
 
+    /** 与后端 list_layers 一致：优先 ISO created_at；否则从 layer_id 前缀 YYYYMMDD_HHMMSS 推导可比较键。 */
+    function layerRepoSourceSortKey(l) {
+      if (l && l.created_at) return l.created_at;
+      const m = String((l && l.layer_id) || '').match(/^(\d{8})_(\d{6})_/);
+      if (!m) return '';
+      const d = m[1];
+      const t = m[2];
+      return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}T${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
+    }
+
+    /** 在可选（非执行中）层中选时间戳最大的一层，避免刷新后仍停留在旧层。 */
+    function pickLatestNonBusyRepoLayerId(layers) {
+      let best = null;
+      let bestKey = '';
+      for (const x of layers) {
+        if (layerIdHasActiveJob(x.layer_id)) continue;
+        const k = layerRepoSourceSortKey(x);
+        if (!best || k > bestKey) {
+          best = x;
+          bestKey = k;
+        } else if (best && k === bestKey && String(x.layer_id) > String(best.layer_id)) {
+          best = x;
+        }
+      }
+      return best ? best.layer_id : '';
+    }
+
     async function fillJobRepoLayerSelect(preferredLayerId) {
       const sel = document.getElementById('jobRepoLayer');
       if (!sel) return;
-      const prev = sel.value;
       const r = await api('/api/layers');
       sel.replaceChildren();
       const empty = document.createElement('option');
@@ -1316,7 +1349,8 @@
         if (busy) {
           txt += ' · （执行中）';
           opt.disabled = true;
-          opt.title = '该层上有任务正在排队或执行中，不可作为工作区来源';
+          opt.title =
+            '该层仍有指令在排队或执行中；请待当前层结束后再从此层叠建新指令层';
         }
         opt.textContent = txt.length > 120 ? txt.slice(0, 120) + '…' : txt;
         sel.appendChild(opt);
@@ -1329,17 +1363,10 @@
       ) {
         pick = preferredLayerId;
         jobRepoLayerUserChoseEmpty = false;
-      } else if (
-        prev &&
-        layers.some((x) => x.layer_id === prev) &&
-        !layerIdHasActiveJob(prev)
-      ) {
-        pick = prev;
-        jobRepoLayerUserChoseEmpty = false;
-      } else if (!jobRepoLayerUserChoseEmpty && layers.length > 0) {
-        // GET /api/layers 与 layerSelect 一致：created_at 降序，优先第一个非繁忙层
-        const firstFree = layers.find((x) => !layerIdHasActiveJob(x.layer_id));
-        if (firstFree) pick = firstFree.layer_id;
+      } else if (jobRepoLayerUserChoseEmpty) {
+        pick = '';
+      } else if (layers.length > 0) {
+        pick = pickLatestNonBusyRepoLayerId(layers);
       }
       if (pick) sel.value = pick;
       else sel.value = '';
@@ -1911,7 +1938,8 @@
         if (layerIdHasActiveJob(layer.layer_id)) {
           bits.push('执行中 · 不可作新建任务来源');
           row.style.opacity = '0.62';
-          row.title = '该层有任务排队或执行中：不可作为「工作区来源层」，亦不可选为父任务';
+          row.title =
+            '该层仍有指令在排队或执行中；请待当前层结束后再从此层叠建新层（不可作工作区来源或父任务）';
         }
         muted.textContent = bits.join(' · ');
 
@@ -2365,9 +2393,42 @@
     // 须立即恢复克隆表单：若等到 loadLayers 完成再写入，/api/layers 慢或失败时 URL 会一直为空。
     applyPersistedCloneUi(__persistedClone);
     wireCloneFormInputPersist();
-    applyTaskGate();
-    loadJobs();
-    void loadLayers(__persistedClone && __persistedClone.layer_id);
+    void (async () => {
+      try {
+        await applyTaskGate();
+      } catch (_) {}
+      const layersBoot = (async () => {
+        try {
+          const r = await api('/api/repos/bootstrap-clone-log');
+          if (r.ok) {
+            const j = await r.json();
+            const out = document.getElementById('cloneOut');
+            if (
+              j &&
+              j.layer_id &&
+              j.text != null &&
+              String(j.text).trim() &&
+              out &&
+              !out.textContent.trim()
+            ) {
+              out.textContent = normalizeCloneLogText(j.text);
+              await loadLayers(j.layer_id);
+              const sel = document.getElementById('layerSelect');
+              if (sel && j.layer_id) sel.value = j.layer_id;
+              updateLayerCommandMeta();
+              void reloadLayerTree();
+              return;
+            }
+          }
+        } catch (_) {}
+        await loadLayers(__persistedClone && __persistedClone.layer_id);
+      })();
+      try {
+        await Promise.all([loadJobs(), layersBoot]);
+      } catch (_) {}
+      // 留出 >500ms 无长连接窗口，便于依赖 networkidle 的宿主结束「加载中」
+      setTimeout(connectSse, 600);
+    })();
   </script>
 </body>
 </html>

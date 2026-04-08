@@ -40,7 +40,7 @@ from .layer_git import (
 from .job_trajectory import load_agent_steps_for_layer
 from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .paths import config_file_path, service_root
-from .task_api_bootstrap import bootstrap_container_config
+from . import task_api_bootstrap
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ def _strict_bootstrap_enabled() -> bool:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     try:
-        await asyncio.to_thread(bootstrap_container_config)
+        await asyncio.to_thread(task_api_bootstrap.bootstrap_container_config)
     except Exception:
         if _strict_bootstrap_enabled():
             raise
@@ -257,6 +257,16 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
 async def api_clone_log(_: AuthDep, layer_id: str) -> dict[str, Any]:
     """轮询克隆进度：正文在服务端缓冲，SSE 仅通知 layer_id。"""
     lid = _valid_layer_id_param(layer_id)
+    text = await get_clone_layer_log_text(lid)
+    return {"layer_id": lid, "text": text}
+
+
+@app.get("/api/repos/bootstrap-clone-log")
+async def api_bootstrap_clone_log(_: AuthDep) -> dict[str, Any]:
+    """容器启动引导阶段完成的克隆日志（无 SSE 时供首屏拉取）。"""
+    lid = task_api_bootstrap.bootstrap_clone_layer_id
+    if not lid:
+        return {"layer_id": None, "text": ""}
     text = await get_clone_layer_log_text(lid)
     return {"layer_id": lid, "text": text}
 

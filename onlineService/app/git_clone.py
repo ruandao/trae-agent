@@ -6,6 +6,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from .layers import create_root_layer, new_layer_id
 PublishFn = Callable[[dict[str, Any]], Awaitable[None]]
 from .paths import layers_root
 
-_clone_log_lock = asyncio.Lock()
+_clone_log_lock = threading.Lock()
 _clone_logs: dict[str, str] = {}
 
 try:
@@ -26,19 +27,19 @@ except ValueError:
 
 
 async def clear_clone_layer_log(layer_id: str) -> None:
-    async with _clone_log_lock:
+    with _clone_log_lock:
         _clone_logs.pop(layer_id, None)
 
 
 async def get_clone_layer_log_text(layer_id: str) -> str:
-    async with _clone_log_lock:
+    with _clone_log_lock:
         return _clone_logs.get(layer_id, "")
 
 
 async def append_clone_layer_log(layer_id: str, text: str) -> None:
     if not text:
         return
-    async with _clone_log_lock:
+    with _clone_log_lock:
         cur = _clone_logs.get(layer_id, "") + text
         if len(cur) > _MAX_CLONE_LOG_CHARS:
             cur = "\n…(日志过长，仅保留末尾)\n" + cur[-_MAX_CLONE_LOG_CHARS :]

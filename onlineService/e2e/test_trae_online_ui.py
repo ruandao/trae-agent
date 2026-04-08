@@ -57,6 +57,15 @@ def reset_before_each_test(request: pytest.FixtureRequest, page: Page) -> None:
 
 
 @pytest.mark.skip_reset
+def test_refresh_allows_networkidle_despite_sse(page: Page) -> None:
+    """首屏 fetch 结束后再建 SSE；避免与长连接并存导致 wait_until=networkidle 永不达成（刷新一直转圈）。"""
+    page.goto(_ui_url(), wait_until="networkidle", timeout=25_000)
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    page.reload(wait_until="networkidle", timeout=25_000)
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+
+
+@pytest.mark.skip_reset
 def test_event_source_patch_and_large_chunk_like_batched_sse(page: Page) -> None:
     """在首屏加载前包装 EventSource；统计轻量 ``job_output`` SSE（无 chunk，前端按 job_id 拉取）。"""
     page.add_init_script(

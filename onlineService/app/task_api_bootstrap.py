@@ -14,10 +14,14 @@ from urllib.request import Request, urlopen
 
 import yaml
 
+from .git_clone import append_clone_layer_log, clear_clone_layer_log
 from .layers import create_root_layer, new_layer_id
 from .paths import config_file_path
 
 log = logging.getLogger(__name__)
+
+# 容器启动引导克隆所用的 layer_id，供 UI GET /api/repos/bootstrap-clone-log 展示日志（无 SSE）。
+bootstrap_clone_layer_id: str | None = None
 
 
 def _bootstrap_http_timeout_sec() -> float:
@@ -154,11 +158,20 @@ def _repo_dir_name_from_url(url: str) -> str:
     return base
 
 
-async def _clone_repos_into_shared_layer(urls: list[str]) -> None:
-    """多个仓库克隆到同一个新建层，不同仓库放在该层不同子目录。"""
+async def _clone_repos_into_shared_layer(urls: list[str]) -> str:
+    """多个仓库克隆到同一个新建层，不同仓库放在该层不同子目录。
+
+    将 git 输出写入与 UI 克隆相同的内存缓冲，便于页面加载后通过
+    ``GET /api/repos/bootstrap-clone-log`` 展示（引导阶段尚无 SSE 客户端）。
+    """
     tout = _bootstrap_git_clone_timeout_sec()
     layer_id = new_layer_id()
     layer_path = create_root_layer(layer_id)
+    await clear_clone_layer_log(layer_id)
+    await append_clone_layer_log(
+        layer_id,
+        "【容器启动引导】正在克隆任务关联仓库…\n\n",
+    )
     n = len(urls)
     log.info("bootstrap 创建共享层 layer_id=%s path=%s", layer_id, layer_path)
     for i, raw in enumerate(urls, start=1):
@@ -181,6 +194,10 @@ async def _clone_repos_into_shared_layer(urls: list[str]) -> None:
             u[:512],
             repo_dir.name,
         )
+        await append_clone_layer_log(
+            layer_id,
+            f"━━ ({i}/{n}) {u}\n→ {repo_dir.name}\n",
+        )
         cmd = ["git", "clone", "--progress", u, str(repo_dir)]
         try:
             proc = await asyncio.to_thread(
@@ -191,11 +208,16 @@ async def _clone_repos_into_shared_layer(urls: list[str]) -> None:
                 timeout=tout,
             )
         except subprocess.TimeoutExpired as e:
+            await append_clone_layer_log(
+                layer_id,
+                f"\n[bootstrap-clone 超时] url={u!r} timeout={tout}s\n",
+            )
             raise RuntimeError(
                 f"[bootstrap-clone] git clone 超时 url={u} timeout={tout}s"
             ) from e
+        out = (proc.stdout or "") + (proc.stderr or "")
+        await append_clone_layer_log(layer_id, out + ("\n" if out and not out.endswith("\n") else ""))
         if proc.returncode != 0:
-            out = (proc.stdout or "") + (proc.stderr or "")
             tail = out[-2000:] if len(out) > 2000 else out
             raise RuntimeError(
                 f"[bootstrap-clone] git clone 失败 exit={proc.returncode} url={u} "
@@ -206,21 +228,26 @@ async def _clone_repos_into_shared_layer(urls: list[str]) -> None:
             layer_id,
             repo_dir.name,
         )
+    await append_clone_layer_log(layer_id, "\n【容器启动引导】克隆完成。\n")
+    return layer_id
 
 
-def _clone_projects_via_shared_layer(repo_urls: list[str]) -> None:
+def _clone_projects_via_shared_layer(repo_urls: list[str]) -> str | None:
     if not repo_urls:
         log.info("task-detail 中未提供项目地址，跳过克隆")
-        return
-    asyncio.run(_clone_repos_into_shared_layer(repo_urls))
+        return None
+    return asyncio.run(_clone_repos_into_shared_layer(repo_urls))
 
 
 def bootstrap_container_config() -> None:
     """与 machine_container.md 一致：exchange-refresh → refresh-access → task-detail → feature-params-yaml。"""
+    global bootstrap_clone_layer_id
+
     prefix = _task_api_prefix()
     if not prefix:
         return
 
+    bootstrap_clone_layer_id = None
     timeout = _bootstrap_http_timeout_sec()
     business_api_endpoint = _business_api_endpoint()
 
@@ -262,7 +289,7 @@ def bootstrap_container_config() -> None:
         timeout=timeout,
     )
     repo_urls = _extract_git_repo_urls(detail)
-    _clone_projects_via_shared_layer(repo_urls)
+    bootstrap_clone_layer_id = _clone_projects_via_shared_layer(repo_urls)
 
     y = _post_json(
         f"{prefix}/server-container-token/feature-params-yaml/",
