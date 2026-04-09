@@ -26,7 +26,7 @@ RUN set -e; \
 
 COPY onlineService /app/onlineService
 
-RUN mkdir -p /app/onlineProject/layers /app/onlineService/runtime
+RUN mkdir -p /app/onlineProject_state/runtime /app/onlineProject_state/logs /app/onlineProject_state/reqLogs /app/onlineProject_state/layers
 
 ENV REPO_ROOT=/app
 ENV TRAE_VENV=/app/.venv

@@ -5,13 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from starlette.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .auth import AuthDep
@@ -31,15 +37,18 @@ from .layer_fs import (
 )
 from .layer_git import (
     commit_layer_worktree,
+    diff_layer_one_path_vs_parent,
     diff_layer_worktree_vs_parent,
     git_ahead_of_upstream,
     git_worktree_dirty,
     list_branches as list_layer_git_branches,
+    list_layer_changes_vs_parent,
     push_layer_worktree,
 )
 from .job_trajectory import load_agent_steps_for_layer
 from .jobs import JobRecord, job_layer_git_destructive_locked, store
-from .paths import config_file_path, service_root
+from .online_project_view import get_online_project_active_info, set_online_project_tip
+from .paths import config_file_path, layers_root, logs_dir, service_root
 from . import task_api_bootstrap
 
 log = logging.getLogger(__name__)
@@ -62,10 +71,94 @@ async def _lifespan(_app: FastAPI):
             "startup bootstrap failed; continue without refreshed token/config "
             "(set TASK_API_BOOTSTRAP_STRICT_STARTUP=1 to fail-fast)"
         )
+    bs_lid = task_api_bootstrap.bootstrap_clone_layer_id
+    if bs_lid:
+        try:
+            await store.register_clone_layer_job(
+                str(bs_lid).strip(),
+                command="[bootstrap] 容器引导克隆",
+                output="",
+            )
+        except Exception:
+            log.exception(
+                "bootstrap: 登记克隆层任务失败 layer_id=%s",
+                bs_lid,
+            )
     yield
 
 
 app = FastAPI(title="Trae Online Service", version="1.0.0", lifespan=_lifespan)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=str(service_root() / "static")),
+    name="static",
+)
+
+_request_access_logger = logging.getLogger("trae_online.http_requests")
+
+
+def _request_path_with_qs(request: Request) -> str:
+    if request.url.query:
+        return f"{request.url.path}?{request.url.query}"
+    return request.url.path
+
+
+def _ensure_request_access_file_handler() -> None:
+    log_path = (logs_dir() / "requests.log").resolve()
+    logger = _request_access_logger
+    logger.setLevel(logging.INFO)
+    for h in logger.handlers:
+        if isinstance(h, logging.handlers.RotatingFileHandler):
+            try:
+                if Path(h.baseFilename).resolve() == log_path:
+                    return
+            except OSError:
+                continue
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+class _RequestAccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            client = request.client.host if request.client else "-"
+            _request_access_logger.info(
+                '%s "%s %s" error %.2fms',
+                client,
+                request.method,
+                _request_path_with_qs(request),
+                elapsed_ms,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        client = request.client.host if request.client else "-"
+        _request_access_logger.info(
+            '%s "%s %s" %d %.2fms',
+            client,
+            request.method,
+            _request_path_with_qs(request),
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
+
+
+_ensure_request_access_file_handler()
+app.add_middleware(_RequestAccessLogMiddleware)
 
 
 def _job_to_api_dict(rec: JobRecord) -> dict[str, Any]:
@@ -93,12 +186,34 @@ class JobCreateBody(BaseModel):
     )
 
 
+def _git_clone_command_label(url: str, branch: str | None) -> str:
+    u = (url or "").strip()
+    parts: list[str] = ["git", "clone"]
+    if branch and str(branch).strip():
+        parts.extend(["-b", str(branch).strip()])
+    parts.append(u)
+    return " ".join(parts)
+
+
 class CloneRepoBody(BaseModel):
     """将远程仓库克隆到新的可写层根目录（空目录内 ``git clone … .``）。"""
 
     url: str = Field(..., min_length=1, max_length=4096)
     branch: str | None = None
     depth: int | None = Field(default=None, ge=1, le=10_000)
+
+
+class ProjectViewBody(BaseModel):
+    """将 ``onlineProject`` 指向某可写层 tip（联合视图）。"""
+
+    layer_id: str = Field(..., min_length=1, max_length=256)
+
+
+class LayerQueueBody(BaseModel):
+    """在节点任务运行中/排队时，向该可写层待执行队列追加一条指令。"""
+
+    command: str = Field(..., min_length=1)
+    command_kind: Literal["trae", "shell"] = "trae"
 
 
 class LayerGitCommitBody(BaseModel):
@@ -237,6 +352,19 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
             "status": "ok",
         }
     )
+    try:
+        out_trim = (
+            out
+            if len(out) <= 120_000
+            else out[-120_000:] + "\n…(truncated)\n"
+        )
+        await store.register_clone_layer_job(
+            layer_id,
+            command=_git_clone_command_label(body.url, body.branch),
+            output=out_trim,
+        )
+    except Exception:
+        log.exception("clone: 登记克隆层任务失败 layer_id=%s", layer_id)
     await hub.publish(
         {
             "type": "repo_cloned",
@@ -245,6 +373,10 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
         }
     )
     await _schedule_clear_clone_log(layer_id)
+    try:
+        await asyncio.to_thread(set_online_project_tip, layer_id)
+    except Exception:
+        log.exception("clone: 无法将 onlineProject 指向层 %s", layer_id)
     return {
         "status": "ok",
         "layer_id": layer_id,
@@ -443,6 +575,44 @@ async def api_layer_git_push(_: AuthDep, layer_id: str) -> dict[str, Any]:
     return await push_layer_worktree(layer_id)
 
 
+@app.get("/api/layers/{layer_id}/diff/parent/files")
+async def api_layer_diff_parent_files(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """子层相对已解析父层的变动路径列表（``diff -rq -x .git`` 解析摘要）。"""
+    layers = await asyncio.to_thread(list_layers)
+    known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
+    jobs = await asyncio.to_thread(store.list_jobs)
+    parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
+    if not parent:
+        return {
+            "layer_id": layer_id,
+            "parent_layer_id": None,
+            "same": None,
+            "changes": [],
+            "truncated": False,
+            "detail": "无父层可对比（根层或父层目录已不存在）",
+        }
+    return await asyncio.to_thread(list_layer_changes_vs_parent, parent, layer_id)
+
+
+@app.get("/api/layers/{layer_id}/diff/parent/file")
+async def api_layer_diff_parent_file(
+    _: AuthDep,
+    layer_id: str,
+    path: str = Query(..., min_length=1, description="层内相对 POSIX 路径"),
+) -> dict[str, Any]:
+    """单路径相对已解析父层的 unified diff（文件 ``diff -uN``；目录树 ``diff -ruN -x .git``）。"""
+    layers = await asyncio.to_thread(list_layers)
+    known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
+    jobs = await asyncio.to_thread(store.list_jobs)
+    parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
+    if not parent:
+        raise HTTPException(
+            status_code=400,
+            detail="无父层可对比（根层或父层目录已不存在）",
+        )
+    return await asyncio.to_thread(diff_layer_one_path_vs_parent, parent, layer_id, path)
+
+
 @app.get("/api/layers/{layer_id}/diff/parent")
 async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
     """当前可写层工作区目录与已解析父层目录的差异（``diff -ruN -x .git``）。"""
@@ -466,6 +636,25 @@ async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
 async def api_task_gate(_: AuthDep) -> dict[str, Any]:
     """新建任务前是否已满足「至少成功克隆过一次」（存在含 ``.git`` 的可写层）。"""
     return {"clone_done": any_layer_has_git_repo()}
+
+
+@app.post("/api/project/view")
+async def api_set_project_view(_: AuthDep, body: ProjectViewBody) -> dict[str, Any]:
+    """将 ``onlineProject`` 指向某可写层 tip（与层关系树中选中节点一致）。"""
+    try:
+        await asyncio.to_thread(set_online_project_tip, body.layer_id.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    info = await asyncio.to_thread(get_online_project_active_info)
+    return {"status": "ok", **info}
+
+
+@app.get("/api/project/active")
+async def api_project_active(_: AuthDep) -> dict[str, Any]:
+    """当前 ``onlineProject`` 指向的 tip 层（符号链接解析）。"""
+    return await asyncio.to_thread(get_online_project_active_info)
 
 
 def _layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
@@ -494,11 +683,13 @@ def _resolved_parent_layer_id(layer_id: str, known_ids: set[str], jobs: list[Any
 
 
 async def _layer_git_meta(lid: str) -> tuple[bool | None, dict[str, Any]]:
-    """在线程中跑 git 子进程，避免阻塞事件循环。"""
-    return await asyncio.gather(
-        asyncio.to_thread(git_worktree_dirty, lid),
-        asyncio.to_thread(git_ahead_of_upstream, lid),
-    )
+    """在线程中跑 git 子进程，避免阻塞事件循环。
+
+    同一 layer 的两次调用必须串行：二者都会物化 merged 目录，并行会并发 rmtree/copy 同一 dest。
+    """
+    dirty = await asyncio.to_thread(git_worktree_dirty, lid)
+    remote = await asyncio.to_thread(git_ahead_of_upstream, lid)
+    return dirty, remote
 
 
 @app.get("/api/layers")
@@ -510,6 +701,10 @@ async def api_list_layers(_: AuthDep) -> dict[str, Any]:
     # 将 layer_id 映射到 jobs 记录的执行命令（用于 UI 展示）。
     # 如果某个 layer 目录存在但 jobs 状态里已不存在，则不返回 command。
     cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in jobs}
+    job_by_layer_id: dict[str, JobRecord] = {}
+    for j in jobs:
+        if j.layer_id not in job_by_layer_id:
+            job_by_layer_id[j.layer_id] = j
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
     with_git: list[tuple[dict[str, Any], str]] = []
     for item in layers:
@@ -520,6 +715,18 @@ async def api_list_layers(_: AuthDep) -> dict[str, Any]:
         if lid_s in cmd_by_layer_id:
             item["command"] = cmd_by_layer_id[lid_s]
         item["parent_layer_id"] = _resolved_parent_layer_id(lid_s, known_ids, jobs)
+        jrec = job_by_layer_id.get(lid_s)
+        if jrec:
+            item["job_id"] = jrec.id
+            item["job_status"] = jrec.status
+        else:
+            item["job_id"] = None
+            item["job_status"] = None
+        item["queue_depth"] = store.layer_queue_depth(lid_s)
+        if jrec and jrec.status in ("pending", "running"):
+            item["mind_state"] = "running"
+        else:
+            item["mind_state"] = "idle_done"
         with_git.append((item, lid_s))
 
     if with_git:
@@ -530,7 +737,43 @@ async def api_list_layers(_: AuthDep) -> dict[str, Any]:
             item["git_worktree_dirty"] = dirty
             item["git_remote"] = remote
 
-    return {"layers": layers}
+    bs = task_api_bootstrap.bootstrap_clone_layer_id
+    bs_s = str(bs).strip() if bs else ""
+    if bs_s:
+        idx = next(
+            (i for i, x in enumerate(layers) if str(x.get("layer_id", "")) == bs_s),
+            None,
+        )
+        if idx is not None and idx > 0:
+            layers.insert(0, layers.pop(idx))
+
+    return {
+        "layers": layers,
+        "layers_root": str(layers_root().resolve()),
+        "bootstrap_layer_id": bs_s or None,
+    }
+
+
+@app.delete("/api/layers/{layer_id}")
+async def api_delete_layer(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """删除可写层：若任务运行中则先中断；含子任务时自底向上删除。"""
+    lid = _valid_layer_id_param(layer_id)
+    try:
+        return await store.delete_layer_by_layer_id(lid)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/layers/{layer_id}/queue")
+async def api_layer_enqueue(_: AuthDep, layer_id: str, body: LayerQueueBody) -> dict[str, Any]:
+    """向该层当前排队/运行中的任务追加待执行指令（队列在任务完成时消费）。"""
+    lid = _valid_layer_id_param(layer_id)
+    try:
+        return await store.enqueue_layer_command(
+            lid, body.command, command_kind=body.command_kind
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.get("/api/layers/{layer_id}/files")

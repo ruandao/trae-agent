@@ -1,3 +1,1 @@
-runtime/service_config.yaml
-runtime/jobs_state.json
-runtime/commands.json
+# 运行时状态已迁至仓库根下 onlineService_state/（见 app.paths.state_root）

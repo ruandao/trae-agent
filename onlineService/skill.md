@@ -8,12 +8,13 @@
 |------|------|
 | `ACCESS_TOKEN` | **必填**。所有受保护接口须携带与此相同的令牌（查询参数或 Header）。未配置时 SSE 会返回 503。 |
 | `REPO_ROOT` | 可选。本仓库根目录，默认 `onlineService` 的上一级目录。 |
+| `ONLINE_PROJECT_STATE_ROOT` | 可选。运行时状态根目录（其下含 `runtime`、`logs`、`reqLogs`），默认 `{REPO_ROOT}/onlineProject_state`。 |
 | `TRAE_VENV` | 可选。含 `trae-cli` 的虚拟环境根路径（使用 `TRAE_VENV/bin/activate`），默认 `{REPO_ROOT}/.venv`。 |
-| `ONLINE_PROJECT_LAYERS` | 可选。可写层根目录，默认 `{REPO_ROOT}/onlineProject/layers`。 |
+| `ONLINE_PROJECT_LAYERS` | 可选。可写层根目录，默认 `{REPO_ROOT}/onlineProject_state/layers`。 |
 
 运行时与任务行为还可通过 `TRAE_JOB_COLUMNS`、`TRAE_JOB_STDOUT_CHUNK_BYTES`、`TRAE_JOB_STEPS_MAX_CELL_CHARS` 等调节（见实现代码）；克隆相关有 `GIT_CLONE_TIMEOUT_SEC`、`GIT_CLONE_MAX_RETRIES` 等。
 
-配置文件固定路径：`onlineService/runtime/service_config.yaml`（由 API 写入）。任务状态持久化：`onlineService/runtime/jobs_state.json`。
+配置文件固定路径：`onlineProject_state/runtime/service_config.yaml`（由 API 写入）。任务状态持久化：`onlineProject_state/runtime/jobs_state.json`。
 
 ## 推荐调用顺序
 
@@ -98,6 +99,9 @@
 | `GET` | `/api/layers/{layer_id}/files` | 查询参数：`prefix`（可选路径前缀）、`max_files`（默认 2000，上限 5000）。 |
 | `GET` | `/api/layers/{layer_id}/files/{file_rel_posix}` | 读取单文件；可选 `max_bytes`、`max_text_chars` 限制返回大小。路径为层内相对 POSIX 路径。 |
 | `GET` | `/api/layers/{layer_id}/children` | 列目录子项；查询参数：`dir`（相对路径，默认根）、`prefix`、`offset`、`limit`。 |
+| `GET` | `/api/layers/{layer_id}/diff/parent` | **父层与当前层目录树全文 diff**（`diff -ruN -x .git`）。父层 ID 由 `.git` 符号链接或任务记录解析，与 `GET /api/layers` 返回的 `parent_layer_id` 一致；若无父层则响应体含 `detail` 说明，`diff` 为空。返回 `same`、`diff`、`truncated` 等。 |
+| `GET` | `/api/layers/{layer_id}/diff/parent/files` | **相对父层的变动路径列表**。由 `diff -rq -x .git` 解析为 JSON：`changes` 为 `{ path, kind }` 数组，`kind` 为 `modified` \| `added` \| `removed`。无父层时同上，返回 `changes: []` 与 `detail`。条数过多时 `truncated: true`。 |
+| `GET` | `/api/layers/{layer_id}/diff/parent/file` | **单路径相对父层的 unified diff**。查询参数 **`path`**（必填）：层内相对 POSIX 路径，规则同读取单文件接口。文件使用 `diff -uN`；目录使用 `diff -ruN -x .git`。无父层时 **400**。响应含 `path_kind`（`file` \| `dir`）、`diff`、`truncated` 等。 |
 
 ## 层内 Git（不 push）
 
@@ -124,7 +128,7 @@
 
 ## Web 控制台
 
-- `GET /ui/{access_token}` — 路径中的令牌须与 `ACCESS_TOKEN` 一致，否则 401。页面内调用上述 API，并建立 SSE 连接。
+- `GET /ui/{access_token}` — 路径中的令牌须与 `ACCESS_TOKEN` 一致，否则 401。页面内调用上述 API，并建立 SSE 连接。页面含 **可写层变动浏览**：按任务层调用 `GET /api/layers/{layer_id}/diff/parent/files` 列出相对父层的路径变动，再对所选路径调用 `GET /api/layers/{layer_id}/diff/parent/file?path=...` 查看 diff。
 
 ## 层命名
 
@@ -134,7 +138,7 @@
 
 ```bash
 export ACCESS_TOKEN='your-secret'
-cp trae_config.yaml onlineService/runtime/service_config.yaml   # 或使用 UI/API 上传
+cp trae_config.yaml onlineProject_state/runtime/service_config.yaml   # 或使用 UI/API 上传
 cd onlineService
 # 依赖：在仓库根目录执行 uv pip install -r onlineService/requirements.txt（或可用 pip）
 ../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765

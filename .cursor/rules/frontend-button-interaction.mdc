@@ -1,0 +1,52 @@
+---
+description: 前端按钮需状态反馈与 debounce，防止重复点击
+globs: "**/*.{tsx,jsx,vue,html}"
+alwaysApply: false
+---
+
+# 按钮交互与防重复点击
+
+编写或修改可点击按钮（含 `button`、带 `role="button"` 的控件、表单提交等）时须同时满足：
+
+## 状态交互
+
+- 用户点击后应有**可感知反馈**：例如 `loading`/`pending` 状态、`aria-busy`、文案变化（如「提交中…」）、禁用态样式，或明确的视觉/无障碍提示。
+- 异步操作进行中应**禁用重复触发**（`disabled` 或等价约束），操作结束后再恢复。
+
+## Debounce / 防连点
+
+- 对可能触发网络请求、导航或副作用的点击，使用 **debounce**（或业务上更合适的 **throttle**）限制短时间内的重复执行；不要仅依赖用户「不会连点」。
+- 与 `loading` 配合：debounce 处理误触，禁用态处理进行中的任务。
+
+## 示例（原则示意）
+
+- 用 `disabled` / `aria-busy` 与文案反映进行中；用 **ref 同步门闩**（或等价手段）挡住首帧重绘前的连点。
+- 对 `onClick` 使用项目内的 **debounce**（如 lodash `debounce`、自写定时器），与门闩/ `pending` 并用：防抖减轻误触，门闩保证异步完成前不重入。
+
+```tsx
+const busyRef = useRef(false);
+const [pending, setPending] = useState(false);
+const onClick = useMemo(
+  () =>
+    debounce(async () => {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      setPending(true);
+      try {
+        await doRequest();
+      } finally {
+        busyRef.current = false;
+        setPending(false);
+      }
+    }, 300),
+  []
+);
+
+return (
+  <button type="button" disabled={pending} aria-busy={pending} onClick={onClick}>
+    {pending ? "提交中…" : "提交"}
+  </button>
+);
+```
+
+非 React 栈时沿用同一原则：显式状态、防抖/节流、进行中不可重复提交。

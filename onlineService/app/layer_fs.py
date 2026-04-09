@@ -1,7 +1,7 @@
 """Writable layer filesystem browser helpers.
 
 Provides:
-- list existing writable layers under `onlineProject/layers` (or `ONLINE_PROJECT_LAYERS`)
+- list existing writable layers under ``state_root()/layers``（或环境变量 ``ONLINE_PROJECT_LAYERS``）
 - list files under a layer (recursive, safe)
 - read file content from a layer (text or base64 for binary)
 """
@@ -17,11 +17,20 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from .layer_meta import is_overlay_v1_layer, read_layer_meta
+from .layer_merge import layer_merged_root_for_api
 from .layers import layer_path
 from .paths import layers_root
 
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 _SKIP_PARTS = {".git", "__pycache__", ".DS_Store"}
+
+
+def _layer_browser_root(layer_id: str) -> Path:
+    """文件树 API 根：Overlay 层为物化合并视图。"""
+    if is_overlay_v1_layer(layer_id):
+        return layer_merged_root_for_api(layer_id)
+    return layer_path(layer_id)
 
 _MAX_BYTES_DEFAULT = int(os.environ.get("LAYER_FILE_MAX_BYTES", "2000000"))  # 2MB
 _MAX_BYTES_CAP = int(os.environ.get("LAYER_FILE_MAX_BYTES_CAP", "20000000"))  # 20MB
@@ -81,22 +90,24 @@ def layer_root_or_child_has_git_repo(layer_dir: Path) -> bool:
     """层目录根部或根下**直接子目录**内是否有 git 仓库。
 
     - UI ``POST /api/repos/clone`` 使用 ``git clone … .``，``.git`` 在层根。
+    - Overlay v1 克隆层：``.git`` 在 ``<layer>/base``。
     - 容器 bootstrap（``task_api_bootstrap``）把多个仓库克隆到同一层的子目录中，
       ``.git`` 在 ``<layer>/<repo_name>/.git``，层根没有 ``.git``。
     """
     try:
-        if not layer_dir.is_dir():
-            return False
-        if _dir_has_git_metadata(layer_dir):
-            return True
-        for child in layer_dir.iterdir():
-            try:
-                if not child.is_dir() or child.name in _SKIP_PARTS:
-                    continue
-            except OSError:
+        for base in (layer_dir, layer_dir / "base"):
+            if not base.is_dir():
                 continue
-            if _dir_has_git_metadata(child):
+            if _dir_has_git_metadata(base):
                 return True
+            for child in base.iterdir():
+                try:
+                    if not child.is_dir() or child.name in _SKIP_PARTS:
+                        continue
+                except OSError:
+                    continue
+                if _dir_has_git_metadata(child):
+                    return True
     except OSError:
         return False
     return False
@@ -117,7 +128,10 @@ def any_layer_has_git_repo() -> bool:
 
 
 def infer_layer_parent_from_workspace(layer_id: str) -> str | None:
-    """若该层根目录下 ``.git`` 为指向兄弟层 ``../<parent>/.git`` 的符号链接，返回父层 *layer_id*。"""
+    """优先读 ``layer_meta.json``；否则若 ``.git`` 为指向兄弟层的符号链接则解析父层 *layer_id*。"""
+    m = read_layer_meta(layer_id)
+    if m and m.parent_layer_id and _LAYER_ID_RE.match(m.parent_layer_id):
+        return m.parent_layer_id
     if not _LAYER_ID_RE.match(layer_id):
         return None
     root = layers_root().resolve()
@@ -166,7 +180,7 @@ def _validate_safe_rel_posix(rel_posix: str) -> PurePosixPath:
 
 
 def list_layer_files(layer_id: str, prefix: str | None, max_files: int) -> dict[str, Any]:
-    layer_dir = layer_path(layer_id).resolve()
+    layer_dir = _layer_browser_root(layer_id).resolve()
     if not layer_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Layer not found: {layer_id}")
 
@@ -222,7 +236,7 @@ def list_layer_children(
     offset: int,
     limit: int,
 ) -> dict[str, Any]:
-    layer_dir = layer_path(layer_id)
+    layer_dir = _layer_browser_root(layer_id)
     if not layer_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Layer not found: {layer_id}")
 
@@ -311,7 +325,7 @@ def read_layer_file(
     max_bytes: int | None = None,
     max_text_chars: int | None = None,
 ) -> dict[str, Any]:
-    layer_dir = layer_path(layer_id)
+    layer_dir = _layer_browser_root(layer_id)
     if not layer_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Layer not found: {layer_id}")
 

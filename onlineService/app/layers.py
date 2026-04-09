@@ -1,7 +1,10 @@
-"""Writable workspace layers (stacked copies for portability).
+"""Writable workspace layers.
 
-基于父层「新建层」时，优先使用文件系统 COW/reflink（与父层共享数据块、写入时再分裂），
-在 APFS / btrfs / xfs 等环境下可避免每次全量逐字节复制；不支持时退回 shutil。
+可写层根目录默认在 ``onlineProject_state/layers/``（见 ``paths.layers_root``），不在 ``onlineProject`` 下。
+
+**Overlay v1（默认新任务）**：克隆层仅含 ``base/`` + ``layer_meta.json``；任务层仅 ``diff/`` + 元数据，
+运行时在内核 OverlayFS（Linux）或物化目录（macOS）上执行，结束后提交为 whiteout 差分层。
+**旧版** ``create_stacked_layer`` 仍用于无 ``layer_meta`` 的遗留目录。
 """
 
 import platform
@@ -12,6 +15,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from .layer_meta import write_layer_meta
 from .paths import layers_root
 
 # 不复制 .git：在 create_stacked_layer 末尾用符号链接指向父层 .git，各可写层共享同一仓库元数据。
@@ -85,6 +89,28 @@ def _copy_entry_reflink_or_shutil(src: Path, dest: Path) -> None:
 def create_root_layer(layer_id: str) -> Path:
     p = layer_path(layer_id)
     p.mkdir(parents=True, exist_ok=True)
+    return p.resolve()
+
+
+def create_clone_layer(layer_id: str) -> Path:
+    """Overlay v1：克隆层仅含 ``base/`` + 元数据（完整树在 base）。"""
+    p = layer_path(layer_id)
+    if p.exists():
+        shutil.rmtree(p)
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "base").mkdir(exist_ok=True)
+    write_layer_meta(layer_id, kind="clone", parent_layer_id=None)
+    return p.resolve()
+
+
+def create_job_layer(layer_id: str, parent_layer_id: str) -> Path:
+    """Overlay v1：任务层仅元数据 + 空 ``diff/``；运行时在 merged 上写入，结束后提交为 diff。"""
+    p = layer_path(layer_id)
+    if p.exists():
+        shutil.rmtree(p)
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "diff").mkdir(exist_ok=True)
+    write_layer_meta(layer_id, kind="job", parent_layer_id=parent_layer_id)
     return p.resolve()
 
 

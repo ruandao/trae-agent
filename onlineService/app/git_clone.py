@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .layers import create_root_layer, new_layer_id
+from .layers import create_clone_layer, new_layer_id
 
 PublishFn = Callable[[dict[str, Any]], Awaitable[None]]
 from .paths import layers_root
@@ -303,7 +303,7 @@ async def clone_into_new_layer(
         try:
             ipv4_curl_cfg = _make_ipv4_curl_config_file()
             layer_id = new_layer_id()
-            lp = create_root_layer(layer_id)
+            lp = create_clone_layer(layer_id)
             try:
                 lp_resolved = lp.resolve()
                 if root not in lp_resolved.parents and lp_resolved != root:
@@ -336,7 +336,7 @@ async def clone_into_new_layer(
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                cwd=str(lp),
+                cwd=str(lp / "base"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=_clone_subprocess_env(),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import json
+import logging
 import os
 import sys
 import shutil
@@ -17,15 +18,19 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .hub import hub
-from .layer_fs import (
-    any_layer_has_git_repo,
-    infer_layer_parent_from_workspace,
-    list_layers,
+from .layer_fs import any_layer_has_git_repo
+from .layer_meta import is_overlay_v1_layer, read_layer_meta
+from .layer_merge import (
+    finalize_job_overlay_finished,
+    interrupt_job_overlay,
+    prepare_job_run,
 )
+from .online_project_view import clear_online_project_tip, set_online_project_tip
 from .layer_git import git_checkout
 from .layers import (
     _LAYER_ID_RE,
     cleanup_layers,
+    create_job_layer,
     create_root_layer,
     create_stacked_layer,
     layer_path,
@@ -40,9 +45,10 @@ from .paths import (
     venv_activate_path,
 )
 
+log = logging.getLogger(__name__)
 
 JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
-CommandKind = Literal["trae", "shell"]
+CommandKind = Literal["trae", "shell", "clone"]
 
 _GIT_LOCK_MSG = (
     "该任务可写层在运行开始后已有 git 提交（HEAD 已变化），已禁止中断、重新执行与删除。"
@@ -67,6 +73,31 @@ def _git_rev_parse_head_sync(workdir: Path) -> str | None:
         return out or None
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def _git_workdir_for_lock_probe(rec: JobRecord) -> Path:
+    """与 ``_run_job`` 记录 ``git_head_at_run_start`` 时使用同一 git 工作区。
+
+    Overlay v1 任务层的工作区在 ``<layer>/merged``，层根目录通常没有 ``.git``；
+    克隆层工作区在 ``<layer>/base``（``.git`` 在 base 内）。
+    """
+    root = Path(rec.layer_path)
+    if not root.is_dir():
+        return root
+    if not is_overlay_v1_layer(rec.layer_id):
+        return root
+    meta = read_layer_meta(rec.layer_id)
+    if meta and meta.kind == "clone":
+        base = root / "base"
+        if base.is_dir() and (base / ".git").exists():
+            return base
+        return root
+    if meta is None or meta.kind != "job":
+        return root
+    merged = root / "merged"
+    if merged.is_dir() and (merged / ".git").exists():
+        return merged
+    return root
 
 
 # Rich 需要有限列宽，无法用「无限」；用极大值近似不折行，避免长路径/JSON 在管道下被 80 列切碎。
@@ -231,7 +262,7 @@ def job_layer_git_destructive_locked(rec: JobRecord) -> bool:
     baseline = (rec.git_head_at_run_start or "").strip()
     if not baseline:
         return rec.status != "failed"
-    work = Path(rec.layer_path)
+    work = _git_workdir_for_lock_probe(rec)
     if not work.is_dir():
         return False
     cur = _git_rev_parse_head_sync(work)
@@ -243,82 +274,20 @@ def job_layer_git_destructive_locked(rec: JobRecord) -> bool:
 class JobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, JobRecord] = {}
+        self._layer_queues: dict[str, list[dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
         self._creation_lock = asyncio.Lock()
         self._running: dict[str, asyncio.subprocess.Process] = {}
         self._runner_tasks: dict[str, asyncio.Task[None]] = {}
         self._load()
 
-    @staticmethod
-    def _stack_source_layer_id(j: JobRecord, job_by_id: dict[str, JobRecord]) -> str | None:
-        """叠层时作为复制来源的父层 layer_id；根层（空目录新建任务）为 None。"""
-        if j.parent_job_id:
-            p = job_by_id.get(j.parent_job_id)
-            return str(p.layer_id) if p else None
-        if j.repo_layer_id:
-            return str(j.repo_layer_id)
-        return None
-
-    def _stack_parent_to_children_edges(self) -> dict[str, set[str]]:
-        """父层 layer_id -> 由该层直接叠出的子层 layer_id（任务记录 + 磁盘上 .git 链）。
-
-        与 ``_expand_descendant_layers`` 配合：从链上某锚点再叠新层时，会删掉该锚点下
-        原有「直接子层」及整条下游链（对应 UI 上该点之后的层级）。
-        """
-        job_by_id = self._jobs
-        edges: dict[str, set[str]] = {}
-        for j in self._jobs.values():
-            src = self._stack_source_layer_id(j, job_by_id)
-            if src:
-                edges.setdefault(src, set()).add(j.layer_id)
-        try:
-            disk = list_layers()
-        except OSError:
-            disk = []
-        for item in disk:
-            lid = str(item.get("layer_id") or "")
-            if not _LAYER_ID_RE.match(lid):
-                continue
-            parent = infer_layer_parent_from_workspace(lid)
-            if parent:
-                edges.setdefault(parent, set()).add(lid)
-        return edges
-
-    @staticmethod
-    def _expand_descendant_layers(
-        seeds: set[str], edges: dict[str, set[str]]
-    ) -> set[str]:
-        out = set(seeds)
-        queue = list(seeds)
-        while queue:
-            cur = queue.pop()
-            for ch in edges.get(cur, ()):
-                if ch not in out:
-                    out.add(ch)
-                    queue.append(ch)
-        return out
-
-    @staticmethod
-    def _topo_delete_order(job_ids: set[str], by_id: dict[str, JobRecord]) -> list[str]:
-        """先删子任务、后删父任务（仅 ``parent_job_id`` 构成的任务树）。"""
-        if not job_ids:
-            return []
-        remaining = set(job_ids)
-        order: list[str] = []
-        while remaining:
-            leaves = [
-                jid
-                for jid in remaining
-                if not any(
-                    by_id[k].parent_job_id == jid for k in remaining if k in by_id
-                )
-            ]
-            if not leaves:
-                leaves = [next(iter(remaining))]
-            for leaf in leaves:
-                order.append(leaf)
-                remaining.remove(leaf)
-        return order
+    async def _wait_until_layer_idle(self, layer_id: str) -> None:
+        """在叠层复制前等待：该 layer 上无排队/执行中的任务（叠加指令串行化）。"""
+        while True:
+            async with self._lock:
+                if not self._active_job_for_layer(layer_id):
+                    return
+            await asyncio.sleep(0.08)
 
     async def _force_remove_job(self, job_id: str) -> None:
         """放弃分支时强制移除任务与其可写层（不校验 git 锁/子任务顺序由调用方保证）。"""
@@ -369,6 +338,23 @@ class JobStore:
                 return j
         return None
 
+    def _job_for_layer(self, layer_id: str) -> JobRecord | None:
+        """每个可写层至多一条任务记录（layer_id 唯一）。"""
+        for j in self._jobs.values():
+            if j.layer_id == layer_id:
+                return j
+        return None
+
+    def layer_queue_depth(self, layer_id: str) -> int:
+        return len(self._layer_queues.get(layer_id, []))
+
+    def _post_order_job_ids(self, job_id: str) -> list[str]:
+        out: list[str] = []
+        for cid in self._child_job_ids(job_id):
+            out.extend(self._post_order_job_ids(cid))
+        out.append(job_id)
+        return out
+
     def _load(self) -> None:
         p = jobs_state_path()
         if not p.exists():
@@ -378,16 +364,40 @@ class JobStore:
             for row in data.get("jobs", []):
                 row = {**row}
                 row.setdefault("command_kind", "trae")
+                if row.get("command_kind") not in ("trae", "shell", "clone"):
+                    row["command_kind"] = "trae"
                 rec = JobRecord(**row)
                 if rec.status == "running":
                     rec.status = "interrupted"
                 self._jobs[rec.id] = rec
+            raw_q = data.get("layer_queues") or {}
+            self._layer_queues = {}
+            if isinstance(raw_q, dict):
+                for k, v in raw_q.items():
+                    if not isinstance(k, str) or not isinstance(v, list):
+                        continue
+                    norm: list[dict[str, Any]] = []
+                    for item in v:
+                        if isinstance(item, dict) and item.get("command"):
+                            ck = item.get("command_kind", "trae")
+                            if ck not in ("trae", "shell"):
+                                ck = "trae"
+                            norm.append(
+                                {"command": str(item["command"]), "command_kind": ck}
+                            )
+                        elif isinstance(item, str) and item.strip():
+                            norm.append({"command": item.strip(), "command_kind": "trae"})
+                    if norm:
+                        self._layer_queues[k] = norm
         except (json.JSONDecodeError, TypeError, KeyError):
             pass
 
     def _save_sync(self) -> None:
         p = jobs_state_path()
-        payload = {"jobs": [j.to_dict() for j in self._jobs.values()]}
+        payload: dict[str, Any] = {
+            "jobs": [j.to_dict() for j in self._jobs.values()],
+            "layer_queues": {k: v for k, v in self._layer_queues.items() if v},
+        }
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     async def _save(self) -> None:
@@ -432,63 +442,34 @@ class JobStore:
             raise ValueError("git_branch requires parent_job_id or repo_layer_id")
 
         async with self._creation_lock:
-            parent_layer_path: Path | None = None
-            repo_src_resolved: Path | None = None
             stack_parent: str | None = None
-            to_remove_layers: set[str] = set()
 
             async with self._lock:
                 if parent_job_id:
                     parent_rec = self._jobs.get(parent_job_id)
                     if not parent_rec:
                         raise ValueError(f"parent_job_id not found: {parent_job_id}")
-                    parent_layer_path = Path(parent_rec.layer_path)
                     stack_parent = str(parent_rec.layer_id)
                 elif repo_layer_id:
                     src = layer_path(repo_layer_id)
                     if not src.is_dir():
                         raise ValueError(f"repo_layer_id not found: {repo_layer_id}")
-                    repo_src_resolved = src.resolve()
                     stack_parent = str(repo_layer_id)
                 else:
                     stack_parent = None
 
-                if stack_parent:
-                    busy = self._active_job_for_layer(stack_parent)
-                    if busy:
-                        raise ValueError(
-                            "该可写层上仍有任务在排队或执行；请待当前层指令结束后再从此层叠建新指令层。"
-                        )
-                    edges = self._stack_parent_to_children_edges()
-                    direct = set(edges.get(stack_parent, ()))
-                    to_remove_layers = self._expand_descendant_layers(direct, edges)
-                    job_ids_to_remove = {
-                        j.id for j in self._jobs.values() if j.layer_id in to_remove_layers
-                    }
-                    ordered = self._topo_delete_order(job_ids_to_remove, self._jobs)
-                else:
-                    ordered = []
-
-            for jid in ordered:
-                await self._force_remove_job(jid)
-
-            for lid in to_remove_layers:
-                p = layer_path(lid)
-                try:
-                    if p.is_dir() and self._is_managed_layer_dir(p):
-                        await asyncio.to_thread(shutil.rmtree, p, True)
-                except OSError:
-                    pass
+            if stack_parent:
+                await self._wait_until_layer_idle(stack_parent)
 
             layer_id = new_layer_id()
             if parent_job_id:
-                if parent_layer_path is None:
-                    raise ValueError("内部错误：未解析父任务工作区路径")
-                lp = create_stacked_layer(layer_id, parent_layer_path)
+                if stack_parent is None:
+                    raise ValueError("内部错误：未解析父层 layer_id")
+                lp = create_job_layer(layer_id, stack_parent)
             elif repo_layer_id:
-                if repo_src_resolved is None:
-                    raise ValueError("内部错误：未解析工作区来源层路径")
-                lp = create_stacked_layer(layer_id, repo_src_resolved)
+                if stack_parent is None:
+                    raise ValueError("内部错误：未解析父层 layer_id")
+                lp = create_job_layer(layer_id, stack_parent)
             else:
                 lp = create_root_layer(layer_id)
 
@@ -516,6 +497,68 @@ class JobStore:
             )
             return rec
 
+    async def register_clone_layer_job(
+        self,
+        layer_id: str,
+        *,
+        command: str,
+        output: str = "",
+    ) -> JobRecord | None:
+        """克隆层就绪后登记一条已完成任务（不启动子进程）；每层至多一条。"""
+        from datetime import datetime
+
+        lid = (layer_id or "").strip()
+        if not lid:
+            raise ValueError("empty layer_id")
+
+        lp = layer_path(lid)
+        if not lp.is_dir():
+            raise ValueError(f"layer not found: {lid!r}")
+
+        async with self._creation_lock:
+            async with self._lock:
+                if self._job_for_layer(lid):
+                    return self._job_for_layer(lid)
+
+            probe_rec = JobRecord(
+                id="",
+                layer_id=lid,
+                layer_path=str(lp.resolve()),
+                command=command,
+                parent_job_id=None,
+                status="completed",
+                created_at="",
+                command_kind="clone",
+            )
+            git_head = await asyncio.to_thread(
+                _git_rev_parse_head_sync,
+                _git_workdir_for_lock_probe(probe_rec),
+            )
+
+            async with self._lock:
+                if self._job_for_layer(lid):
+                    return self._job_for_layer(lid)
+                jid = str(uuid4())
+                rec = JobRecord(
+                    id=jid,
+                    layer_id=lid,
+                    layer_path=str(lp.resolve()),
+                    command=command,
+                    parent_job_id=None,
+                    status="completed",
+                    created_at=datetime.now().isoformat(timespec="seconds"),
+                    exit_code=0,
+                    output=output or "",
+                    repo_layer_id=None,
+                    command_kind="clone",
+                    git_head_at_run_start=git_head,
+                )
+                self._jobs[jid] = rec
+            await self._save()
+
+        await hub.publish(sse_job_event("job_created", rec, rec.id))
+        return rec
+
     async def _run_job(
         self,
         job_id: str,
@@ -527,15 +570,45 @@ class JobStore:
         if not rec:
             return
         cfg = config_file_path()
-        work = rec.layer_path
         cmd_text = run_command if run_command is not None else rec.command
+
+        overlay_prepared = False
+
+        async def _finalize_overlay_if_needed() -> None:
+            if not overlay_prepared:
+                return
+            if rec.status == "interrupted":
+                await asyncio.to_thread(interrupt_job_overlay, rec.layer_id)
+            else:
+                await asyncio.to_thread(finalize_job_overlay_finished, rec.layer_id)
+
+        work_dir = Path(rec.layer_path)
+        if is_overlay_v1_layer(rec.layer_id):
+            try:
+                work_dir = await asyncio.to_thread(
+                    prepare_job_run,
+                    rec.layer_id,
+                    reuse_upper=preserve_output,
+                )
+                overlay_prepared = True
+            except Exception as e:
+                rec.status = "failed"
+                rec.output = f"overlay prepare failed: {e}\n"
+                rec.exit_code = -1
+                async with self._lock:
+                    self._layer_queues.pop(rec.layer_id, None)
+                await self._save()
+                await hub.publish(sse_job_event("job_finished", rec, job_id))
+                return
+
+        work = str(work_dir)
         if rec.command_kind == "shell":
             cmd = _build_shell_cmd(cmd_text)
         else:
             cmd = _build_trae_run_cmd(cfg, work, cmd_text)
 
         if rec.git_branch and not preserve_output:
-            co_out, co_code = await git_checkout(Path(rec.layer_path), rec.git_branch)
+            co_out, co_code = await git_checkout(work_dir, rec.git_branch)
             banner = f"[git checkout {rec.git_branch}]\n{co_out}"
             rec.output = banner
             await self._save()
@@ -543,11 +616,18 @@ class JobStore:
             if co_code != 0:
                 rec.status = "failed"
                 rec.exit_code = co_code
+                async with self._lock:
+                    self._layer_queues.pop(rec.layer_id, None)
                 await self._save()
                 await hub.publish(sse_job_event("job_finished", rec, job_id))
+                await _finalize_overlay_if_needed()
+                try:
+                    await asyncio.to_thread(set_online_project_tip, rec.layer_id)
+                except Exception:
+                    log.exception("set_online_project_tip after checkout failure")
                 return
 
-        head0 = await asyncio.to_thread(_git_rev_parse_head_sync, Path(work))
+        head0 = await asyncio.to_thread(_git_rev_parse_head_sync, work_dir)
         rec.git_head_at_run_start = head0
         await self._save()
 
@@ -564,7 +644,7 @@ class JobStore:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=work,
+                cwd=str(work_dir),
                 env=_job_subprocess_env(),
                 start_new_session=True,
             )
@@ -573,8 +653,15 @@ class JobStore:
             err_line = f"spawn error: {e} (cmd={cmd[0]!r}, cwd={work!r})\n"
             rec.output = err_line if not preserve_output else rec.output + err_line
             rec.exit_code = -1
+            async with self._lock:
+                self._layer_queues.pop(rec.layer_id, None)
             await self._save()
             await hub.publish(sse_job_event("job_finished", rec, job_id))
+            await _finalize_overlay_if_needed()
+            try:
+                await asyncio.to_thread(set_online_project_tip, rec.layer_id)
+            except Exception:
+                log.exception("set_online_project_tip after spawn failure")
             return
 
         self._running[job_id] = proc
@@ -603,15 +690,129 @@ class JobStore:
         finally:
             if job_id in self._running:
                 del self._running[job_id]
+            if rec.status in ("failed", "interrupted") and rec.layer_id:
+                async with self._lock:
+                    self._layer_queues.pop(rec.layer_id, None)
             await self._save()
             await hub.publish(sse_job_event("job_finished", rec, job_id))
+            await _finalize_overlay_if_needed()
+            try:
+                await asyncio.to_thread(set_online_project_tip, rec.layer_id)
+            except Exception:
+                log.exception("set_online_project_tip after job finished")
+
+        rec_done = self._jobs.get(job_id)
+        if rec_done and rec_done.status == "completed":
+            asyncio.create_task(self._maybe_drain_layer_queue(job_id))
+
+    async def _maybe_drain_layer_queue(self, finished_job_id: str) -> None:
+        """当前层任务成功完成后：从该层待执行队列取第一条，基于本任务新建子层执行；其余队列挂到新层。"""
+        try:
+            async with self._lock:
+                fin = self._jobs.get(finished_job_id)
+                if not fin or fin.status != "completed":
+                    return
+                layer_id = fin.layer_id
+                q = self._layer_queues.get(layer_id)
+                if not q:
+                    return
+                first = q[0]
+                rest = q[1:]
+                saved_snapshot = list(q)
+                self._layer_queues.pop(layer_id, None)
+            cmd = str(first.get("command", "")).strip()
+            kind: CommandKind = (
+                first.get("command_kind", "trae")
+                if first.get("command_kind") in ("trae", "shell")
+                else "trae"
+            )
+            if not cmd:
+                async with self._lock:
+                    self._layer_queues[layer_id] = saved_snapshot
+                await self._save()
+                return
+            try:
+                new_rec = await self.create_job(
+                    cmd,
+                    finished_job_id,
+                    command_kind=kind,
+                )
+            except Exception:
+                async with self._lock:
+                    self._layer_queues[layer_id] = saved_snapshot
+                await self._save()
+                raise
+            async with self._lock:
+                if rest:
+                    self._layer_queues[new_rec.layer_id] = rest
+            await self._save()
+        except Exception:
+            log.exception("drain layer queue after job %s", finished_job_id)
+
+    async def enqueue_layer_command(
+        self,
+        layer_id: str,
+        command: str,
+        *,
+        command_kind: CommandKind = "trae",
+    ) -> dict[str, Any]:
+        command = command.strip()
+        if not command:
+            raise ValueError("empty command")
+        if command_kind not in ("trae", "shell"):
+            raise ValueError("invalid command_kind")
+        async with self._lock:
+            j = self._active_job_for_layer(layer_id)
+            if not j:
+                raise ValueError("该层无排队或运行中的任务，无法加入待执行队列")
+            self._layer_queues.setdefault(layer_id, []).append(
+                {"command": command, "command_kind": command_kind}
+            )
+            depth = len(self._layer_queues[layer_id])
+        await self._save()
+        return {"layer_id": layer_id, "queue_depth": depth}
+
+    async def delete_layer_by_layer_id(self, layer_id: str) -> dict[str, Any]:
+        """删除可写层：运行中则先中断；含子任务时自底向上删除；纯克隆层则先删依赖任务再删目录。"""
+        if not layer_id or not _LAYER_ID_RE.match(layer_id):
+            raise ValueError("invalid layer_id")
+
+        async with self._lock:
+            self._layer_queues.pop(layer_id, None)
+
+        job = self._job_for_layer(layer_id)
+        if not job:
+            roots = [j for j in self._jobs.values() if j.repo_layer_id == layer_id]
+            for r in roots:
+                for jid in self._post_order_job_ids(r.id):
+                    await self.delete_job(jid)
+            lp = layer_path(layer_id)
+            if self._is_managed_layer_dir(lp) and lp.is_dir():
+                await asyncio.to_thread(shutil.rmtree, lp, True)
+            await self._save()
+            await hub.publish(
+                {
+                    "type": "layer_deleted",
+                    "layer_id": layer_id,
+                    "title": "可写层已删除",
+                }
+            )
+            return {"layer_id": layer_id, "status": "deleted"}
+
+        for jid in self._post_order_job_ids(job.id):
+            await self.delete_job(jid)
+        await self._save()
+        await hub.publish(
+            {"type": "layer_deleted", "layer_id": layer_id, "title": "可写层已删除"}
+        )
+        return {"layer_id": layer_id, "job_id": job.id, "status": "deleted"}
 
     async def interrupt(self, job_id: str) -> bool:
         rec = self._jobs.get(job_id)
         if not rec or rec.status != "running":
             return False
-        if job_layer_git_destructive_locked(rec):
-            raise ValueError(_GIT_LOCK_MSG)
+        # 中断仅终止子进程，不依赖「层与基线 HEAD 一致」；HEAD 在长任务中可能因正常 git 操作变化，
+        # 若与 redo/删除 共用 git 锁会导致「中断」按钮永久不可用。
         proc = self._running.get(job_id)
         if not proc:
             return False
@@ -632,6 +833,11 @@ class JobStore:
                 if not rec:
                     raise ValueError("Job not found")
                 runner_task = self._runner_tasks.get(job_id)
+
+            if rec.command_kind == "clone":
+                raise ValueError(
+                    "克隆层任务不支持重新执行，请使用「克隆仓库」新建可写层。"
+                )
 
             if job_layer_git_destructive_locked(rec):
                 raise ValueError(_GIT_LOCK_MSG)
@@ -670,14 +876,14 @@ class JobStore:
                         raise ValueError(
                             f"parent_job_id not found: {rec.parent_job_id}"
                         )
-                    lp = create_stacked_layer(new_lid, Path(parent.layer_path))
+                    lp = create_job_layer(new_lid, str(parent.layer_id))
                 elif rec.repo_layer_id:
                     src = layer_path(rec.repo_layer_id)
                     if not src.is_dir():
                         raise ValueError(
                             f"repo_layer_id not found: {rec.repo_layer_id}"
                         )
-                    lp = create_stacked_layer(new_lid, src.resolve())
+                    lp = create_job_layer(new_lid, str(rec.repo_layer_id))
                 else:
                     lp = create_root_layer(new_lid)
 
@@ -705,6 +911,8 @@ class JobStore:
                 rec = self._jobs.get(job_id)
                 if not rec:
                     raise ValueError("Job not found")
+                if rec.command_kind == "clone":
+                    raise ValueError("克隆任务不支持「继续」。")
                 if rec.command_kind == "shell":
                     raise ValueError("Shell 任务不支持「继续」，请使用重新执行。")
                 if rec.status != "interrupted":
@@ -743,6 +951,7 @@ class JobStore:
 
                 # 清空内存状态，确保 /api/jobs 立刻变空
                 self._jobs.clear()
+                self._layer_queues.clear()
                 self._running.clear()
                 self._runner_tasks.clear()
 
@@ -771,6 +980,7 @@ class JobStore:
                     pass
 
             await asyncio.to_thread(_unlink_commands_log)
+            await asyncio.to_thread(clear_online_project_tip)
 
             await hub.publish({"type": "jobs_reset", "title": "任务与可写层已重置"})
             return {
@@ -829,6 +1039,7 @@ class JobStore:
                 raise ValueError("Job not found")
             if self._child_job_ids(job_id):
                 raise ValueError("存在子任务，请先删除子任务后再删除该任务")
+            self._layer_queues.pop(rec.layer_id, None)
             del self._jobs[job_id]
             self._running.pop(job_id, None)
             self._runner_tasks.pop(job_id, None)

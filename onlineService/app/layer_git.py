@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import HTTPException
@@ -18,7 +18,16 @@ from trae_agent.utils.auto_commit_message import (
 )
 
 from .git_clone import _validate_branch
+from .layer_meta import is_overlay_v1_layer
+from .layer_merge import layer_merged_root_for_api
 from .layers import layer_path
+
+
+def layer_git_workspace_root(layer_id: str) -> Path:
+    """git 工作区根：Overlay 层为物化合并视图（含 base + diff 链）。"""
+    if is_overlay_v1_layer(layer_id):
+        return layer_merged_root_for_api(layer_id)
+    return layer_path(layer_id)
 
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 
@@ -32,7 +41,7 @@ def git_worktree_dirty(layer_id: str) -> bool | None:
     """``True``：存在未暂存或未提交变更；``False``：工作区干净；``None``：非 git 或检测失败。"""
     if not layer_id or not _LAYER_ID_RE.match(layer_id):
         return None
-    root = layer_path(layer_id)
+    root = layer_git_workspace_root(layer_id)
     if not root.is_dir() or not (root / ".git").exists():
         return None
     try:
@@ -54,7 +63,7 @@ def git_worktree_dirty(layer_id: str) -> bool | None:
 async def list_branches(layer_id: str) -> dict:
     """Return local + remote branch short names and current branch if any."""
     _ensure_layer_id(layer_id)
-    root = layer_path(layer_id)
+    root = layer_git_workspace_root(layer_id)
     if not root.is_dir():
         raise HTTPException(status_code=404, detail="layer not found")
     git_dir = root / ".git"
@@ -177,7 +186,7 @@ async def commit_layer_worktree(
     * ``message`` 为空：根据 ``command_hint``、最新轨迹 JSON（若存在）与暂存区统计自动生成说明。
     """
     _ensure_layer_id(layer_id)
-    root = layer_path(layer_id)
+    root = layer_git_workspace_root(layer_id)
     if not root.is_dir():
         raise HTTPException(status_code=404, detail="layer not found")
     if not (root / ".git").exists():
@@ -292,7 +301,7 @@ async def commit_layer_worktree(
 def git_ahead_of_upstream(layer_id: str) -> dict[str, Any]:
     """当前分支相对上游的领先提交数（共享 ``.git`` 的层结果一致）。"""
     _ensure_layer_id(layer_id)
-    root = layer_path(layer_id)
+    root = layer_git_workspace_root(layer_id)
     if not root.is_dir() or not (root / ".git").exists():
         return {
             "is_git": False,
@@ -361,6 +370,213 @@ def git_ahead_of_upstream(layer_id: str) -> dict[str, Any]:
 
 
 _MAX_PARENT_DIFF_CHARS = 400_000
+_MAX_CHANGE_LIST_LINES = 2500
+_MAX_SINGLE_PATH_DIFF_CHARS = 350_000
+
+_FILES_DIFF_RQ_RE = re.compile(r"^Files (.+) and (.+) differ\s*$")
+_ONLY_IN_RQ_RE = re.compile(r"^Only in (.+): (.+)\s*$")
+
+
+def _parse_diff_rq_output(output: str, parent_root: Path, child_root: Path) -> list[dict[str, str]]:
+    """Parse ``diff -rq`` lines into ``{path, kind}`` where kind is ``modified`` | ``added`` | ``removed``."""
+    parent_r = parent_root.resolve()
+    child_r = child_root.resolve()
+    items: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+
+    def add_one(rel: str, kind: str) -> None:
+        rel = rel.strip().lstrip("/")
+        if not rel or rel == ".":
+            return
+        if ".." in PurePosixPath(rel).parts:
+            return
+        if rel in seen_paths:
+            return
+        seen_paths.add(rel)
+        items.append({"path": rel, "kind": kind})
+
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = _FILES_DIFF_RQ_RE.match(line)
+        if m:
+            try:
+                ar = Path(m.group(1)).resolve()
+                br = Path(m.group(2)).resolve()
+                rel_a = ar.relative_to(parent_r).as_posix()
+                rel_b = br.relative_to(child_r).as_posix()
+            except ValueError:
+                continue
+            rel = rel_a if rel_a == rel_b else rel_b
+            add_one(rel, "modified")
+            continue
+        m2 = _ONLY_IN_RQ_RE.match(line)
+        if m2:
+            try:
+                dir_abs = Path(m2.group(1)).resolve()
+                name = m2.group(2).strip()
+                if not name:
+                    continue
+                full = (dir_abs / name).resolve()
+                try:
+                    rel = full.relative_to(child_r).as_posix()
+                    add_one(rel, "added")
+                except ValueError:
+                    rel = full.relative_to(parent_r).as_posix()
+                    add_one(rel, "removed")
+            except ValueError:
+                continue
+
+    items.sort(key=lambda x: x["path"])
+    return items
+
+
+def list_layer_changes_vs_parent(parent_layer_id: str, layer_id: str) -> dict[str, Any]:
+    """列出子层相对父层工作区（排除 ``.git``）的变动路径摘要，基于 ``diff -rq``。"""
+    _ensure_layer_id(layer_id)
+    _ensure_layer_id(parent_layer_id)
+    if parent_layer_id == layer_id:
+        raise HTTPException(status_code=400, detail="invalid parent/child pair")
+
+    parent_root = layer_git_workspace_root(parent_layer_id).resolve()
+    child_root = layer_git_workspace_root(layer_id).resolve()
+    if not parent_root.is_dir():
+        raise HTTPException(status_code=404, detail="parent layer not found")
+    if not child_root.is_dir():
+        raise HTTPException(status_code=404, detail="layer not found")
+
+    try:
+        proc = subprocess.run(
+            ["diff", "-rq", "-x", ".git", str(parent_root), str(child_root)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
+        )
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail=f"diff timed out: {e}") from e
+
+    if proc.returncode not in (0, 1):
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise HTTPException(
+            status_code=400,
+            detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
+        )
+
+    out = proc.stdout or ""
+    items = _parse_diff_rq_output(out, parent_root, child_root)
+    truncated_list = False
+    if len(items) > _MAX_CHANGE_LIST_LINES:
+        items = items[:_MAX_CHANGE_LIST_LINES]
+        truncated_list = True
+
+    return {
+        "layer_id": layer_id,
+        "parent_layer_id": parent_layer_id,
+        "same": proc.returncode == 0,
+        "changes": items,
+        "truncated": truncated_list,
+    }
+
+
+def diff_layer_one_path_vs_parent(
+    parent_layer_id: str,
+    layer_id: str,
+    file_rel_posix: str,
+) -> dict[str, Any]:
+    """单路径相对父层的 unified diff（文件用 ``diff -uN``；目录用 ``diff -ruN -x .git``）。"""
+    from .layer_fs import _validate_safe_rel_posix
+
+    _ensure_layer_id(layer_id)
+    _ensure_layer_id(parent_layer_id)
+    if parent_layer_id == layer_id:
+        raise HTTPException(status_code=400, detail="invalid parent/child pair")
+
+    norm = (file_rel_posix or "").replace("\\", "/").lstrip("/")
+    rel = _validate_safe_rel_posix(norm)
+    rel_s = rel.as_posix()
+
+    parent_root = layer_git_workspace_root(parent_layer_id).resolve()
+    child_root = layer_git_workspace_root(layer_id).resolve()
+    if not parent_root.is_dir():
+        raise HTTPException(status_code=404, detail="parent layer not found")
+    if not child_root.is_dir():
+        raise HTTPException(status_code=404, detail="layer not found")
+
+    p_path = parent_root / Path(*rel.parts)
+    c_path = child_root / Path(*rel.parts)
+    try:
+        p_res = p_path.resolve()
+        c_res = c_path.resolve()
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
+    if not p_res.is_relative_to(parent_root) or not c_res.is_relative_to(child_root):
+        raise HTTPException(status_code=400, detail="path escapes layer root")
+
+    p_exists = p_res.exists()
+    c_exists = c_res.exists()
+    if not p_exists and not c_exists:
+        raise HTTPException(status_code=404, detail="path not found in parent or child layer")
+
+    p_is_dir = p_exists and p_res.is_dir()
+    c_is_dir = c_exists and c_res.is_dir()
+    p_is_file = p_exists and p_res.is_file()
+    c_is_file = c_exists and c_res.is_file()
+
+    def run_diff(argv: list[str]) -> tuple[str, int]:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
+        )
+        if proc.returncode not in (0, 1):
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise HTTPException(
+                status_code=400,
+                detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
+            )
+        out_l = proc.stdout or ""
+        if proc.stderr:
+            out_l = (out_l + "\n" + proc.stderr).strip()
+        return out_l, proc.returncode
+
+    truncated = False
+    if p_is_file and c_is_file:
+        kind = "file"
+        diff_text, code = run_diff(["diff", "-uN", str(p_res), str(c_res)])
+    elif p_is_file or c_is_file:
+        if p_is_dir or c_is_dir:
+            raise HTTPException(
+                status_code=400,
+                detail="路径在一侧为文件、另一侧为目录，无法生成 diff",
+            )
+        left = str(p_res) if p_exists else "/dev/null"
+        right = str(c_res) if c_exists else "/dev/null"
+        kind = "file"
+        diff_text, code = run_diff(["diff", "-uN", left, right])
+    else:
+        kind = "dir"
+        diff_text, code = run_diff(["diff", "-ruN", "-x", ".git", str(p_res), str(c_res)])
+
+    if len(diff_text) > _MAX_SINGLE_PATH_DIFF_CHARS:
+        diff_text = (
+            diff_text[:_MAX_SINGLE_PATH_DIFF_CHARS]
+            + "\n\n…（此路径 diff 已截断；完整内容可用 GET /api/layers/{id}/diff/parent）"
+        )
+        truncated = True
+
+    return {
+        "layer_id": layer_id,
+        "parent_layer_id": parent_layer_id,
+        "path": rel_s,
+        "path_kind": kind,
+        "same": code == 0,
+        "diff": diff_text if code != 0 else "",
+        "truncated": truncated,
+    }
 
 
 def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[str, Any]:
@@ -370,8 +586,8 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
     if parent_layer_id == layer_id:
         raise HTTPException(status_code=400, detail="invalid parent/child pair")
 
-    parent_root = layer_path(parent_layer_id).resolve()
-    child_root = layer_path(layer_id).resolve()
+    parent_root = layer_git_workspace_root(parent_layer_id).resolve()
+    child_root = layer_git_workspace_root(layer_id).resolve()
     if not parent_root.is_dir():
         raise HTTPException(status_code=404, detail="parent layer not found")
     if not child_root.is_dir():
@@ -417,7 +633,7 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
 async def push_layer_worktree(layer_id: str) -> dict[str, Any]:
     """将当前分支推送到已配置的上游（``git push``）。"""
     _ensure_layer_id(layer_id)
-    root = layer_path(layer_id)
+    root = layer_git_workspace_root(layer_id)
     if not root.is_dir():
         raise HTTPException(status_code=404, detail="layer not found")
     if not (root / ".git").exists():

@@ -4,6 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Trae Online Service</title>
+  <link rel="stylesheet" href="/static/vendor/ztree/css/zTreeStyle/zTreeStyle.css" />
+  <script src="/static/vendor/jquery/jquery-3.7.1.min.js"></script>
+  <script src="/static/vendor/ztree/js/jquery.ztree.all.min.js"></script>
   <style>
     :root {
       --bg: #0f1419;
@@ -132,14 +135,100 @@
     .tree-children { margin-left: 14px; margin-top: 0.25rem; }
     .tree-more { margin-left: 14px; margin-top: 0.25rem; }
     .tree-path-meta { margin-top: 0.45rem; }
-    .layer-relation-tree { margin-top: 0.35rem; max-height: 360px; }
-    .layer-relation-tree .tree-node.layer-graph-root > .tree-layer-id { color: var(--ok); }
-    .layer-relation-tree .tree-layer-id { font-weight: 600; }
-    .layer-relation-tree .tree-children {
-      margin-left: 12px;
-      padding-left: 8px;
-      border-left: 1px dashed var(--border);
+    .layer-relation-tree { margin-top: 0.35rem; }
+    /* zTree：任务关联树（深色主题；单一顶层「任务」根） */
+    #ztree_layer_graph.ztree {
+      width: 100%;
+      min-height: 420px;
+      max-height: 420px;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      margin: 0;
+      padding: 0.5rem 0.35rem;
     }
+    #layerRelationTree .ztree * {
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    #layerRelationTree .ztree {
+      color: var(--text);
+      background: transparent;
+    }
+    #layerRelationTree .ztree li a {
+      color: inherit;
+      height: auto;
+      min-height: 17px;
+      padding: 3px 6px;
+      white-space: normal;
+      max-width: 100%;
+      word-break: break-word;
+      background-color: #1a2332;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    #layerRelationTree .ztree li a:hover {
+      text-decoration: none;
+      background: rgba(61, 139, 253, 0.14);
+    }
+    #layerRelationTree .ztree li a.curSelectedNode {
+      padding-top: 3px;
+      background-color: rgba(61, 139, 253, 0.28) !important;
+      color: var(--text) !important;
+      border: 1px solid var(--accent) !important;
+      opacity: 1;
+    }
+    #layerRelationTree .ztree li span.button.switch {
+      opacity: 0.85;
+    }
+    #layerRelationTree .ztree li.level0 > a {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .layer-relation-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    .layer-relation-actions button { margin-top: 0; margin-right: 0.35rem; }
+    .writable-changes-panel { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+    .writable-changes-panel > div { flex: 1; min-width: 260px; }
+    .writable-change-row { cursor: pointer; }
+    .writable-change-row.active { background: rgba(61, 139, 253, 0.22); }
+    .writable-change-kind {
+      font-size: 0.68rem;
+      font-weight: 700;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      background: #334155;
+      flex-shrink: 0;
+    }
+    .writable-change-kind.kind-modified { background: #854d0e; color: #fef3c7; }
+    .writable-change-kind.kind-added { background: #14532d; color: #bbf7d0; }
+    .writable-change-kind.kind-removed { background: #7f1d1d; color: #fecaca; }
+    #writableChangesList { max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 0.35rem; background: rgba(0, 0, 0, 0.05); }
+    #layerParentDiff {
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.35rem;
+      background: rgba(0, 0, 0, 0.05);
+      margin-top: 0;
+      font-size: 0.78rem;
+    }
+    .layer-parent-diff-file-row {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.18rem 0.25rem;
+      border-radius: 6px;
+      user-select: text;
+    }
+    #writableChangesDiff { max-height: 380px; font-family: ui-monospace, monospace; font-size: 0.72rem; white-space: pre; overflow-x: auto; }
     button.tree-layer-commit {
       margin-left: 0.45rem;
       padding: 0.12rem 0.45rem;
@@ -278,7 +367,7 @@
     </section>
     <section>
       <h2>推送配置</h2>
-      <p class="meta">写入 <code>onlineService/runtime/service_config.yaml</code></p>
+      <p class="meta">写入 <code>onlineProject_state/runtime/service_config.yaml</code>（仓库根下，与 <code>onlineService</code> 并列）</p>
       <label for="cfgYaml">YAML 内容</label>
       <textarea id="cfgYaml" placeholder="粘贴 service 配置…"></textarea>
       <button type="button" id="btnPushCfg">上传配置</button>
@@ -318,58 +407,56 @@
     <section id="newTaskSection">
       <h2>新建任务</h2>
       <p id="taskGateMsg" class="err-msg" style="display: none; margin: 0 0 0.5rem"></p>
-      <div class="row">
-        <div>
-          <label for="cmd">指令（trae-cli run）</label>
-          <input type="text" id="cmd" placeholder="例如：列出当前目录" />
-        </div>
-        <div>
-          <label for="parentId">父任务 ID（可选，叠加可写层）</label>
-          <select id="parentId" title="基于当前任务列表；选「根层」则从新建层开始">
-            <option value="">（无）根层 · 新建可写层</option>
-          </select>
-        </div>
-      </div>
-      <div style="margin-top: 0.75rem;">
-        <label for="bashCmd">Shell 指令（bash -lc）</label>
-        <p class="meta" style="margin: 0.25rem 0 0.35rem;">
-          与上一行<strong>二选一</strong>：在此填写任意 shell 时，将锁定「trae-cli run」输入框；清空此处后可再填 trae 指令。本任务在仓库工作区内执行，不经 <code>trae-cli run</code>。
-        </p>
-        <textarea id="bashCmd" rows="3" placeholder="例如：ls -la&#10;pytest -q"></textarea>
-      </div>
-      <div class="row" style="margin-top: 0.75rem;">
-        <div id="jobRepoLayerWrap">
-          <label for="jobRepoLayer">工作区来源层（无父任务时从该层复制，含已克隆仓库）</label>
-          <select id="jobRepoLayer" title="选克隆完成的层，或留空表示空目录新层">
-            <option value="">（无）空目录 · 新根层</option>
-          </select>
-        </div>
-        <div>
-          <label for="jobGitBranch">检出分支（可选）</label>
-          <select id="jobGitBranch" title="来自当前选定层的 git 分支列表">
-            <option value="">（不切换分支）</option>
-          </select>
-        </div>
-      </div>
-      <div style="margin: 0.85rem 0 0.5rem;">
-        <label>可写层关联（树形）</label>
-        <p class="meta" style="margin: 0.25rem 0 0.35rem;">由工作区 <code>.git</code> 符号链接或任务记录推断父层；点击行可选中下方「选择层」、刷新文件树，并显示<strong>与父层工作区目录的差异</strong>（<code>diff -ruN -x .git</code>）。每行「提交」会按<strong>关联任务指令</strong>与<strong>暂存区变更</strong>自动生成说明并执行 <code>git add -A</code> / <code>git commit</code>。若当前分支<strong>领先上游</strong>且有待推送的提交，会显示「推送」。</p>
-        <div id="layerRelationTree" class="tree layer-relation-tree"></div>
+      <div style="margin: 0 0 0.65rem;">
+        <label>任务关联（zTree 树形图）</label>
+        <p class="meta" style="margin: 0.25rem 0 0.35rem;"><strong>可写层</strong>按 <code>parent_layer_id</code> 嵌套；每层下为该层上的<strong>任务</strong>（按创建时间正序排列）。点击<strong>层</strong>或<strong>任务</strong>会同步「选择层」、刷新文件树，并加载相对父层的<strong>变动路径列表</strong>（<code>diff -rq</code>，排除 <code>.git</code>）。逐文件 diff 见下方「可写层变动浏览」。操作栏在选中层时默认以该层上最新任务为上下文（排队 / 叠建子层等）。尚无任务时也可展开层树并<code>选择层</code>后新建任务；全局已有任务时，点选<strong>任务</strong>节点后再叠建。</p>
+        <div id="layerRelationTree" class="layer-relation-tree"></div>
+        <div id="layerRelationActions" class="layer-relation-actions"></div>
         <p class="meta" id="layerRelationMeta" style="margin-top:0.35rem;"></p>
         <div id="layerParentDiffWrap" style="margin-top: 0.65rem;">
-          <label class="meta" for="layerParentDiff" style="display:block;margin-bottom:0.3rem;">与上层可写层的差异</label>
-          <pre id="layerParentDiff" class="out" style="max-height: 280px; margin-top: 0;">（点击上方树中的某一层以加载）</pre>
+          <span class="meta" style="display:block;margin-bottom:0.3rem;">与上层可写层的差异（文件列表）</span>
+          <div id="layerParentDiff">（点击上方树中的可写层或任务节点以加载）</div>
           <p class="meta" id="layerParentDiffMeta" style="margin-top:0.35rem;"></p>
         </div>
       </div>
-      <p class="meta" style="margin: 0.35rem 0 0">有父任务时，分支列表来自父任务所在层；无父任务时来自上面「工作区来源层」。</p>
-      <button type="button" id="btnRun">提交执行</button>
-      <div class="err-msg" id="jobErr"></div>
+      <p id="newTaskFormHint" class="meta" style="margin: 0.65rem 0 0.35rem;">
+        新建、排队或叠建任务请在上方的 zTree 中点选<strong>可写层</strong>或<strong>任务</strong>节点，使用节点下方操作栏内的指令框与类型选择（与下方「选择层」联动）。
+      </p>
     </section>
     <section>
       <h2>任务列表</h2>
       <button type="button" class="secondary" id="btnRefresh">刷新</button>
       <div id="jobs"></div>
+    </section>
+    <section id="writableChangesSection">
+      <h2>可写层变动浏览</h2>
+      <p class="meta" style="margin: 0 0 0.65rem;">
+        对比<strong>当前任务所在层</strong>与其<strong>解析后的父可写层</strong>（与上方「与上层可写层的差异」相同基准：<code>diff -rq</code> / <code>diff -uN</code>，排除 <code>.git</code>）。用于查看某次命令叠加的层相对父层改动了哪些路径，并逐文件查看 diff。
+      </p>
+      <div class="row">
+        <div>
+          <label for="writableChangesLayer">关联任务层（layer_id）</label>
+          <select id="writableChangesLayer" title="默认取最近任务；可在任务卡片上点「本层变动」跳转">
+            <option value="">（无任务）</option>
+          </select>
+          <p class="meta" id="writableChangesCmdMeta" style="margin: 0.35rem 0 0;"></p>
+        </div>
+      </div>
+      <div style="margin-top: 0.65rem;">
+        <button type="button" id="btnRefreshWritableChanges">刷新变动列表</button>
+      </div>
+      <div class="err-msg" id="writableChangesErr"></div>
+      <div class="writable-changes-panel" style="margin-top: 0.75rem;">
+        <div>
+          <label class="meta" for="writableChangesList" style="display: block; margin-bottom: 0.35rem;">变动路径</label>
+          <div id="writableChangesList"></div>
+        </div>
+        <div>
+          <label class="meta" for="writableChangesDiff" style="display: block; margin-bottom: 0.35rem;">选中路径的 diff</label>
+          <pre id="writableChangesDiff" class="out" style="max-height: 380px; margin-top: 0;">（选择左侧路径）</pre>
+        </div>
+      </div>
+      <p class="meta" id="writableChangesMeta" style="margin-top: 0.5rem;"></p>
     </section>
     <section>
       <h2>可写层文件浏览</h2>
@@ -429,19 +516,99 @@
   <script>
     const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
     const CLONE_PERSIST_KEY = 'trae_online_clone_ui_v1';
+    /** 最近一次 GET /api/layers 返回的 layers_root，用于空列表时提示路径不一致 */
+    let lastLayersRootFromApi = '';
+    /** 容器启动 bootstrap 克隆所用层（若有），任务树根顺序与默认选中优先该层 */
+    let lastBootstrapLayerId = '';
+    function cacheLayersApiMeta(j) {
+      try {
+        lastLayersRootFromApi = j && j.layers_root ? String(j.layers_root) : '';
+        lastBootstrapLayerId =
+          j && j.bootstrap_layer_id ? String(j.bootstrap_layer_id) : '';
+      } catch (_) {
+        lastLayersRootFromApi = '';
+        lastBootstrapLayerId = '';
+      }
+    }
+
+    /** 将 ISO created_at 解析为毫秒；无效为 0。后端为秒精度，同秒多条需配合 API 顺序作次要排序。 */
+    function createdAtMs(iso) {
+      const m = Date.parse(iso || '');
+      return Number.isFinite(m) ? m : 0;
+    }
+
+    /** 可写层顶层排序：bootstrap 克隆层优先，其余按创建时间新→旧（用于 pickFirstCloneRootLayerId 等） */
+    function sortMindRoots(roots) {
+      const bs =
+        lastBootstrapLayerId &&
+        roots.some((r) => r.layer_id === lastBootstrapLayerId)
+          ? lastBootstrapLayerId
+          : '';
+      roots.sort((a, b) => {
+        const sa = bs && a.layer_id === bs ? 1 : 0;
+        const sb = bs && b.layer_id === bs ? 1 : 0;
+        if (sa !== sb) return sb - sa;
+        return (b.created_at || '').localeCompare(a.created_at || '');
+      });
+    }
+
+    /** zTree 同父下的可写层兄弟：bootstrap 优先，其余按 created_at 旧→新（正序）。 */
+    function sortZTreeLayerSiblings(siblings) {
+      const bs =
+        lastBootstrapLayerId &&
+        siblings.some((r) => r.layer_id === lastBootstrapLayerId)
+          ? lastBootstrapLayerId
+          : '';
+      siblings.sort((a, b) => {
+        const sa = bs && a.layer_id === bs ? 1 : 0;
+        const sb = bs && b.layer_id === bs ? 1 : 0;
+        if (sa !== sb) return sb - sa;
+        const da = createdAtMs(a.created_at);
+        const db = createdAtMs(b.created_at);
+        if (da !== db) return da - db;
+        return String(a.layer_id || '').localeCompare(String(b.layer_id || ''));
+      });
+    }
+
+    /** 同一 layer_id 在 API 中若重复出现，只保留一条合并后的记录，避免 zTree 出现相同 id 的多个层节点。 */
+    function dedupeLayersById(layers) {
+      const by = new Map();
+      for (const l of layers || []) {
+        const id = l && l.layer_id;
+        if (!id) continue;
+        if (!by.has(id)) {
+          by.set(id, Object.assign({}, l));
+        } else {
+          const cur = by.get(id);
+          for (const k of Object.keys(l)) {
+            const v = l[k];
+            if (v !== undefined && v !== null && v !== '') cur[k] = v;
+          }
+        }
+      }
+      return Array.from(by.values());
+    }
+
     let lastJobs = [];
     function isJobStatusActive(status) {
       return status === 'pending' || status === 'running';
     }
-    /** 某 layer_id 上是否有排队/执行中的任务（与新建任务时「工作区来源层」门禁一致）。 */
+    /** 某 layer_id 上是否有排队/执行中的任务（与新建任务时在来源层上叠层的门禁一致）。 */
     function layerIdHasActiveJob(layerId) {
       if (!layerId) return false;
       return lastJobs.some((j) => j.layer_id === layerId && isJobStatusActive(j.status));
     }
-    /** 丢弃过期的 refreshJobBranches 异步结果，避免并行 loadJobs/loadLayers 等把分支选项追加两遍。 */
-    let _jobBranchRefreshSeq = 0;
-    /** 用户是否明确选了「不基于已有层」；为 false 时自动选时间最新的非繁忙层（见 fillJobRepoLayerSelect）。 */
-    let jobRepoLayerUserChoseEmpty = false;
+
+    function normalizeLayerMindApiFields(layers) {
+      if (!layers || !layers.length) return;
+      for (let i = 0; i < layers.length; i++) {
+        const l = layers[i];
+        if (!l.mind_state) {
+          l.mind_state = layerIdHasActiveJob(l.layer_id) ? 'running' : 'idle_done';
+        }
+        if (typeof l.queue_depth !== 'number') l.queue_depth = 0;
+      }
+    }
     const MAX_CLONE_LOG_CHARS = 480000;
     let lastCloneForm = { url: '', branch: '', depth: '' };
     let currentStreamingLayerId = null;
@@ -600,6 +767,62 @@
       });
     };
 
+    /** 按钮防连点：两次有效点击至少间隔 ms（前缘限流，与异步中的 busy 门闩配合）。 */
+    const BTN_DEBOUNCE_MS = 300;
+    function debounceClick(fn, ms) {
+      let lastFire = 0;
+      return function (...args) {
+        const now = Date.now();
+        if (lastFire && now - lastFire < ms) return;
+        lastFire = now;
+        return fn.apply(this, args);
+      };
+    }
+
+    /**
+     * 异步操作期间：disabled + aria-busy + 可选文案；dataset.btnBusy 防止重入。
+     * onReleased：恢复禁用态时调用（例如 applyTaskGate），不传则 btn.disabled = false。
+     */
+    async function runAsyncButton(btn, work, opts) {
+      if (!btn || btn.dataset.btnBusy === '1') return;
+      const o = opts || {};
+      const busyText = o.busyText != null ? o.busyText : '处理中…';
+      const skipLabel = !!o.skipLabelChange;
+      const prevLabel = btn.textContent;
+      btn.dataset.btnBusy = '1';
+      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
+      if (!skipLabel && busyText) btn.textContent = busyText;
+      try {
+        await work();
+      } finally {
+        if (!skipLabel) btn.textContent = prevLabel;
+        btn.removeAttribute('aria-busy');
+        delete btn.dataset.btnBusy;
+        if (typeof o.onReleased === 'function') o.onReleased(btn);
+        else btn.disabled = false;
+      }
+    }
+
+    /** 将仓库根下 onlineProject 指向该可写层 tip（与层关系树选中节点一致）。 */
+    async function setProjectView(layerId) {
+      const lid = (layerId || '').trim();
+      if (!lid) return;
+      try {
+        const r = await api('/api/project/view', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ layer_id: lid }),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          console.warn('setProjectView failed', t);
+        }
+      } catch (e) {
+        console.warn('setProjectView', e);
+      }
+    }
+
     async function applyTaskGate() {
       const r = await api('/api/requirements/task-gate');
       let ok = false;
@@ -608,21 +831,6 @@
           const j = await r.json();
           ok = !!j.clone_done;
         } catch (_) {}
-      }
-      const gateIds = ['parentId', 'jobRepoLayer', 'jobGitBranch', 'btnRun'];
-      for (const id of gateIds) {
-        const el = document.getElementById(id);
-        if (el) el.disabled = !ok;
-      }
-      const cmdEl = document.getElementById('cmd');
-      const bashEl = document.getElementById('bashCmd');
-      if (!ok) {
-        if (cmdEl) cmdEl.disabled = true;
-        if (bashEl) bashEl.disabled = true;
-      } else {
-        if (cmdEl) cmdEl.disabled = false;
-        if (bashEl) bashEl.disabled = false;
-        syncTaskCommandFields();
       }
       const msg = document.getElementById('taskGateMsg');
       if (msg) {
@@ -637,21 +845,6 @@
       }
       const sec = document.getElementById('newTaskSection');
       if (sec) sec.classList.toggle('task-gate-locked', !ok);
-    }
-
-    /** trae-cli 自然语言指令 与 Shell 指令互斥：其一有内容则禁用另一方。 */
-    function syncTaskCommandFields() {
-      const cmdEl = document.getElementById('cmd');
-      const bashEl = document.getElementById('bashCmd');
-      if (!cmdEl || !bashEl) return;
-      const gateLocked =
-        document.getElementById('newTaskSection') &&
-        document.getElementById('newTaskSection').classList.contains('task-gate-locked');
-      if (gateLocked) return;
-      const hasTrae = cmdEl.value.trim().length > 0;
-      const hasBash = bashEl.value.trim().length > 0;
-      bashEl.disabled = hasTrae;
-      cmdEl.disabled = hasBash;
     }
 
     const logEl = document.getElementById('sseLog');
@@ -1074,6 +1267,7 @@
               if (sel && o.layer_id) sel.value = o.layer_id;
               updateLayerCommandMeta();
               reloadLayerTree();
+              void setProjectView(o.layer_id);
             });
           } else if (o.status === 'error') {
             const errEl = document.getElementById('cloneErr');
@@ -1097,7 +1291,6 @@
           currentStreamingLayerId = null;
           if (o.title) sseAppend('jobs_reset · ' + o.title);
           resetCloneSectionUi();
-          jobRepoLayerUserChoseEmpty = false;
           void loadJobs();
           void loadLayers();
           void reloadLayerTree();
@@ -1107,9 +1300,10 @@
           o.type === 'job_created' ||
           o.type === 'job_redone' ||
           o.type === 'job_continued' ||
-          o.type === 'job_deleted'
+          o.type === 'job_deleted' ||
+          o.type === 'layer_deleted'
         ) {
-          if (o.type === 'job_deleted') {
+          if (o.type === 'job_deleted' || o.type === 'layer_deleted') {
             markSseFullList({ refreshLayers: true });
           } else {
             markSseFullList({});
@@ -1141,32 +1335,48 @@
       es.onerror = () => sseAppend('[SSE error / reconnecting]');
     }
 
-    document.getElementById('btnPushCfg').onclick = async () => {
-      document.getElementById('cfgErr').textContent = '';
-      const yaml = document.getElementById('cfgYaml').value;
-      const fd = new FormData();
-      fd.append('file', new Blob([yaml], { type: 'text/yaml' }), 'service_config.yaml');
-      const u = new URL('/api/config', location.origin);
-      u.searchParams.set('access_token', ACCESS_TOKEN);
-      const r = await fetch(u, { method: 'POST', body: fd, headers: { 'X-Access-Token': ACCESS_TOKEN } });
-      if (!r.ok) {
-        document.getElementById('cfgErr').textContent = await r.text();
-        return;
-      }
-      alert('配置已保存');
-    };
-    document.getElementById('btnPullCfg').onclick = async () => {
-      document.getElementById('cfgErr').textContent = '';
-      const r = await api('/api/config');
-      if (!r.ok) {
-        document.getElementById('cfgErr').textContent = await r.text();
-        return;
-      }
-      const j = await r.json();
-      document.getElementById('cfgYaml').value = j.yaml || '';
-    };
+    document.getElementById('btnPushCfg').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnPushCfg');
+      void runAsyncButton(
+        btn,
+        async () => {
+          document.getElementById('cfgErr').textContent = '';
+          const yaml = document.getElementById('cfgYaml').value;
+          const fd = new FormData();
+          fd.append('file', new Blob([yaml], { type: 'text/yaml' }), 'service_config.yaml');
+          const u = new URL('/api/config', location.origin);
+          u.searchParams.set('access_token', ACCESS_TOKEN);
+          const r = await fetch(u, { method: 'POST', body: fd, headers: { 'X-Access-Token': ACCESS_TOKEN } });
+          if (!r.ok) {
+            document.getElementById('cfgErr').textContent = await r.text();
+            return;
+          }
+          alert('配置已保存');
+        },
+        { busyText: '上传中…' },
+      );
+    }, BTN_DEBOUNCE_MS);
 
-    document.getElementById('btnClone').onclick = async () => {
+    document.getElementById('btnPullCfg').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnPullCfg');
+      void runAsyncButton(
+        btn,
+        async () => {
+          document.getElementById('cfgErr').textContent = '';
+          const r = await api('/api/config');
+          if (!r.ok) {
+            document.getElementById('cfgErr').textContent = await r.text();
+            return;
+          }
+          const j = await r.json();
+          document.getElementById('cfgYaml').value = j.yaml || '';
+        },
+        { busyText: '拉取中…' },
+      );
+    }, BTN_DEBOUNCE_MS);
+
+    document.getElementById('btnClone').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnClone');
       const errEl = document.getElementById('cloneErr');
       const outEl = document.getElementById('cloneOut');
       errEl.textContent = '';
@@ -1186,72 +1396,73 @@
         }
         body.depth = d;
       }
-      const btn = document.getElementById('btnClone');
-      btn.disabled = true;
-      try {
-        const r = await api('/api/repos/clone', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        const text = await r.text();
-        let j = null;
-        try {
-          j = JSON.parse(text);
-        } catch (_) {
-          j = null;
-        }
-        if (!r.ok) {
-          if (j && j.detail) {
-            if (typeof j.detail === 'object' && j.detail.output != null) {
-              errEl.textContent =
-                (j.detail.message || '克隆失败') + ' (exit ' + (j.detail.exit_code ?? '?') + ')';
-              if (!outEl.textContent.trim()) {
-                outEl.textContent = j.detail.output || '';
-              }
-              snapshotClonePersist('error', {
-                layer_id: j.detail.layer_id,
-                errorMsg: errEl.textContent,
-              });
-            } else {
-              errEl.textContent = typeof j.detail === 'string' ? j.detail : text;
-            }
-          } else {
-            errEl.textContent = text || r.statusText;
-          }
-          return;
-        }
-        errEl.textContent = '';
-        currentStreamingLayerId = null;
-        if (j && j.layer_id && !document.getElementById('cloneOut').textContent.trim()) {
-          outEl.textContent = normalizeCloneLogText((j && j.output) || '');
-        }
-        // 无论轮询区块当前是否已有内容，都用接口返回的完整输出做一次最终覆盖，避免竞态丢尾巴。
-        if (j && j.output != null) {
-          outEl.textContent = normalizeCloneLogText(j.output);
-          outEl.scrollTop = outEl.scrollHeight;
-        }
-        if (j && j.layer_id) {
-          snapshotClonePersist('ok', {
-            layer_id: j.layer_id,
-            layer_path: j.layer_path,
+      void runAsyncButton(
+        btn,
+        async () => {
+          const r = await api('/api/repos/clone', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
           });
-          await loadLayers(j.layer_id);
-          const sel = document.getElementById('layerSelect');
-          if (sel && j.layer_id) sel.value = j.layer_id;
-          updateLayerCommandMeta();
-          reloadLayerTree();
-        }
-      } finally {
-        btn.disabled = false;
-      }
-    };
+          const text = await r.text();
+          let j = null;
+          try {
+            j = JSON.parse(text);
+          } catch (_) {
+            j = null;
+          }
+          if (!r.ok) {
+            if (j && j.detail) {
+              if (typeof j.detail === 'object' && j.detail.output != null) {
+                errEl.textContent =
+                  (j.detail.message || '克隆失败') + ' (exit ' + (j.detail.exit_code ?? '?') + ')';
+                if (!outEl.textContent.trim()) {
+                  outEl.textContent = j.detail.output || '';
+                }
+                snapshotClonePersist('error', {
+                  layer_id: j.detail.layer_id,
+                  errorMsg: errEl.textContent,
+                });
+              } else {
+                errEl.textContent = typeof j.detail === 'string' ? j.detail : text;
+              }
+            } else {
+              errEl.textContent = text || r.statusText;
+            }
+            return;
+          }
+          errEl.textContent = '';
+          currentStreamingLayerId = null;
+          if (j && j.layer_id && !document.getElementById('cloneOut').textContent.trim()) {
+            outEl.textContent = normalizeCloneLogText((j && j.output) || '');
+          }
+          if (j && j.output != null) {
+            outEl.textContent = normalizeCloneLogText(j.output);
+            outEl.scrollTop = outEl.scrollHeight;
+          }
+          if (j && j.layer_id) {
+            snapshotClonePersist('ok', {
+              layer_id: j.layer_id,
+              layer_path: j.layer_path,
+            });
+            await loadLayers(j.layer_id);
+            const sel = document.getElementById('layerSelect');
+            if (sel && j.layer_id) sel.value = j.layer_id;
+            updateLayerCommandMeta();
+            await reloadLayerTree();
+          }
+        },
+        { busyText: '克隆请求中…' },
+      );
+    }, BTN_DEBOUNCE_MS);
 
-    document.getElementById('btnCopyCloneLog').onclick = async () => {
+    document.getElementById('btnCopyCloneLog').onclick = debounceClick(async () => {
       const outEl = document.getElementById('cloneOut');
       const text = outEl ? outEl.textContent : '';
       const copyBtn = document.getElementById('btnCopyCloneLog');
       const label = copyBtn.textContent;
+      copyBtn.disabled = true;
+      copyBtn.setAttribute('aria-busy', 'true');
       try {
         await navigator.clipboard.writeText(text);
         copyBtn.textContent = '已复制';
@@ -1260,173 +1471,55 @@
         }, 1600);
       } catch (e) {
         alert('复制失败：' + (e && e.message ? e.message : String(e)));
+      } finally {
+        copyBtn.disabled = false;
+        copyBtn.removeAttribute('aria-busy');
       }
-    };
+    }, BTN_DEBOUNCE_MS);
 
-    function fillParentJobSelect(jobs) {
-      const sel = document.getElementById('parentId');
-      const prev = sel.value;
-      sel.replaceChildren();
-      const root = document.createElement('option');
-      root.value = '';
-      root.textContent = '（无）根层 · 新建可写层';
-      sel.appendChild(root);
-      for (const j of jobs) {
-        const o = document.createElement('option');
-        o.value = j.id;
-        const cmd = j.command || '';
-        const short = cmd.length > 42 ? cmd.slice(0, 42) + '…' : cmd;
-        const busy = isJobStatusActive(j.status);
-        o.textContent =
-          `${short || j.id} · 层 ${j.layer_id}` +
-          (busy ? ' · （执行中）' : '');
-        if (busy) {
-          o.disabled = true;
-          o.title =
-            '该任务所在层仍有指令在排队或执行中；请待当前层指令结束后再从此层叠建新层';
-        }
-        sel.appendChild(o);
-      }
-      const prevOpt = prev ? [...sel.options].find((opt) => opt.value === prev) : null;
-      if (prevOpt && !prevOpt.disabled) sel.value = prev;
-      else if (prevOpt && prevOpt.disabled) sel.value = '';
-    }
-
-    function updateJobRepoLayerVisibility() {
-      const wrap = document.getElementById('jobRepoLayerWrap');
-      const sel = document.getElementById('jobRepoLayer');
-      const hasParent = !!document.getElementById('parentId').value.trim();
-      if (wrap) wrap.style.display = hasParent ? 'none' : 'block';
-      if (sel) sel.disabled = hasParent;
-    }
-
-    /** 与后端 list_layers 一致：优先 ISO created_at；否则从 layer_id 前缀 YYYYMMDD_HHMMSS 推导可比较键。 */
-    function layerRepoSourceSortKey(l) {
-      if (l && l.created_at) return l.created_at;
-      const m = String((l && l.layer_id) || '').match(/^(\d{8})_(\d{6})_/);
-      if (!m) return '';
-      const d = m[1];
-      const t = m[2];
-      return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}T${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`;
-    }
-
-    /** 在可选（非执行中）层中选时间戳最大的一层，避免刷新后仍停留在旧层。 */
-    function pickLatestNonBusyRepoLayerId(layers) {
-      let best = null;
-      let bestKey = '';
-      for (const x of layers) {
-        if (layerIdHasActiveJob(x.layer_id)) continue;
-        const k = layerRepoSourceSortKey(x);
-        if (!best || k > bestKey) {
-          best = x;
-          bestKey = k;
-        } else if (best && k === bestKey && String(x.layer_id) > String(best.layer_id)) {
-          best = x;
-        }
-      }
-      return best ? best.layer_id : '';
-    }
-
-    async function fillJobRepoLayerSelect(preferredLayerId) {
-      const sel = document.getElementById('jobRepoLayer');
-      if (!sel) return;
+    /** 任务列表变更后刷新任务树（与 GET /api/layers 同步，不改动「选择层」下拉）。 */
+    async function refreshMindGraphFromApi() {
       const r = await api('/api/layers');
-      sel.replaceChildren();
-      const empty = document.createElement('option');
-      empty.value = '';
-      empty.textContent = '（空目录）不基于已有层';
-      sel.appendChild(empty);
       if (!r.ok) return;
       const j = await r.json();
-      const layers = j.layers || [];
-      for (const l of layers) {
-        const opt = document.createElement('option');
-        opt.value = l.layer_id;
-        const created = l.created_at ? `${l.created_at}` : '';
-        const cmd = l.command ? ` · ${l.command}` : '';
-        let txt = created ? `${l.layer_id} · ${created}${cmd}` : `${l.layer_id}${cmd}`;
-        const busy = layerIdHasActiveJob(l.layer_id);
-        if (busy) {
-          txt += ' · （执行中）';
-          opt.disabled = true;
-          opt.title =
-            '该层仍有指令在排队或执行中；请待当前层结束后再从此层叠建新指令层';
-        }
-        opt.textContent = txt.length > 120 ? txt.slice(0, 120) + '…' : txt;
-        sel.appendChild(opt);
-      }
-      let pick = '';
-      if (
-        preferredLayerId &&
-        layers.some((x) => x.layer_id === preferredLayerId) &&
-        !layerIdHasActiveJob(preferredLayerId)
-      ) {
-        pick = preferredLayerId;
-        jobRepoLayerUserChoseEmpty = false;
-      } else if (jobRepoLayerUserChoseEmpty) {
-        pick = '';
-      } else if (layers.length > 0) {
-        pick = pickLatestNonBusyRepoLayerId(layers);
-      }
-      if (pick) sel.value = pick;
-      else sel.value = '';
-      updateJobRepoLayerVisibility();
-      renderLayerRelationTree(layers);
+      cacheLayersApiMeta(j);
+      renderLayerRelationTree(j.layers || []);
     }
 
-    async function refreshJobBranches() {
-      const seq = ++_jobBranchRefreshSeq;
-      const branchSel = document.getElementById('jobGitBranch');
-      if (!branchSel) return;
-      const prev = branchSel.value;
-      branchSel.replaceChildren();
-      const def = document.createElement('option');
-      def.value = '';
-      def.textContent = '（不切换分支）';
-      branchSel.appendChild(def);
-
-      const parentId = document.getElementById('parentId').value.trim();
-      let layerId = '';
-      if (parentId) {
-        const pj = lastJobs.find((x) => x.id === parentId);
-        layerId = pj ? pj.layer_id : '';
-      } else {
-        const rs = document.getElementById('jobRepoLayer');
-        layerId = (rs && rs.value) ? rs.value.trim() : '';
-      }
-      if (!layerId) return;
-
-      const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/git/branches');
-      if (seq !== _jobBranchRefreshSeq) return;
-      if (!r.ok) return;
-      const data = await r.json();
-      if (seq !== _jobBranchRefreshSeq) return;
-      if (!data.is_git) return;
-      const branches = data.branches || [];
-      for (const b of branches) {
-        const o = document.createElement('option');
-        o.value = b;
-        o.textContent = data.current === b ? b + '（当前）' : b;
-        branchSel.appendChild(o);
-      }
-      if (prev && [...branchSel.options].some((opt) => opt.value === prev)) {
-        branchSel.value = prev;
-      }
+    /** 与任务树根下「克隆/顶层」子节点一致：bootstrap 层优先，否则按创建时间取最新。 */
+    function pickFirstCloneRootLayerId(layers) {
+      if (!layers || !layers.length) return '';
+      const byId = new Map(layers.map((l) => [l.layer_id, l]));
+      const roots = layers.filter((l) => {
+        const p = l.parent_layer_id;
+        return !p || !byId.has(p);
+      });
+      sortMindRoots(roots);
+      return roots.length ? roots[0].layer_id : layers[0].layer_id;
     }
 
     function jobCardMarkup(j) {
       const gitLock = j.git_destructive_locked === true;
       const lockTitle = '该可写层在任务开始后已有 git 提交（HEAD 已变化），不可中断、重新执行或删除';
-      const disRedo = gitLock ? 'disabled title="' + lockTitle + '"' : '';
+      const cloneTask = j.command_kind === 'clone';
+      const redoLockTitle = cloneTask
+        ? '克隆层任务不支持重新执行，请使用「克隆仓库」'
+        : lockTitle;
+      const disRedo = gitLock || cloneTask ? 'disabled title="' + redoLockTitle + '"' : '';
       const disDel = gitLock ? 'disabled title="' + lockTitle + '"' : '';
       const disInt =
-        j.status !== 'running' || gitLock
-          ? 'disabled' + (gitLock ? ' title="' + lockTitle + '"' : '')
+        j.status !== 'running'
+          ? 'disabled'
           : '';
       const lockNote = gitLock
-        ? '<div class="meta" style="color:var(--warn);margin-top:0.35rem;">已检测到 git 提交，已禁止中断、重新执行与删除。</div>'
+        ? '<div class="meta" style="color:var(--warn);margin-top:0.35rem;">已检测到任务开始后 git HEAD 变化：已禁止重新执行与删除；运行中任务仍可中断。</div>'
         : '';
-      const shellTag = j.command_kind === 'shell' ? '<span class="meta">[shell]</span> ' : '';
+      const shellTag =
+        j.command_kind === 'shell'
+          ? '<span class="meta">[shell]</span> '
+          : j.command_kind === 'clone'
+            ? '<span class="meta">[clone]</span> '
+            : '';
       return `
         <div class="job-card" data-id="${j.id}">
           <div class="meta">层: ${j.layer_id} · ${j.created_at}</div>
@@ -1436,10 +1529,13 @@
           ${lockNote}
           <div class="job-log-actions">
             <button type="button" class="secondary copy-job-log" data-copy-log="${j.id}">复制日志</button>
+            <button type="button" class="secondary" data-show-changes="${j.layer_id}">本层变动</button>
             <button type="button" data-redo="${j.id}" ${disRedo}>重新执行</button>
             <button type="button" class="danger" data-delete="${j.id}" ${disDel}>删除</button>
             ${
-              j.status === 'interrupted' && j.command_kind !== 'shell'
+              j.status === 'interrupted' &&
+              j.command_kind !== 'shell' &&
+              j.command_kind !== 'clone'
                 ? '<button type="button" data-continue="' + j.id + '">继续</button>'
                 : ''
             }
@@ -1457,18 +1553,26 @@
 
     function wireJobCardButtons(container) {
       container.querySelectorAll('[data-interrupt]').forEach((btn) => {
-        btn.onclick = async () => {
-          const id = btn.getAttribute('data-interrupt');
-          await api('/api/jobs/' + id + '/interrupt', { method: 'POST' });
-          loadJobs();
-        };
+        btn.onclick = debounceClick(() => {
+          void runAsyncButton(
+            btn,
+            async () => {
+              const id = btn.getAttribute('data-interrupt');
+              await api('/api/jobs/' + id + '/interrupt', { method: 'POST' });
+              await loadJobs();
+            },
+            { busyText: '中断中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
       });
       container.querySelectorAll('.copy-job-log').forEach((btn) => {
-        btn.onclick = async () => {
+        btn.onclick = debounceClick(async () => {
           const id = btn.getAttribute('data-copy-log');
           const job = lastJobs.find((x) => x.id === id);
           const text = job != null && job.output != null ? String(job.output) : '';
           const label = btn.textContent;
+          btn.disabled = true;
+          btn.setAttribute('aria-busy', 'true');
           try {
             await navigator.clipboard.writeText(text);
             btn.textContent = '已复制';
@@ -1477,96 +1581,280 @@
             }, 1600);
           } catch (e) {
             alert('复制失败：' + (e && e.message ? e.message : String(e)));
+          } finally {
+            btn.disabled = false;
+            btn.removeAttribute('aria-busy');
           }
-        };
+        }, BTN_DEBOUNCE_MS);
       });
       container.querySelectorAll('[data-redo]').forEach((btn) => {
-        btn.onclick = async () => {
-          const id = btn.getAttribute('data-redo');
-          const label = btn.textContent;
-          btn.disabled = true;
-          try {
-            const r = await api('/api/jobs/' + encodeURIComponent(id) + '/redo', {
-              method: 'POST',
-            });
-            if (!r.ok) {
-              const t = await r.text();
-              let msg = t;
-              try {
-                const j = JSON.parse(t);
-                if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
-              } catch (_) {}
-              alert('重新执行失败：' + msg);
-              return;
-            }
-            await loadJobs();
-          } catch (e) {
-            alert('重新执行失败：' + (e && e.message ? e.message : String(e)));
-          } finally {
-            btn.disabled = false;
-            btn.textContent = label;
-          }
-        };
+        btn.onclick = debounceClick(() => {
+          void runAsyncButton(
+            btn,
+            async () => {
+              const id = btn.getAttribute('data-redo');
+              const r = await api('/api/jobs/' + encodeURIComponent(id) + '/redo', {
+                method: 'POST',
+              });
+              if (!r.ok) {
+                const t = await r.text();
+                let msg = t;
+                try {
+                  const j = JSON.parse(t);
+                  if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                } catch (_) {}
+                alert('重新执行失败：' + msg);
+                return;
+              }
+              await loadJobs();
+            },
+            { busyText: '提交中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
       });
       container.querySelectorAll('[data-continue]').forEach((btn) => {
-        btn.onclick = async () => {
-          const id = btn.getAttribute('data-continue');
-          const label = btn.textContent;
-          btn.disabled = true;
-          try {
-            const r = await api('/api/jobs/' + encodeURIComponent(id) + '/continue', {
-              method: 'POST',
-            });
-            if (!r.ok) {
-              const t = await r.text();
-              let msg = t;
-              try {
-                const j = JSON.parse(t);
-                if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
-              } catch (_) {}
-              alert('继续执行失败：' + msg);
-              return;
-            }
-            await loadJobs();
-          } catch (e) {
-            alert('继续执行失败：' + (e && e.message ? e.message : String(e)));
-          } finally {
-            btn.disabled = false;
-            btn.textContent = label;
-          }
-        };
+        btn.onclick = debounceClick(() => {
+          void runAsyncButton(
+            btn,
+            async () => {
+              const id = btn.getAttribute('data-continue');
+              const r = await api('/api/jobs/' + encodeURIComponent(id) + '/continue', {
+                method: 'POST',
+              });
+              if (!r.ok) {
+                const t = await r.text();
+                let msg = t;
+                try {
+                  const j = JSON.parse(t);
+                  if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                } catch (_) {}
+                alert('继续执行失败：' + msg);
+                return;
+              }
+              await loadJobs();
+            },
+            { busyText: '继续中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
       });
       container.querySelectorAll('[data-delete]').forEach((btn) => {
-        btn.onclick = async () => {
+        btn.onclick = debounceClick(() => {
           const id = btn.getAttribute('data-delete');
           if (!id) return;
           const ok = confirm('确定删除该任务及其可写层目录？此操作不可恢复。');
           if (!ok) return;
-          const label = btn.textContent;
-          btn.disabled = true;
-          try {
-            const r = await api('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
-            if (!r.ok) {
-              const t = await r.text();
-              let msg = t;
-              try {
-                const j = JSON.parse(t);
-                if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
-              } catch (_) {}
-              alert('删除失败：' + msg);
-              return;
-            }
-            await loadJobs();
-            await loadLayers();
-            await reloadLayerTree();
-          } catch (e) {
-            alert('删除失败：' + (e && e.message ? e.message : String(e)));
-          } finally {
-            btn.disabled = false;
-            btn.textContent = label;
-          }
-        };
+          void runAsyncButton(
+            btn,
+            async () => {
+              const r = await api('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' });
+              if (!r.ok) {
+                const t = await r.text();
+                let msg = t;
+                try {
+                  const j = JSON.parse(t);
+                  if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                } catch (_) {}
+                alert('删除失败：' + msg);
+                return;
+              }
+              await loadJobs();
+              await loadLayers();
+              await reloadLayerTree();
+            },
+            { busyText: '删除中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
       });
+      container.querySelectorAll('[data-show-changes]').forEach((btn) => {
+        btn.onclick = debounceClick(() => {
+          const lid = btn.getAttribute('data-show-changes');
+          const sel = document.getElementById('writableChangesLayer');
+          const section = document.getElementById('writableChangesSection');
+          if (!sel || !lid) return;
+          if ([...sel.options].some((o) => o.value === lid)) {
+            sel.value = lid;
+            updateWritableChangesCommandMeta();
+            void loadWritableChangesList();
+          }
+          if (section) section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, BTN_DEBOUNCE_MS);
+      });
+    }
+
+    function pickWritableChangesDefaultLayerId(jobs) {
+      const running = jobs.find((x) => x.status === 'running');
+      if (running) return running.layer_id;
+      if (!jobs || !jobs.length) return '';
+      const sorted = [...jobs].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      return sorted[0].layer_id;
+    }
+
+    function fillWritableChangesLayerSelect(preferredLayerId) {
+      const sel = document.getElementById('writableChangesLayer');
+      if (!sel) return;
+      const prev = sel.value;
+      sel.replaceChildren();
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '（选择任务层）';
+      sel.appendChild(placeholder);
+      const sorted = [...lastJobs].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      for (const j of sorted) {
+        if (!j.layer_id) continue;
+        const o = document.createElement('option');
+        o.value = j.layer_id;
+        const cmd = j.command || '';
+        const short = cmd.length > 48 ? cmd.slice(0, 48) + '…' : cmd;
+        o.textContent = (short || j.layer_id) + ' · ' + j.layer_id;
+        if (cmd) o.dataset.command = cmd;
+        sel.appendChild(o);
+      }
+      let pick = (preferredLayerId || '').trim();
+      if (pick && [...sel.options].some((x) => x.value === pick)) sel.value = pick;
+      else if (prev && [...sel.options].some((x) => x.value === prev)) sel.value = prev;
+      else if (sorted.length && sorted[0].layer_id) sel.value = sorted[0].layer_id;
+      else sel.value = '';
+      updateWritableChangesCommandMeta();
+    }
+
+    function updateWritableChangesCommandMeta() {
+      const meta = document.getElementById('writableChangesCmdMeta');
+      const sel = document.getElementById('writableChangesLayer');
+      if (!meta || !sel) return;
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      const cmd = opt && opt.dataset && opt.dataset.command ? opt.dataset.command : '';
+      if (cmd) {
+        meta.textContent =
+          '当前命令: ' + (cmd.length > 240 ? cmd.slice(0, 240) + '…' : cmd);
+      } else {
+        meta.textContent = '请从列表中选择层，或在工作区内新建任务后刷新。';
+      }
+    }
+
+    async function loadWritableChangesList() {
+      const errEl = document.getElementById('writableChangesErr');
+      const listEl = document.getElementById('writableChangesList');
+      const diffEl = document.getElementById('writableChangesDiff');
+      const metaEl = document.getElementById('writableChangesMeta');
+      const sel = document.getElementById('writableChangesLayer');
+      if (errEl) errEl.textContent = '';
+      if (!listEl || !sel) return;
+      if (diffEl) diffEl.textContent = '';
+      const layerId = (sel.value || '').trim();
+      if (!layerId) {
+        listEl.innerHTML = '<p class="meta">请先选择任务层。</p>';
+        if (metaEl) metaEl.textContent = '';
+        return;
+      }
+      listEl.innerHTML = '<p class="meta">加载中…</p>';
+      const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/diff/parent/files');
+      const raw = await r.text();
+      let j = null;
+      try {
+        j = JSON.parse(raw);
+      } catch (_) {}
+      if (!r.ok) {
+        listEl.innerHTML = '';
+        if (errEl) {
+          errEl.textContent =
+            j && j.detail !== undefined
+              ? typeof j.detail === 'string'
+                ? j.detail
+                : JSON.stringify(j.detail)
+              : raw;
+        }
+        return;
+      }
+      if (j.parent_layer_id == null && j.detail) {
+        listEl.innerHTML = '<p class="meta">' + escapeHtml(String(j.detail)) + '</p>';
+        if (metaEl) metaEl.textContent = '';
+        return;
+      }
+      const changes = j.changes || [];
+      if (metaEl) {
+        metaEl.textContent =
+          '父层 ' +
+          (j.parent_layer_id || '—') +
+          ' → 当前 ' +
+          (j.layer_id || layerId) +
+          ' · 共 ' +
+          changes.length +
+          ' 条路径' +
+          (j.truncated ? '（列表已截断）' : '') +
+          (j.same && changes.length === 0 ? ' · 无文件差异' : '');
+      }
+      listEl.replaceChildren();
+      if (j.same && changes.length === 0) {
+        const p = document.createElement('p');
+        p.className = 'meta';
+        p.textContent = '与父层工作区一致（除 .git）。';
+        listEl.appendChild(p);
+        return;
+      }
+      for (const c of changes) {
+        const row = document.createElement('div');
+        row.className = 'tree-node writable-change-row';
+        const badge = document.createElement('span');
+        const k = c.kind || '';
+        badge.className = 'writable-change-kind kind-' + k;
+        badge.textContent =
+          k === 'modified' ? '改' : k === 'added' ? '增' : k === 'removed' ? '删' : '?';
+        const label = document.createElement('span');
+        label.style.marginLeft = '0.35rem';
+        label.textContent = c.path || '';
+        row.appendChild(badge);
+        row.appendChild(label);
+        row.onclick = debounceClick(async () => {
+          if (row.dataset.diffBusy === '1') return;
+          row.dataset.diffBusy = '1';
+          row.setAttribute('aria-busy', 'true');
+          try {
+            document.querySelectorAll('.writable-change-row.active').forEach((n) => n.classList.remove('active'));
+            row.classList.add('active');
+            await loadWritableChangeDiff(layerId, c.path);
+          } finally {
+            delete row.dataset.diffBusy;
+            row.removeAttribute('aria-busy');
+          }
+        }, BTN_DEBOUNCE_MS);
+        listEl.appendChild(row);
+      }
+    }
+
+    async function loadWritableChangeDiff(layerId, relPath) {
+      const errEl = document.getElementById('writableChangesErr');
+      const diffEl = document.getElementById('writableChangesDiff');
+      if (errEl) errEl.textContent = '';
+      if (!diffEl) return;
+      diffEl.textContent = '加载 diff…';
+      const r = await api(
+        '/api/layers/' +
+          encodeURIComponent(layerId) +
+          '/diff/parent/file?path=' +
+          encodeURIComponent(relPath),
+      );
+      const raw = await r.text();
+      let j = null;
+      try {
+        j = JSON.parse(raw);
+      } catch (_) {}
+      if (!r.ok) {
+        diffEl.textContent = '';
+        if (errEl) {
+          errEl.textContent =
+            j && j.detail !== undefined
+              ? typeof j.detail === 'string'
+                ? j.detail
+                : JSON.stringify(j.detail)
+              : raw;
+        }
+        return;
+      }
+      if (j.same) {
+        diffEl.textContent = '（无逐行差异）';
+        return;
+      }
+      diffEl.textContent = (j.diff || '') + (j.truncated ? '\n\n（此路径 diff 已截断）' : '');
     }
 
     async function refreshSingleJobFromApi(jobId) {
@@ -1578,8 +1866,13 @@
       const j = await r.json();
       const ix = lastJobs.findIndex((x) => x.id === j.id);
       if (ix >= 0) lastJobs[ix] = j;
-      else lastJobs.unshift(j);
-      lastJobs.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      else lastJobs.push(j);
+      lastJobs.sort((a, b) => {
+        const da = createdAtMs(a.created_at);
+        const db = createdAtMs(b.created_at);
+        if (db !== da) return db - da;
+        return 0;
+      });
       const box = document.getElementById('jobs');
       if (!box) return;
       const wrap = document.createElement('div');
@@ -1604,6 +1897,8 @@
       }
       wireJobCardButtons(newCard);
       scheduleJobStepsRefresh(j.id);
+      const wsel = document.getElementById('writableChangesLayer');
+      if (wsel && wsel.value === j.layer_id) void loadWritableChangesList();
     }
 
     async function flushSseQueue() {
@@ -1655,13 +1950,12 @@
       }
       const { jobs } = await r.json();
       lastJobs = jobs;
-      fillParentJobSelect(jobs);
-      await fillJobRepoLayerSelect();
-      updateJobRepoLayerVisibility();
-      await refreshJobBranches();
+      await refreshMindGraphFromApi();
       box.innerHTML = jobs.map((j) => jobCardMarkup(j)).join('');
       wireJobCardButtons(box);
       refreshAllJobSteps();
+      fillWritableChangesLayerSelect(pickWritableChangesDefaultLayerId(jobs));
+      void loadWritableChangesList();
       await applyTaskGate();
     }
     function escapeHtml(s) {
@@ -1753,25 +2047,28 @@
       wrapper.appendChild(childrenEl);
       wrapper.appendChild(moreEl);
 
-      row.onclick = async () => {
+      row.onclick = debounceClick(async () => {
         const cache = treeCache.get(dirRelPath) || { loaded: false, nextOffset: 0, truncated: false };
         if (!childrenEl || !moreEl) return;
         if (childrenEl.style.display === 'none') {
-          // Expand
           childrenEl.style.display = 'block';
           moreEl.style.display = 'block';
           toggle.textContent = '-';
           if (!cache.loaded) {
+            row.setAttribute('aria-busy', 'true');
             treeCache.set(dirRelPath, { ...cache, loading: true });
-            await loadDirPage(dirRelPath, childrenEl, moreEl, 0, false);
+            try {
+              await loadDirPage(dirRelPath, childrenEl, moreEl, 0, false);
+            } finally {
+              row.removeAttribute('aria-busy');
+            }
           }
         } else {
-          // Collapse
           childrenEl.style.display = 'none';
           moreEl.style.display = 'none';
           toggle.textContent = '+';
         }
-      };
+      }, BTN_DEBOUNCE_MS);
 
       return wrapper;
     }
@@ -1800,9 +2097,14 @@
       row.appendChild(name);
       if (metaLine) row.appendChild(spacer);
 
-      row.onclick = async () => {
-        await loadLayerFileContent(fileRelPath);
-      };
+      row.onclick = debounceClick(async () => {
+        row.setAttribute('aria-busy', 'true');
+        try {
+          await loadLayerFileContent(fileRelPath);
+        } finally {
+          row.removeAttribute('aria-busy');
+        }
+      }, BTN_DEBOUNCE_MS);
 
       return row;
     }
@@ -1814,22 +2116,34 @@
       sel.value = layerId;
       updateLayerCommandMeta();
       void reloadLayerTree();
+      void setProjectView(layerId);
+    }
+
+    /** 任务树选中任务节点时同步「选择层」为任务所在可写层 */
+    function selectTaskFromMind(jobId) {
+      const j = lastJobs.find((x) => x.id === jobId);
+      if (!j) return;
+      selectLayerFromGraph(j.layer_id);
     }
 
     async function loadLayerParentDiff(layerId) {
-      const pre = document.getElementById('layerParentDiff');
+      const box = document.getElementById('layerParentDiff');
       const meta = document.getElementById('layerParentDiffMeta');
-      if (!pre || !meta) return;
-      pre.textContent = '加载中…';
+      if (!box || !meta) return;
+      box.textContent = '';
+      const loading = document.createElement('p');
+      loading.className = 'meta';
+      loading.textContent = '加载中…';
+      box.appendChild(loading);
       meta.textContent = '';
-      const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/diff/parent');
+      const r = await api('/api/layers/' + encodeURIComponent(layerId) + '/diff/parent/files');
       const raw = await r.text();
       let j = null;
       try {
         j = JSON.parse(raw);
       } catch (_) {}
       if (!r.ok) {
-        pre.textContent = '';
+        box.textContent = '';
         let msg = raw;
         if (j && j.detail !== undefined) {
           msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
@@ -1838,145 +2152,600 @@
         return;
       }
       if (j.parent_layer_id == null && j.detail) {
-        pre.textContent = '';
-        meta.textContent = j.detail;
+        box.innerHTML = '<p class="meta">' + escapeHtml(String(j.detail)) + '</p>';
+        meta.textContent = '';
         return;
       }
-      const pair =
-        j.parent_layer_id != null
-          ? '父层 ' + j.parent_layer_id + ' → 当前 ' + j.layer_id
-          : '';
+      const changes = j.changes || [];
       meta.textContent =
-        pair + (j.truncated ? ' · 输出已截断' : '') + (j.same ? ' · 无文件差异' : '');
-      if (j.same) {
-        pre.textContent = '（无差异：除 .git 外，工作区文件与父层目录一致）';
-      } else {
-        pre.textContent = j.diff || '（diff 为空）';
+        '父层 ' +
+        (j.parent_layer_id || '—') +
+        ' → 当前 ' +
+        (j.layer_id || layerId) +
+        ' · 共 ' +
+        changes.length +
+        ' 条路径' +
+        (j.truncated ? '（列表已截断）' : '') +
+        (j.same && changes.length === 0 ? ' · 无文件差异' : '');
+      box.replaceChildren();
+      if (j.same && changes.length === 0) {
+        const p = document.createElement('p');
+        p.className = 'meta';
+        p.textContent = '与父层工作区一致（除 .git）。';
+        box.appendChild(p);
+        return;
+      }
+      for (const c of changes) {
+        const row = document.createElement('div');
+        row.className = 'layer-parent-diff-file-row';
+        const badge = document.createElement('span');
+        const k = c.kind || '';
+        badge.className = 'writable-change-kind kind-' + k;
+        badge.textContent =
+          k === 'modified' ? '改' : k === 'added' ? '增' : k === 'removed' ? '删' : '?';
+        const label = document.createElement('span');
+        label.style.fontFamily = 'ui-monospace, monospace';
+        label.style.wordBreak = 'break-word';
+        label.textContent = c.path || '';
+        row.appendChild(badge);
+        row.appendChild(label);
+        box.appendChild(row);
       }
     }
 
-    function renderLayerRelationTree(layers) {
-      const el = document.getElementById('layerRelationTree');
-      const meta = document.getElementById('layerRelationMeta');
-      if (!el) return;
-      el.replaceChildren();
-      if (meta) meta.textContent = '';
-      if (!layers || !layers.length) {
-        const empty = document.createElement('div');
-        empty.className = 'meta';
-        empty.textContent = '（暂无可写层）';
-        el.appendChild(empty);
+    const LAYER_GRAPH_ROOT_ID = '__layer_graph_root__';
+    const LAYER_TREE_NODE_PREFIX = '__layer__:';
+    function layerNodeId(layerId) {
+      return LAYER_TREE_NODE_PREFIX + layerId;
+    }
+    function parseLayerTreeNodeId(nid) {
+      if (nid == null || nid === LAYER_GRAPH_ROOT_ID) return null;
+      const s = String(nid);
+      if (s.indexOf(LAYER_TREE_NODE_PREFIX) !== 0) return null;
+      return s.slice(LAYER_TREE_NODE_PREFIX.length);
+    }
+
+    function zTreeExpandAncestors(z, treeNode) {
+      if (!z || !treeNode) return;
+      let p = treeNode.getParentNode();
+      while (p) {
+        z.expandNode(p, true);
+        p = p.getParentNode();
+      }
+    }
+
+    function handleLayerGraphNodeSelect(nid) {
+      if (!nid || nid === LAYER_GRAPH_ROOT_ID) {
+        updateLayerRelationToolbar(nid || null);
         return;
       }
-      const byId = new Map(layers.map((l) => [l.layer_id, l]));
+      if (String(nid).indexOf('cycle_') === 0) {
+        return;
+      }
+      const layerOnlyId = parseLayerTreeNodeId(nid);
+      if (layerOnlyId) {
+        selectLayerFromGraph(layerOnlyId);
+        void loadLayerParentDiff(layerOnlyId);
+        const onLayer = (lastJobs || []).filter((j) => j.layer_id === layerOnlyId);
+        onLayer.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+        const repId = onLayer.length ? onLayer[onLayer.length - 1].id : null;
+        updateLayerRelationToolbar(repId);
+        return;
+      }
+      selectTaskFromMind(nid);
+      const tj = lastJobs.find((x) => x.id === nid);
+      if (tj) void loadLayerParentDiff(tj.layer_id);
+      updateLayerRelationToolbar(nid);
+    }
+
+    function buildJobGraphMaps(jobs, layerById) {
+      const byId = new Map(jobs.map((j) => [j.id, j]));
       const childMap = new Map();
-      for (const l of layers) {
-        const p = l.parent_layer_id;
+      for (const j of jobs) {
+        const p = j.parent_job_id;
         if (p && byId.has(p)) {
           if (!childMap.has(p)) childMap.set(p, []);
-          childMap.get(p).push(l);
+          childMap.get(p).push(j);
         }
       }
       for (const arr of childMap.values()) {
-        arr.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+        arr.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
       }
-      const roots = layers.filter((l) => {
-        const p = l.parent_layer_id;
-        return !p || !byId.has(p);
-      });
-      roots.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-
-      /** 本层 git 干净，或任一子孙层在接口上为干净（已提交），则本行显示 ✓ */
-      function effectiveClean(layer) {
-        if (layer.git_worktree_dirty === false) return true;
-        if (layer.git_worktree_dirty === null) return false;
-        const kids = childMap.get(layer.layer_id) || [];
+      function effectiveClean(job) {
+        const L = layerById.get(job.layer_id);
+        if (!L) return false;
+        if (L.git_worktree_dirty === false) return true;
+        if (L.git_worktree_dirty === null) return false;
+        const kids = childMap.get(job.id) || [];
         for (const k of kids) {
           if (effectiveClean(k)) return true;
         }
         return false;
       }
+      return { byId, childMap, effectiveClean };
+    }
 
-      function mkNode(layer, pathVisited) {
-        if (pathVisited.has(layer.layer_id)) {
-          const w = document.createElement('div');
-          w.className = 'meta';
-          w.style.color = 'var(--err)';
-          w.textContent = '（循环: ' + layer.layer_id + '）';
-          return w;
-        }
-        const nextVisited = new Set(pathVisited);
-        nextVisited.add(layer.layer_id);
+    /** zTree：按可写层 parent_layer_id 组织；任务挂在对应 layer_id 下（同级正序），不再按 parent_job_id 嵌套。 */
+    function buildZTreeNodesFromLayers(layers, jobs, maps, layerById) {
+      const { effectiveClean } = maps;
+      const ZROOT = 0;
+      const layerChildMap = new Map();
+      for (const l of layers) {
+        const p = l.parent_layer_id;
+        const pk = p && layerById.has(p) ? p : '__root__';
+        if (!layerChildMap.has(pk)) layerChildMap.set(pk, []);
+        layerChildMap.get(pk).push(l);
+      }
+      for (const arr of layerChildMap.values()) {
+        sortZTreeLayerSiblings(arr);
+      }
+      const jobsByLayer = new Map();
+      const jobApiOrder = new Map();
+      for (let i = 0; i < (jobs || []).length; i++) {
+        const j = jobs[i];
+        if (j && j.id && !jobApiOrder.has(j.id)) jobApiOrder.set(j.id, i);
+      }
+      for (const j of jobs) {
+        if (!layerById.has(j.layer_id)) continue;
+        if (!jobsByLayer.has(j.layer_id)) jobsByLayer.set(j.layer_id, []);
+        jobsByLayer.get(j.layer_id).push(j);
+      }
+      for (const arr of jobsByLayer.values()) {
+        arr.sort((a, b) => {
+          const da = createdAtMs(a.created_at);
+          const db = createdAtMs(b.created_at);
+          if (da !== db) return da - db;
+          return (jobApiOrder.get(a.id) ?? 0) - (jobApiOrder.get(b.id) ?? 0);
+        });
+      }
 
-        const kidsArr = childMap.get(layer.layer_id) || [];
-        const wrap = document.createElement('div');
-        wrap.style.marginTop = '0.12rem';
-
-        const row = document.createElement('div');
-        row.className = 'tree-node';
-        const isRoot = !layer.parent_layer_id || !byId.has(layer.parent_layer_id);
-        if (isRoot) row.classList.add('layer-graph-root');
-
-        const toggle = document.createElement('span');
-        toggle.className = 'tree-toggle';
-        toggle.textContent = kidsArr.length ? '+' : '·';
-
-        const name = document.createElement('span');
-        name.className = 'tree-layer-id';
-        name.textContent = layer.layer_id;
-
-        const muted = document.createElement('span');
-        muted.style.marginLeft = '0.45rem';
-        muted.style.color = 'var(--muted)';
-        muted.style.fontSize = '0.72rem';
-        const bits = [];
-        if (layer.created_at) bits.push(layer.created_at);
-        if (layer.command) {
-          const c = layer.command;
-          bits.push(c.length > 40 ? c.slice(0, 40) + '…' : c);
-        }
-        if (layerIdHasActiveJob(layer.layer_id)) {
-          bits.push('执行中 · 不可作新建任务来源');
-          row.style.opacity = '0.62';
-          row.title =
-            '该层仍有指令在排队或执行中；请待当前层结束后再从此层叠建新层（不可作工作区来源或父任务）';
-        }
-        muted.textContent = bits.join(' · ');
-
+      /** omitLayerCommand：下方会挂多条任务子节点时不在层行重复 command（否则会与每个任务行各显示一遍，像两个任务节点）。 */
+      function topicForLayer(layer, omitLayerCommand) {
+        const lid = layer.layer_id || '';
+        const bits = [lid];
+        const st = layer.job_status || layer.mind_state || '—';
+        bits.push(st);
         const dirty = layer.git_worktree_dirty;
-        const showSubmitted = effectiveClean(layer);
-        if (dirty === null) {
-          const na = document.createElement('span');
-          na.className = 'tree-layer-commit-na';
-          na.textContent = '—';
-          na.title = '该目录下无 git 仓库';
-          row.appendChild(toggle);
-          row.appendChild(name);
-          row.appendChild(muted);
-          row.appendChild(na);
-        } else if (showSubmitted) {
-          const ok = document.createElement('span');
-          ok.className = 'tree-layer-commit-done';
-          ok.textContent = '✓';
-          const propagated = showSubmitted && dirty !== false && dirty !== null;
-          ok.title = propagated
-            ? '下层已有可写层提交完毕（工作区干净），本层在树中一并视为已提交'
-            : '工作区干净，当前无未提交变更';
-          ok.setAttribute('aria-label', propagated ? '因下层已提交而视为已提交' : '已同步提交状态');
-          row.appendChild(toggle);
-          row.appendChild(name);
-          row.appendChild(muted);
-          row.appendChild(ok);
-        } else {
-          const commitBtn = document.createElement('button');
-          commitBtn.type = 'button';
-          commitBtn.className = 'secondary tree-layer-commit';
-          commitBtn.textContent = '提交';
-          commitBtn.title = '自动生成提交说明：任务指令 + 暂存区 diff（git add -A && git commit，不 push）';
-          commitBtn.onclick = async (e) => {
-            e.stopPropagation();
-            commitBtn.disabled = true;
+        if (dirty === null) bits.push('无 git');
+        else if (dirty === false) bits.push('✓');
+        else bits.push('未提交');
+        if (typeof layer.queue_depth === 'number' && layer.queue_depth > 0) {
+          bits.push('队列 ' + layer.queue_depth);
+        }
+        const sub = [];
+        if (layer.created_at) sub.push(layer.created_at);
+        if (layer.command && !omitLayerCommand) {
+          sub.push(layer.command.length > 36 ? layer.command.slice(0, 36) + '…' : layer.command);
+        }
+        const line1 = bits.join(' · ');
+        return sub.length ? line1 + '\n' + sub.join(' · ') : line1;
+      }
+
+      /** 该层仅一条可见（非 clone）任务：合并到同一层节点，避免「层行一条 + 任务行一条」的双重展示。 */
+      function topicForLayerMergedWithJob(layer, job) {
+        const lid = layer.layer_id || '';
+        const st = job.status || '—';
+        const bits = [st];
+        const L = layerById.get(job.layer_id);
+        const dirty = L ? L.git_worktree_dirty : null;
+        const showSubmitted = effectiveClean(job);
+        if (dirty === null) bits.push('无 git');
+        else if (showSubmitted) bits.push('✓');
+        else bits.push('未提交');
+        if (typeof layer.queue_depth === 'number' && layer.queue_depth > 0) {
+          bits.push('队列 ' + layer.queue_depth);
+        }
+        const sub = [];
+        if (job.created_at) sub.push(job.created_at);
+        const cmd = job.command || '';
+        if (cmd) sub.push(cmd.length > 36 ? cmd.slice(0, 36) + '…' : cmd);
+        const jid = job.id || '';
+        const shortId = jid.length > 14 ? jid.slice(0, 8) + '…' : jid;
+        const line1 = lid + '\n任务 · ' + shortId + '\n' + bits.join(' · ');
+        return sub.length ? line1 + '\n' + sub.join(' · ') : line1;
+      }
+
+      function ztStyleForLayer(layer) {
+        const st = layer.job_status;
+        if (st === 'pending' || st === 'running') return 'active';
+        const dirty = layer.git_worktree_dirty;
+        if (dirty === null) return 'no_git';
+        if (dirty === false) return 'clean';
+        return 'dirty';
+      }
+
+      /** 挂在层节点下的任务：不重复展示 layer_id（父节点已是该层），避免界面上出现两个节点同显一个 layerId。 */
+      function topicForJobUnderLayer(job) {
+        const st = job.status || '—';
+        const bits = [st];
+        const L = layerById.get(job.layer_id);
+        const dirty = L ? L.git_worktree_dirty : null;
+        const showSubmitted = effectiveClean(job);
+        if (dirty === null) bits.push('无 git');
+        else if (showSubmitted) bits.push('✓');
+        else bits.push('未提交');
+        const sub = [];
+        if (job.created_at) sub.push(job.created_at);
+        const cmd = job.command || '';
+        if (cmd) sub.push(cmd.length > 36 ? cmd.slice(0, 36) + '…' : cmd);
+        if (L && typeof L.queue_depth === 'number' && L.queue_depth > 0) {
+          bits.push('队列 ' + L.queue_depth);
+        }
+        const jid = job.id || '';
+        const shortId = jid.length > 14 ? jid.slice(0, 8) + '…' : jid;
+        const line1 = '任务 · ' + shortId + '\n' + bits.join(' · ');
+        return sub.length ? line1 + '\n' + sub.join(' · ') : line1;
+      }
+
+      function ztStyleForJob(job) {
+        const L = layerById.get(job.layer_id);
+        const dirty = L ? L.git_worktree_dirty : null;
+        const showSubmitted = effectiveClean(job);
+        const active = job.status === 'pending' || job.status === 'running';
+        if (active) return 'active';
+        if (dirty === null) return 'no_git';
+        if (dirty === false || showSubmitted) return 'clean';
+        return 'dirty';
+      }
+
+      const nodes = [];
+
+      function visitJobUnderLayer(job, parentPid) {
+        const fullTopic = topicForJobUnderLayer(job);
+        nodes.push({
+          id: job.id,
+          pId: parentPid,
+          name: fullTopic.split('\n').join(' · '),
+          title: fullTopic,
+          nodeKind: 'job',
+          ztStyle: ztStyleForJob(job),
+          open: false,
+        });
+      }
+
+      function visitLayer(layer, parentZId, pathVisited) {
+        if (pathVisited.has(layer.layer_id)) {
+          nodes.push({
+            id: 'cycle_ly_' + layer.layer_id,
+            pId: parentZId,
+            name: '（层循环） ' + layer.layer_id,
+            title: layer.layer_id,
+            nodeKind: 'cycle',
+            open: false,
+          });
+          return;
+        }
+        const nextPath = new Set(pathVisited);
+        nextPath.add(layer.layer_id);
+        const zid = layerNodeId(layer.layer_id);
+        const jlist = jobsByLayer.get(layer.layer_id) || [];
+        const visibleJobs = jlist.filter((j) => j.command_kind !== 'clone');
+        const soleVisible = visibleJobs.length === 1 ? visibleJobs[0] : null;
+        const ltopic = soleVisible
+          ? topicForLayerMergedWithJob(layer, soleVisible)
+          : topicForLayer(layer, visibleJobs.length > 1);
+        nodes.push({
+          id: zid,
+          pId: parentZId,
+          name: ltopic.split('\n').join(' · '),
+          title: ltopic,
+          nodeKind: 'layer',
+          ztStyle: soleVisible ? ztStyleForJob(soleVisible) : ztStyleForLayer(layer),
+          open: true,
+        });
+        const sublayers = layerChildMap.get(layer.layer_id) || [];
+        const childEntries = [];
+        for (const ch of sublayers) {
+          childEntries.push({ kind: 'layer', t: ch.created_at || '', layer: ch });
+        }
+        if (!soleVisible) {
+          for (const j of jlist) {
+            if (j.command_kind === 'clone') continue;
+            childEntries.push({ kind: 'job', t: j.created_at || '', job: j });
+          }
+        }
+        childEntries.sort((a, b) => {
+          const ta =
+            a.kind === 'layer'
+              ? createdAtMs(a.layer.created_at)
+              : createdAtMs(a.job.created_at);
+          const tb =
+            b.kind === 'layer'
+              ? createdAtMs(b.layer.created_at)
+              : createdAtMs(b.job.created_at);
+          if (ta !== tb) return ta - tb;
+          if (a.kind !== b.kind) return a.kind === 'layer' ? -1 : 1;
+          if (a.kind === 'layer')
+            return String(a.layer.layer_id || '').localeCompare(
+              String(b.layer.layer_id || ''),
+            );
+          return (
+            (jobApiOrder.get(a.job.id) ?? 0) - (jobApiOrder.get(b.job.id) ?? 0)
+          );
+        });
+        for (let i = 0; i < childEntries.length; i++) {
+          const e = childEntries[i];
+          if (e.kind === 'layer') visitLayer(e.layer, zid, nextPath);
+          else visitJobUnderLayer(e.job, zid);
+        }
+      }
+
+      const rootLayers = layerChildMap.get('__root__') || [];
+      const nRoot = rootLayers.length;
+      nodes.push({
+        id: LAYER_GRAPH_ROOT_ID,
+        pId: ZROOT,
+        name:
+          nRoot <= 1
+            ? '可写层'
+            : '可写层（' + nRoot + ' 个顶层 · 同级按时间正序）',
+        title:
+          nRoot <= 1
+            ? '可写层'
+            : '可写层\n（' + nRoot + ' 个顶层，同级按创建时间旧→新）',
+        nodeKind: 'virtual',
+        ztStyle: 'virtual',
+        open: true,
+      });
+      for (const r of rootLayers) {
+        visitLayer(r, LAYER_GRAPH_ROOT_ID, new Set());
+      }
+      return nodes;
+    }
+
+    function updateLayerRelationToolbar(selectedMindNodeId) {
+      const bar = document.getElementById('layerRelationActions');
+      if (!bar) return;
+      bar.replaceChildren();
+      const layers = window.__layersForMind;
+      const maps = window.__layerGraphMaps;
+      const effectiveClean = maps && maps.effectiveClean;
+
+      if (!selectedMindNodeId || selectedMindNodeId === LAYER_GRAPH_ROOT_ID) {
+        const hint = document.createElement('span');
+        hint.className = 'meta';
+        hint.textContent =
+          selectedMindNodeId === LAYER_GRAPH_ROOT_ID
+            ? '（请展开根节点「可写层」并点选子层或任务进行操作）'
+            : '（点选可写层或任务节点以查看差异与管理队列）';
+        bar.appendChild(hint);
+        return;
+      }
+      if (String(selectedMindNodeId).indexOf('cycle_') === 0) return;
+
+      const job = lastJobs.find((j) => j.id === selectedMindNodeId);
+      if (!job) return;
+      const layer = layers && layers.find((l) => l.layer_id === job.layer_id);
+      if (!layer) return;
+
+      const mindRunning = isJobStatusActive(job.status);
+
+      const label = document.createElement('span');
+      label.className = 'meta';
+      label.style.marginRight = '0.35rem';
+      label.textContent = '选中任务：' + job.id + ' · 层 ' + job.layer_id;
+      bar.appendChild(label);
+
+      const stEl = document.createElement('span');
+      stEl.className = 'meta';
+      stEl.style.marginRight = '0.5rem';
+      stEl.textContent = '状态：' + (job.status || '—');
+      bar.appendChild(stEl);
+
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'danger';
+      delBtn.textContent = '删除该层';
+      delBtn.title = '删除该可写层（若指令运行中会先终止）；含子层时自底向上删除';
+      delBtn.onclick = debounceClick(() => {
+        if (!confirm('确定删除该可写层及其子层？此操作不可恢复。')) return;
+        void runAsyncButton(
+          delBtn,
+          async () => {
+            const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id), {
+              method: 'DELETE',
+            });
+            const raw = await r.text();
+            let j = null;
             try {
+              j = JSON.parse(raw);
+            } catch (_) {}
+            if (!r.ok) {
+              const msg =
+                j && j.detail !== undefined
+                  ? typeof j.detail === 'string'
+                    ? j.detail
+                    : JSON.stringify(j.detail)
+                  : raw;
+              alert('删除失败：' + msg);
+              return;
+            }
+            await loadJobs();
+            await loadLayers(null);
+          },
+          { busyText: '删除中…' },
+        );
+      }, BTN_DEBOUNCE_MS);
+      bar.appendChild(delBtn);
+
+      if (mindRunning) {
+        const qWrap = document.createElement('div');
+        qWrap.style.cssText =
+          'margin-top:0.5rem;width:100%;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:flex-end;';
+        const qLab = document.createElement('label');
+        qLab.className = 'meta';
+        qLab.textContent =
+          '待执行队列' +
+          (typeof layer.queue_depth === 'number' ? '（' + layer.queue_depth + ' 条）' : '') +
+          '：';
+        qWrap.appendChild(qLab);
+        const ta = document.createElement('textarea');
+        ta.rows = 2;
+        ta.style.minWidth = '220px';
+        ta.style.flex = '1';
+        ta.placeholder = '当前任务结束后按顺序基于本层新建子层执行';
+        qWrap.appendChild(ta);
+        const kindSel = document.createElement('select');
+        [['trae', 'trae-cli'], ['shell', 'shell']].forEach(([v, t]) => {
+          const o = document.createElement('option');
+          o.value = v;
+          o.textContent = t;
+          kindSel.appendChild(o);
+        });
+        qWrap.appendChild(kindSel);
+        const qBtn = document.createElement('button');
+        qBtn.type = 'button';
+        qBtn.textContent = '加入队列';
+        qBtn.onclick = debounceClick(() => {
+          const cmd = (ta.value || '').trim();
+          if (!cmd) {
+            alert('请填写指令');
+            return;
+          }
+          void runAsyncButton(
+            qBtn,
+            async () => {
+              const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/queue', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  command: cmd,
+                  command_kind: kindSel.value,
+                }),
+              });
+              const raw = await r.text();
+              let j = null;
+              try {
+                j = JSON.parse(raw);
+              } catch (_) {}
+              if (!r.ok) {
+                alert(
+                  '加入队列失败：' +
+                    (j && j.detail
+                      ? typeof j.detail === 'string'
+                        ? j.detail
+                        : JSON.stringify(j.detail)
+                      : raw),
+                );
+                return;
+              }
+              ta.value = '';
+              await loadJobs();
+              const sel = document.getElementById('layerSelect');
+              await loadLayers(sel && sel.value ? sel.value : null);
+            },
+            { busyText: '提交中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
+        qWrap.appendChild(qBtn);
+        bar.appendChild(qWrap);
+      }
+
+      if (!mindRunning) {
+        const cWrap = document.createElement('div');
+        cWrap.style.cssText =
+          'margin-top:0.45rem;width:100%;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:flex-end;';
+        const cLab = document.createElement('span');
+        cLab.className = 'meta';
+        cLab.textContent = '基于该任务叠建新指令层：';
+        cWrap.appendChild(cLab);
+        const cta = document.createElement('textarea');
+        cta.rows = 2;
+        cta.style.minWidth = '220px';
+        cta.style.flex = '1';
+        cta.placeholder = 'trae 或 shell 指令';
+        cWrap.appendChild(cta);
+        const cKind = document.createElement('select');
+        [['trae', 'trae-cli'], ['shell', 'shell']].forEach(([v, t]) => {
+          const o = document.createElement('option');
+          o.value = v;
+          o.textContent = t;
+          cKind.appendChild(o);
+        });
+        cWrap.appendChild(cKind);
+        const cBtn = document.createElement('button');
+        cBtn.type = 'button';
+        cBtn.textContent = '创建并执行';
+        cBtn.onclick = debounceClick(() => {
+          const cmd = (cta.value || '').trim();
+          if (!cmd) {
+            alert('请填写指令');
+            return;
+          }
+          void runAsyncButton(
+            cBtn,
+            async () => {
+              const body = {
+                command: cmd,
+                command_kind: cKind.value,
+                parent_job_id: job.id,
+                repo_layer_id: null,
+                git_branch: null,
+              };
+              const r = await api('/api/jobs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+              });
+              const raw = await r.text();
+              let j = null;
+              try {
+                j = JSON.parse(raw);
+              } catch (_) {}
+              if (!r.ok) {
+                alert(
+                  '创建失败：' +
+                    (j && j.detail
+                      ? typeof j.detail === 'string'
+                        ? j.detail
+                        : JSON.stringify(j.detail)
+                      : raw),
+                );
+                return;
+              }
+              cta.value = '';
+              await loadJobs();
+              const sel = document.getElementById('layerSelect');
+              await loadLayers(sel && sel.value ? sel.value : null);
+            },
+            { busyText: '创建中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
+        cWrap.appendChild(cBtn);
+        bar.appendChild(cWrap);
+      }
+
+      const dirty = layer.git_worktree_dirty;
+      const showSubmitted = effectiveClean ? effectiveClean(job) : false;
+
+      if (dirty === null) {
+        const na = document.createElement('span');
+        na.className = 'tree-layer-commit-na';
+        na.textContent = ' — ';
+        na.title = '该目录下无 git 仓库';
+        na.style.marginLeft = '0.35rem';
+        bar.appendChild(na);
+        return;
+      }
+      if (showSubmitted) {
+        const ok = document.createElement('span');
+        ok.className = 'tree-layer-commit-done';
+        ok.textContent = '✓';
+        const propagated = showSubmitted && dirty !== false && dirty !== null;
+        ok.title = propagated
+          ? '下层已有可写层提交完毕（工作区干净），本层在图中一并视为已提交'
+          : '工作区干净，当前无未提交变更';
+        bar.appendChild(ok);
+      } else {
+        const commitBtn = document.createElement('button');
+        commitBtn.type = 'button';
+        commitBtn.className = 'secondary tree-layer-commit';
+        commitBtn.textContent = '提交';
+        commitBtn.title = '自动生成提交说明：任务指令 + 暂存区 diff（git add -A && git commit，不 push）';
+        commitBtn.onclick = debounceClick(() => {
+          void runAsyncButton(
+            commitBtn,
+            async () => {
               const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/commit', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2007,36 +2776,32 @@
               await loadJobs();
               const sel = document.getElementById('layerSelect');
               await loadLayers(sel && sel.value ? sel.value : null);
-            } finally {
-              commitBtn.disabled = false;
-            }
-          };
-          row.appendChild(toggle);
-          row.appendChild(name);
-          row.appendChild(muted);
-          row.appendChild(commitBtn);
-        }
+            },
+            { busyText: '提交中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
+        bar.appendChild(commitBtn);
+      }
 
-        const gr = layer.git_remote;
-        if (gr && gr.is_git && typeof gr.ahead === 'number' && gr.ahead > 0 && !gr.no_upstream) {
-          const pushBtn = document.createElement('button');
-          pushBtn.type = 'button';
-          pushBtn.className = 'tree-layer-push';
-          pushBtn.textContent = '推送';
-          pushBtn.title =
-            'git push：将本地领先上游的 ' +
-            gr.ahead +
-            ' 个提交推送到远程（' +
-            (gr.upstream || 'upstream') +
-            '）';
-          pushBtn.onclick = async (e) => {
-            e.stopPropagation();
-            pushBtn.disabled = true;
-            try {
-              const r = await api(
-                '/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/push',
-                { method: 'POST' },
-              );
+      const gr = layer.git_remote;
+      if (gr && gr.is_git && typeof gr.ahead === 'number' && gr.ahead > 0 && !gr.no_upstream) {
+        const pushBtn = document.createElement('button');
+        pushBtn.type = 'button';
+        pushBtn.className = 'tree-layer-push';
+        pushBtn.textContent = '推送';
+        pushBtn.title =
+          'git push：将本地领先上游的 ' +
+          gr.ahead +
+          ' 个提交推送到远程（' +
+          (gr.upstream || 'upstream') +
+          '）';
+        pushBtn.onclick = debounceClick(() => {
+          void runAsyncButton(
+            pushBtn,
+            async () => {
+              const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/push', {
+                method: 'POST',
+              });
               const rawText = await r.text();
               let j = null;
               try {
@@ -2059,46 +2824,260 @@
               await loadJobs();
               const sel = document.getElementById('layerSelect');
               await loadLayers(sel && sel.value ? sel.value : null);
-            } finally {
-              pushBtn.disabled = false;
-            }
-          };
-          row.appendChild(pushBtn);
-        }
+            },
+            { busyText: '推送中…' },
+          );
+        }, BTN_DEBOUNCE_MS);
+        bar.appendChild(pushBtn);
+      }
+    }
 
-        const childrenEl = document.createElement('div');
-        childrenEl.className = 'tree-children';
-        childrenEl.style.display = 'none';
-
-        let expanded = false;
-        row.onclick = () => {
-          selectLayerFromGraph(layer.layer_id);
-          void loadLayerParentDiff(layer.layer_id);
-          if (kidsArr.length) {
-            expanded = !expanded;
-            childrenEl.style.display = expanded ? 'block' : 'none';
-            toggle.textContent = expanded ? '-' : '+';
+    function renderLayerRelationTree(layers) {
+      const el = document.getElementById('layerRelationTree');
+      const meta = document.getElementById('layerRelationMeta');
+      if (!el) return;
+      try {
+        if (typeof jQuery !== 'undefined' && jQuery.fn && jQuery.fn.zTree) {
+          if (document.getElementById('ztree_layer_graph')) {
+            jQuery.fn.zTree.destroy('ztree_layer_graph');
           }
-        };
-
-        wrap.appendChild(row);
-        for (const kid of kidsArr) {
-          childrenEl.appendChild(mkNode(kid, nextVisited));
         }
-        wrap.appendChild(childrenEl);
-        return wrap;
+      } catch (_) {}
+      el.replaceChildren();
+      if (meta) meta.textContent = '';
+      window.__layerGraphMaps = null;
+      window._layerZtree = null;
+
+      if (!layers || !layers.length) {
+        window.__layersForMind = [];
+        const empty = document.createElement('div');
+        empty.className = 'meta';
+        const pathLine = lastLayersRootFromApi
+          ? ' 当前服务实际扫描：' + lastLayersRootFromApi + '。'
+          : ' ';
+        empty.textContent =
+          '（暂无可写层）' +
+          pathLine +
+          '仅将该目录下的一层子目录视为可写层；更深层的文件夹不会单独成层。若此处为空但磁盘上另有目录，多半是服务使用的路径与本地不一致，请检查启动环境变量 ONLINE_PROJECT_STATE_ROOT、REPO_ROOT、ONLINE_PROJECT_LAYERS（须与 onlineProject_state/layers 指向同一位置）。';
+        el.appendChild(empty);
+        updateLayerRelationToolbar(null);
+        return;
       }
 
-      for (const root of roots) {
-        el.appendChild(mkNode(root, new Set()));
+      if (
+        typeof jQuery === 'undefined' ||
+        !jQuery.fn ||
+        typeof jQuery.fn.zTree === 'undefined'
+      ) {
+        window.__layersForMind = dedupeLayersById(layers);
+        const err = document.createElement('div');
+        err.className = 'err-msg';
+        err.textContent = 'jQuery 或 zTree 未加载，请检查 /static/vendor 下脚本是否完整。';
+        el.appendChild(err);
+        updateLayerRelationToolbar(null);
+        return;
       }
+
+      const layerList = dedupeLayersById(layers);
+      window.__layersForMind = layerList;
+      normalizeLayerMindApiFields(layerList);
+      const jobs = lastJobs || [];
+      const layerById = new Map(layerList.map((l) => [l.layer_id, l]));
+
+      const maps = buildJobGraphMaps(jobs, layerById);
+      window.__layerGraphMaps = maps;
+      const rootLayerRows = layerList.filter((l) => {
+        const p = l.parent_layer_id;
+        return !p || !layerById.has(p);
+      });
+      sortZTreeLayerSiblings(rootLayerRows);
+
+      const zNodes = buildZTreeNodesFromLayers(layerList, jobs, maps, layerById);
+
+      const graphEl = document.createElement('ul');
+      graphEl.id = 'ztree_layer_graph';
+      graphEl.className = 'ztree';
+      el.appendChild(graphEl);
+
+      /* 仅改文字色：避免 fontCss 内联 background 压过 .curSelectedNode */
+      const fontCss = function (_treeId, treeNode) {
+        if (!treeNode) return {};
+        if (treeNode.nodeKind === 'virtual') {
+          return { 'font-weight': '600', color: 'var(--text)' };
+        }
+        if (treeNode.nodeKind === 'layer') {
+          const ls = treeNode.ztStyle;
+          if (ls === 'active') return { color: '#fcd34d', 'font-weight': '600' };
+          if (ls === 'no_git') return { color: '#94a3b8', 'font-weight': '600' };
+          if (ls === 'clean') return { color: '#a7f3d0', 'font-weight': '600' };
+          return { color: '#cbd5e1', 'font-weight': '600' };
+        }
+        if (treeNode.nodeKind === 'cycle') {
+          return { color: '#f87171' };
+        }
+        const s = treeNode.ztStyle;
+        if (s === 'active') return { color: '#fcd34d' };
+        if (s === 'no_git') return { color: '#94a3b8' };
+        if (s === 'clean') return { color: '#a7f3d0' };
+        return { color: '#cbd5e1' };
+      };
+
+      const zSetting = {
+        view: {
+          fontCss: fontCss,
+          showIcon: false,
+          nameIsHTML: false,
+          dblClickExpand: false,
+        },
+        data: {
+          simpleData: {
+            enable: true,
+            idKey: 'id',
+            pIdKey: 'pId',
+            rootPId: 0,
+          },
+        },
+        callback: {
+          onClick: function (_evt, _treeId, treeNode) {
+            if (!treeNode) return;
+            handleLayerGraphNodeSelect(treeNode.id);
+          },
+        },
+      };
+
+      jQuery.fn.zTree.init(jQuery('#ztree_layer_graph'), zSetting, zNodes);
+      window._layerZtree = jQuery.fn.zTree.getZTreeObj('ztree_layer_graph');
+
+      const sel = document.getElementById('layerSelect');
+      const currentLayer = sel && sel.value ? sel.value : null;
+      let preferredJobId = null;
+      if (currentLayer) {
+        const cands = jobs.filter((j) => j.layer_id === currentLayer);
+        cands.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+        if (cands.length) preferredJobId = cands[cands.length - 1].id;
+      }
+      const walkChildMap = new Map();
+      for (const l of layerList) {
+        const p = l.parent_layer_id;
+        const pk = p && layerById.has(p) ? p : '__root__';
+        if (!walkChildMap.has(pk)) walkChildMap.set(pk, []);
+        walkChildMap.get(pk).push(l);
+      }
+      for (const arr of walkChildMap.values()) {
+        sortZTreeLayerSiblings(arr);
+      }
+      let firstJobId = null;
+      outer: for (const rl of rootLayerRows) {
+        const stack = [rl.layer_id];
+        const seen = new Set();
+        while (stack.length && !firstJobId) {
+          const lid = stack.pop();
+          if (seen.has(lid)) continue;
+          seen.add(lid);
+          const jl = jobs.filter((j) => j.layer_id === lid);
+          jl.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+          if (jl.length) {
+            const prefer = jl.find((j) => j.command_kind !== 'clone');
+            firstJobId = prefer ? prefer.id : jl[0].id;
+            break outer;
+          }
+          const subs = walkChildMap.get(lid) || [];
+          for (let i = subs.length - 1; i >= 0; i--) {
+            stack.push(subs[i].layer_id);
+          }
+        }
+      }
+      if (!firstJobId && jobs.length) {
+        const asc = [...jobs].sort((a, b) =>
+          (a.created_at || '').localeCompare(b.created_at || ''),
+        );
+        firstJobId = asc[0].id;
+      }
+      const selectJobId = preferredJobId || firstJobId;
+
+      if (selectJobId) {
+        const tj0 = jobs.find((x) => x.id === selectJobId);
+        const lid0 = tj0 ? tj0.layer_id : null;
+        if (lid0 && sel && sel.value !== lid0) {
+          selectLayerFromGraph(lid0);
+        }
+        requestAnimationFrame(function () {
+          try {
+            const z = window._layerZtree;
+            if (!z) return;
+            const vr = z.getNodeByParam('id', LAYER_GRAPH_ROOT_ID, null);
+            if (vr) z.expandNode(vr, true);
+            const tn = z.getNodeByParam('id', selectJobId, null);
+            if (tn) {
+              zTreeExpandAncestors(z, tn);
+              z.selectNode(tn, false);
+            } else {
+              const jsel = jobs.find((x) => x.id === selectJobId);
+              if (jsel && jsel.layer_id) {
+                const onVis = jobs.filter(
+                  (x) =>
+                    x.layer_id === jsel.layer_id && x.command_kind !== 'clone',
+                );
+                const soleOnLayer =
+                  onVis.length === 1 && onVis[0].id === selectJobId;
+                const pickLayerNode =
+                  jsel.command_kind === 'clone' || soleOnLayer;
+                if (pickLayerNode) {
+                  const ln = z.getNodeByParam('id', layerNodeId(jsel.layer_id), null);
+                  if (ln) {
+                    zTreeExpandAncestors(z, ln);
+                    z.selectNode(ln, false);
+                  }
+                }
+              }
+            }
+            handleLayerGraphNodeSelect(selectJobId);
+          } catch (_) {}
+        });
+      } else if (rootLayerRows.length) {
+        const l0 = rootLayerRows[0].layer_id;
+        requestAnimationFrame(function () {
+          try {
+            const z = window._layerZtree;
+            if (!z) return;
+            const vr = z.getNodeByParam('id', LAYER_GRAPH_ROOT_ID, null);
+            if (vr) z.expandNode(vr, true);
+            const zn = z.getNodeByParam('id', layerNodeId(l0), null);
+            if (zn) {
+              zTreeExpandAncestors(z, zn);
+              z.selectNode(zn, false);
+              handleLayerGraphNodeSelect(layerNodeId(l0));
+            } else if (vr) {
+              z.selectNode(vr, false);
+              handleLayerGraphNodeSelect(LAYER_GRAPH_ROOT_ID);
+            }
+          } catch (_) {}
+        });
+      } else {
+        requestAnimationFrame(function () {
+          try {
+            const z = window._layerZtree;
+            if (!z) return;
+            const vr = z.getNodeByParam('id', LAYER_GRAPH_ROOT_ID, null);
+            if (vr) {
+              z.expandNode(vr, true);
+              z.selectNode(vr, false);
+            }
+            handleLayerGraphNodeSelect(LAYER_GRAPH_ROOT_ID);
+          } catch (_) {}
+        });
+      }
+
       if (meta) {
         meta.textContent =
-          '共 ' +
-          layers.length +
-          ' 个目录 · 根节点 ' +
-          roots.length +
-          ' 个（无父或父层目录已不存在）';
+          '可写层 ' +
+          layerList.length +
+          ' 个（按 parent_layer_id）· 顶层 ' +
+          rootLayerRows.length +
+          ' 个 · 任务 ' +
+          jobs.length +
+          ' 个 · 同层任务正序' +
+          (lastLayersRootFromApi ? ' · 服务扫描 ' + lastLayersRootFromApi : '');
       }
     }
 
@@ -2116,11 +3095,13 @@
       const r = await api('/api/layers');
       if (!r.ok) {
         errEl.textContent = await r.text();
+        cacheLayersApiMeta({});
         renderLayerRelationTree([]);
         await applyTaskGate();
         return;
       }
       const j = await r.json();
+      cacheLayersApiMeta(j);
       const layers = j.layers || [];
       if (!layers.length) {
         const opt = document.createElement('option');
@@ -2129,8 +3110,6 @@
         sel.appendChild(opt);
         updateLayerCommandMeta();
         renderLayerRelationTree([]);
-        await fillJobRepoLayerSelect();
-        await refreshJobBranches();
         await applyTaskGate();
         return;
       }
@@ -2145,7 +3124,7 @@
         if (l.command) opt.dataset.command = l.command;
         sel.appendChild(opt);
       }
-      let pick = layers[0].layer_id;
+      let pick = pickFirstCloneRootLayerId(layers);
       if (
         preferredLayerId &&
         layers.some((x) => x.layer_id === preferredLayerId)
@@ -2155,9 +3134,8 @@
       sel.value = pick;
       updateLayerCommandMeta();
       renderLayerRelationTree(layers);
-      await fillJobRepoLayerSelect(preferredLayerId);
-      await refreshJobBranches();
       await reloadLayerTree();
+      void setProjectView(pick);
       await applyTaskGate();
     }
 
@@ -2222,16 +3200,25 @@
         btn.type = 'button';
         btn.className = 'secondary';
         btn.textContent = '加载更多';
-        btn.onclick = async () => {
+        btn.onclick = debounceClick(async () => {
           const cache = treeCache.get(dirRelPath || '') || {};
           if (cache.loading) return;
           cache.loading = true;
           treeCache.set(dirRelPath || '', cache);
-          await loadDirPage(dirRelPath, childrenEl, moreEl, cache.nextOffset || offset + entries.length, true);
-          const after = treeCache.get(dirRelPath || '') || {};
-          after.loading = false;
-          treeCache.set(dirRelPath || '', after);
-        };
+          btn.disabled = true;
+          btn.setAttribute('aria-busy', 'true');
+          try {
+            await loadDirPage(dirRelPath, childrenEl, moreEl, cache.nextOffset || offset + entries.length, true);
+          } finally {
+            const after = treeCache.get(dirRelPath || '') || {};
+            after.loading = false;
+            treeCache.set(dirRelPath || '', after);
+            if (btn.isConnected) {
+              btn.disabled = false;
+              btn.removeAttribute('aria-busy');
+            }
+          }
+        }, BTN_DEBOUNCE_MS);
         moreEl.appendChild(btn);
       } else {
         moreEl.innerHTML = '';
@@ -2300,95 +3287,71 @@
       }
     }
 
-    document.getElementById('parentId').onchange = () => {
-      updateJobRepoLayerVisibility();
-      refreshJobBranches();
+    document.getElementById('btnLoadLayerFiles').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnLoadLayerFiles');
+      void runAsyncButton(btn, () => reloadLayerTree(), { busyText: '刷新中…' });
+    }, BTN_DEBOUNCE_MS);
+    document.getElementById('layerSelect').onchange = () => {
+      void (async () => {
+        const ls = document.getElementById('layerSelect');
+        const r = await api('/api/layers');
+        if (r.ok) {
+          const j = await r.json();
+          cacheLayersApiMeta(j);
+          renderLayerRelationTree(j.layers || []);
+        }
+        void reloadLayerTree();
+        if (ls && ls.value) void setProjectView(ls.value);
+      })();
     };
-    document.getElementById('jobRepoLayer').onchange = () => {
-      const v = document.getElementById('jobRepoLayer').value.trim();
-      jobRepoLayerUserChoseEmpty = !v;
-      if (!document.getElementById('parentId').value.trim()) {
-        refreshJobBranches();
-      }
-    };
-    document.getElementById('btnLoadLayerFiles').onclick = reloadLayerTree;
-    document.getElementById('layerSelect').onchange = reloadLayerTree;
     document.getElementById('filePrefix').onchange = reloadLayerTree;
-    document.getElementById('btnRefresh').onclick = loadJobs;
-    document.getElementById('btnReset').onclick = async () => {
+    document.getElementById('btnRefresh').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnRefresh');
+      void runAsyncButton(btn, () => loadJobs(), { busyText: '刷新中…' });
+    }, BTN_DEBOUNCE_MS);
+    document.getElementById('btnRefreshWritableChanges').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnRefreshWritableChanges');
+      void runAsyncButton(btn, () => loadWritableChangesList(), { busyText: '刷新中…' });
+    }, BTN_DEBOUNCE_MS);
+    document.getElementById('writableChangesLayer').onchange = () => {
+      updateWritableChangesCommandMeta();
+      void loadWritableChangesList();
+    };
+    document.getElementById('btnReset').onclick = debounceClick(() => {
       const ok = confirm('确定要中断并清空所有任务吗？');
       if (!ok) return;
-      document.getElementById('resetErr').textContent = '';
       const btn = document.getElementById('btnReset');
-      btn.disabled = true;
-      try {
-        const r = await api('/api/jobs/reset', { method: 'POST' });
-        if (!r.ok) {
-          document.getElementById('resetErr').textContent = await r.text();
-          return;
-        }
-        await r.json().catch(() => null);
-        resetCloneSectionUi();
-        jobRepoLayerUserChoseEmpty = false;
-        await loadJobs();
-        await loadLayers();
-        await reloadLayerTree();
-      } finally {
-        btn.disabled = false;
-      }
-    };
-    document.getElementById('btnRun').onclick = async () => {
-      document.getElementById('jobErr').textContent = '';
-      const bashLine = document.getElementById('bashCmd').value.trim();
-      const traeLine = document.getElementById('cmd').value.trim();
-      let command;
-      let command_kind;
-      if (bashLine) {
-        command = bashLine;
-        command_kind = 'shell';
-      } else {
-        command = traeLine;
-        command_kind = 'trae';
-      }
-      if (!command) {
-        document.getElementById('jobErr').textContent =
-          '请填写「trae-cli run」指令或「Shell 指令」之一。';
-        return;
-      }
-      const parent_job_id = document.getElementById('parentId').value.trim() || null;
-      const repo_layer_id = parent_job_id
-        ? null
-        : (document.getElementById('jobRepoLayer').value.trim() || null);
-      const git_branch = document.getElementById('jobGitBranch').value.trim() || null;
-      const r = await api('/api/jobs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          command,
-          command_kind,
-          parent_job_id,
-          repo_layer_id,
-          git_branch,
-        }),
-      });
-      if (!r.ok) {
-        document.getElementById('jobErr').textContent = await r.text();
-        return;
-      }
-      document.getElementById('cmd').value = '';
-      document.getElementById('bashCmd').value = '';
-      syncTaskCommandFields();
-      loadJobs();
-    };
-
-    document.getElementById('cmd').addEventListener('input', syncTaskCommandFields);
-    document.getElementById('bashCmd').addEventListener('input', syncTaskCommandFields);
-    document.getElementById('btnParent').onclick = async () => {
-      const id = document.getElementById('lookupJob').value.trim();
-      const r = await api('/api/jobs/' + encodeURIComponent(id) + '/parent');
-      const pre = document.getElementById('parentOut');
-      pre.textContent = JSON.stringify(await r.json(), null, 2);
-    };
+      void runAsyncButton(
+        btn,
+        async () => {
+          document.getElementById('resetErr').textContent = '';
+          const r = await api('/api/jobs/reset', { method: 'POST' });
+          if (!r.ok) {
+            document.getElementById('resetErr').textContent = await r.text();
+            return;
+          }
+          await r.json().catch(() => null);
+          resetCloneSectionUi();
+          await loadJobs();
+          await loadLayers();
+          await reloadLayerTree();
+        },
+        { busyText: '重置中…' },
+      );
+    }, BTN_DEBOUNCE_MS);
+    document.getElementById('btnParent').onclick = debounceClick(() => {
+      const btn = document.getElementById('btnParent');
+      void runAsyncButton(
+        btn,
+        async () => {
+          const id = document.getElementById('lookupJob').value.trim();
+          const r = await api('/api/jobs/' + encodeURIComponent(id) + '/parent');
+          const pre = document.getElementById('parentOut');
+          pre.textContent = JSON.stringify(await r.json(), null, 2);
+        },
+        { busyText: '查询中…' },
+      );
+    }, BTN_DEBOUNCE_MS);
     const __persistedClone = readClonePersistState();
     // 须立即恢复克隆表单：若等到 loadLayers 完成再写入，/api/layers 慢或失败时 URL 会一直为空。
     applyPersistedCloneUi(__persistedClone);
@@ -2424,7 +3387,8 @@
         await loadLayers(__persistedClone && __persistedClone.layer_id);
       })();
       try {
-        await Promise.all([loadJobs(), layersBoot]);
+        await layersBoot;
+        await loadJobs();
       } catch (_) {}
       // 留出 >500ms 无长连接窗口，便于依赖 networkidle 的宿主结束「加载中」
       setTimeout(connectSse, 600);

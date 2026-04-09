@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import re
 import shutil
+import time
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -22,9 +26,10 @@ from .git_clone import (
     get_clone_layer_log_text,
 )
 from .layers import create_root_layer, new_layer_id
-from .paths import config_file_path
+from .paths import config_file_path, req_logs_dir
 
 log = logging.getLogger(__name__)
+_outbound_req_logger = logging.getLogger("trae_online.outbound_http")
 
 # 容器启动引导克隆所用的 layer_id，供 UI GET /api/repos/bootstrap-clone-log 展示日志（无 SSE）。
 bootstrap_clone_layer_id: str | None = None
@@ -72,6 +77,98 @@ def _business_api_endpoint() -> str:
     return raw.rstrip("/")
 
 
+def _redact_for_log(obj: Any) -> Any:
+    """脱敏后再写入 reqLogs，避免 access_token / refresh_token 等落盘。"""
+    sensitive = frozenset(
+        {
+            "access_token",
+            "refresh_token",
+            "password",
+            "client_secret",
+            "authorization",
+        }
+    )
+
+    def key_sensitive(k: object) -> bool:
+        lk = str(k).lower().replace("-", "_")
+        if lk in sensitive:
+            return True
+        if lk.endswith("_secret"):
+            return True
+        if lk.endswith("_token"):
+            return True
+        return False
+
+    if isinstance(obj, dict):
+        return {k: ("***" if key_sensitive(k) else _redact_for_log(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_for_log(x) for x in obj]
+    return obj
+
+
+def _redact_error_detail_snippet(text: str, max_len: int = 2048) -> str:
+    text = text[:max_len]
+    try:
+        parsed = json.loads(text)
+        return json.dumps(_redact_for_log(parsed), ensure_ascii=False)
+    except json.JSONDecodeError:
+        return text
+
+
+def _ensure_outbound_req_log_handler() -> None:
+    log_path = (req_logs_dir() / "outbound.log").resolve()
+    logger = _outbound_req_logger
+    logger.setLevel(logging.INFO)
+    for h in logger.handlers:
+        if isinstance(h, logging.handlers.RotatingFileHandler):
+            try:
+                if Path(h.baseFilename).resolve() == log_path:
+                    return
+            except OSError:
+                continue
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+def _log_outbound_post(
+    *,
+    step: str,
+    url: str,
+    body: dict,
+    elapsed_ms: float,
+    status: int | None,
+    error_kind: str | None,
+    error_detail: str | None = None,
+) -> None:
+    _ensure_outbound_req_log_handler()
+    body_s = json.dumps(_redact_for_log(body), ensure_ascii=False)
+    if len(body_s) > 4096:
+        body_s = body_s[:4096] + "…"
+    parts = [
+        f"step={step}",
+        "POST",
+        url,
+        f"{elapsed_ms:.2f}ms",
+    ]
+    if status is not None:
+        parts.append(f"status={status}")
+    if error_kind:
+        parts.append(f"error={error_kind}")
+    parts.append(f"body={body_s}")
+    if error_detail:
+        parts.append(f"detail={error_detail}")
+    _outbound_req_logger.info(" | ".join(parts))
+
+
 def _post_json(
     url: str,
     body: dict,
@@ -86,19 +183,59 @@ def _post_json(
         method="POST",
         headers={"Content-Type": "application/json"},
     )
+    t0 = time.perf_counter()
     try:
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
+            status = getattr(resp, "status", None)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        _log_outbound_post(
+            step=step,
+            url=url,
+            body=body,
+            elapsed_ms=elapsed_ms,
+            status=status,
+            error_kind=None,
+        )
     except TimeoutError as e:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        _log_outbound_post(
+            step=step,
+            url=url,
+            body=body,
+            elapsed_ms=elapsed_ms,
+            status=None,
+            error_kind="timeout",
+        )
         raise RuntimeError(
             f"[{step}] 请求超时（{timeout:g}s）: {url}"
         ) from e
     except HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        _log_outbound_post(
+            step=step,
+            url=url,
+            body=body,
+            elapsed_ms=elapsed_ms,
+            status=e.code,
+            error_kind="http",
+            error_detail=_redact_error_detail_snippet(err_body),
+        )
         raise RuntimeError(
             f"[{step}] 请求失败 HTTP {e.code} {url}: {err_body}"
         ) from e
     except URLError as e:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        _log_outbound_post(
+            step=step,
+            url=url,
+            body=body,
+            elapsed_ms=elapsed_ms,
+            status=None,
+            error_kind="url",
+            error_detail=str(e),
+        )
         raise RuntimeError(f"[{step}] 请求失败 {url}: {e}") from e
     return json.loads(raw) if raw else {}
 
@@ -484,6 +621,16 @@ def bootstrap_container_config() -> None:
         cloud_prefix=prefix,
         access_token=new_access,
     )
+    if bootstrap_clone_layer_id:
+        try:
+            from .online_project_view import set_online_project_tip
+
+            set_online_project_tip(bootstrap_clone_layer_id)
+        except Exception:
+            log.exception(
+                "bootstrap: 无法将 onlineProject 指向克隆层 %s",
+                bootstrap_clone_layer_id,
+            )
 
     y = _post_json(
         f"{prefix}/server-container-token/feature-params-yaml/",
