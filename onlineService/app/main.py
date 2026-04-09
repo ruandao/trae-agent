@@ -50,8 +50,12 @@ from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .online_project_view import get_online_project_active_info, set_online_project_tip
 from .paths import config_file_path, layers_root, logs_dir, service_root
 from . import task_api_bootstrap
+from .layer_graph_saas_push import run_layer_graph_saas_push_loop
 
 log = logging.getLogger(__name__)
+
+# 在文件末尾赋值为 build_layer_graph_snapshot_for_saas，供 lifespan 启动层级推送循环
+_layer_graph_snapshot_builder = None
 
 
 def _strict_bootstrap_enabled() -> bool:
@@ -84,7 +88,20 @@ async def _lifespan(_app: FastAPI):
                 "bootstrap: 登记克隆层任务失败 layer_id=%s",
                 bs_lid,
             )
-    yield
+    _layer_graph_task: asyncio.Task | None = None
+    if _layer_graph_snapshot_builder is not None:
+        _layer_graph_task = asyncio.create_task(
+            run_layer_graph_saas_push_loop(_layer_graph_snapshot_builder)
+        )
+    try:
+        yield
+    finally:
+        if _layer_graph_task is not None:
+            _layer_graph_task.cancel()
+            try:
+                await _layer_graph_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Trae Online Service", version="1.0.0", lifespan=_lifespan)
@@ -692,14 +709,12 @@ async def _layer_git_meta(lid: str) -> tuple[bool | None, dict[str, Any]]:
     return dirty, remote
 
 
-@app.get("/api/layers")
-async def api_list_layers(_: AuthDep) -> dict[str, Any]:
+async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
+    """与 GET /api/layers 相同的层列表富集逻辑，并附带 jobs 列表供 SaaS 评论区 zTree。"""
     layers, jobs = await asyncio.gather(
         asyncio.to_thread(list_layers),
         asyncio.to_thread(store.list_jobs),
     )
-    # 将 layer_id 映射到 jobs 记录的执行命令（用于 UI 展示）。
-    # 如果某个 layer 目录存在但 jobs 状态里已不存在，则不返回 command。
     cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in jobs}
     job_by_layer_id: dict[str, JobRecord] = {}
     for j in jobs:
@@ -747,10 +762,22 @@ async def api_list_layers(_: AuthDep) -> dict[str, Any]:
         if idx is not None and idx > 0:
             layers.insert(0, layers.pop(idx))
 
+    jobs_api = [_job_to_api_dict(j) for j in jobs]
     return {
         "layers": layers,
+        "jobs": jobs_api,
         "layers_root": str(layers_root().resolve()),
         "bootstrap_layer_id": bs_s or None,
+    }
+
+
+@app.get("/api/layers")
+async def api_list_layers(_: AuthDep) -> dict[str, Any]:
+    snap = await build_layer_graph_snapshot_for_saas()
+    return {
+        "layers": snap["layers"],
+        "layers_root": snap["layers_root"],
+        "bootstrap_layer_id": snap.get("bootstrap_layer_id"),
     }
 
 
@@ -818,3 +845,6 @@ async def api_list_layer_children(
         offset=offset,
         limit=limit,
     )
+
+
+_layer_graph_snapshot_builder = build_layer_graph_snapshot_for_saas

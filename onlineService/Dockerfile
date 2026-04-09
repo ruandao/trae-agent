@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# 不声明 # syntax=docker/dockerfile:1，避免构建前置拉取该前端镜像（弱网常见 TLS 超时）。
 # 基于 nastool 官方 Debian 变体：预装 git/curl/ffmpeg 等，减少任务运行时再 apt 装工具。
 # 该基础镜像自带 Python 3.10；trae-agent 要求 >=3.12，故从同发行版 bullseye 的官方 Python 镜像并入 /usr/local。
 FROM nastool/nas-tools:3.2.3-debian
