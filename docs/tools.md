@@ -1,8 +1,8 @@
 # Tools
 
-Trae Agent provides five built-in tools for software engineering tasks:
+Trae Agent provides built-in tools for software engineering tasks (see `trae_agent/tools/__init__.py` for the full registry).
 
-## str_replace_based_edit_tool
+## edit_file
 
 File and directory manipulation tool with persistent state.
 
@@ -50,7 +50,7 @@ Structured problem-solving tool for complex analysis.
 - `is_revision` / `revises_thought` - Revision tracking
 - `branch_from_thought` / `branch_id` - Alternative exploration
 
-## task_done
+## complete_task
 
 Signal task completion with verification requirement.
 
@@ -63,7 +63,7 @@ Signal task completion with verification requirement.
 - Simple "Task done." message
 - No parameters required
 
-## json_edit_tool
+## edit_json
 
 Precise JSON file editing using JSONPath expressions.
 
@@ -83,3 +83,7 @@ Precise JSON file editing using JSONPath expressions.
 - Validates JSON syntax and structure
 - Preserves formatting with pretty printing option
 - Detailed error messages for invalid operations
+
+## code_knowledge_search
+
+Search a built code knowledge graph (functions, classes, methods) for the workspace codebase.

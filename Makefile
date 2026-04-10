@@ -9,7 +9,7 @@ help:
 	@echo "  uv-test           - Run all tests (via uv, skips some external service tests)"
 	@echo "  test              - Run all tests (skips some external service tests)"
 	@echo "  uv-pre-commit     - Run pre-commit hooks on all files (via uv)"
-	@echo "  pre-commit-install- Install pre-commit hooks"
+	@echo "  pre-commit-install- Install pre-commit hooks (commit 前会跑 make uv-test 全量单测)"
 	@echo "  pre-commit-run    - Run pre-commit hooks on all files"
 	@echo "  pre-commit        - Install and run pre-commit hooks on all files"
 	@echo "  fix-format        - Fix formatting errors"
@@ -27,9 +27,9 @@ uv-pre-commit:
 	uv run pre-commit run --all-files
 
 pre-commit-install:
-	pre-commit install
+	uv run pre-commit install
 pre-commit-run:
-	pre-commit run --all-files
+	uv run pre-commit run --all-files
 pre-commit: pre-commit-install pre-commit-run
 
 # fix formatting error
@@ -39,9 +39,9 @@ fix-format:
 
 # Testing commands
 uv-test:
-	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run pytest tests/ -v --tb=short --continue-on-collection-errors
+	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run python -m pytest tests/ -v --tb=short --continue-on-collection-errors
 test:
-	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run pytest
+	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run python -m pytest
 
 # Clean up
 clean:

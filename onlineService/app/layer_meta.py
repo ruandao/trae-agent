@@ -48,7 +48,9 @@ def read_layer_meta(layer_id: str) -> LayerMeta | None:
         return None
 
 
-def write_layer_meta(layer_id: str, *, kind: Literal["clone", "job"], parent_layer_id: str | None) -> None:
+def write_layer_meta(
+    layer_id: str, *, kind: Literal["clone", "job"], parent_layer_id: str | None
+) -> None:
     root = _layer_root(layer_id)
     root.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -56,7 +58,9 @@ def write_layer_meta(layer_id: str, *, kind: Literal["clone", "job"], parent_lay
         "kind": kind,
         "parent_layer_id": parent_layer_id,
     }
-    meta_path(layer_id).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta_path(layer_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def layer_chain_root_to_tip(layer_id: str) -> list[str]:
@@ -66,10 +70,10 @@ def layer_chain_root_to_tip(layer_id: str) -> list[str]:
     guard = 0
     while cur and _LAYER_ID_RE.match(cur) and guard < 10_000:
         guard += 1
-        chain_tip_to_root.append(cur)
         meta = read_layer_meta(cur)
         if meta is None:
             break
+        chain_tip_to_root.append(cur)
         if meta.kind == "clone":
             break
         cur = meta.parent_layer_id

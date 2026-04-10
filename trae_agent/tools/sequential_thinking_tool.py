@@ -38,7 +38,7 @@ class SequentialThinkingTool(Tool):
 
     @override
     def get_name(self) -> str:
-        return "sequentialthinking"
+        return "sequential_thinking"
 
     @override
     def get_description(self) -> str:

@@ -8,18 +8,19 @@ import logging
 import logging.handlers
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from starlette.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
+from . import task_api_bootstrap
 from .auth import AuthDep
 from .git_clone import (
     clear_clone_layer_log,
@@ -27,6 +28,8 @@ from .git_clone import (
     get_clone_layer_log_text,
 )
 from .hub import hub
+from .job_trajectory import load_agent_steps_for_job
+from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .layer_fs import (
     any_layer_has_git_repo,
     infer_layer_parent_from_workspace,
@@ -41,16 +44,22 @@ from .layer_git import (
     diff_layer_worktree_vs_parent,
     git_ahead_of_upstream,
     git_worktree_dirty,
-    list_branches as list_layer_git_branches,
     list_layer_changes_vs_parent,
     push_layer_worktree,
 )
-from .job_trajectory import load_agent_steps_for_layer
-from .jobs import JobRecord, job_layer_git_destructive_locked, store
-from .online_project_view import get_online_project_active_info, set_online_project_tip
-from .paths import config_file_path, layers_root, logs_dir, service_root
-from . import task_api_bootstrap
+from .layer_git import (
+    list_branches as list_layer_git_branches,
+)
 from .layer_graph_saas_push import run_layer_graph_saas_push_loop
+from .online_project_view import get_online_project_active_info, set_online_project_tip
+from .paths import (
+    config_file_path,
+    job_events_dir,
+    job_events_file,
+    layers_root,
+    logs_dir,
+    service_root,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,10 +107,8 @@ async def _lifespan(_app: FastAPI):
     finally:
         if _layer_graph_task is not None:
             _layer_graph_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await _layer_graph_task
-            except asyncio.CancelledError:
-                pass
 
 
 app = FastAPI(title="Trae Online Service", version="1.0.0", lifespan=_lifespan)
@@ -290,7 +297,10 @@ async def ui_page(access_token: str) -> HTMLResponse:
 
 
 @app.post("/api/config")
-async def push_config(_: AuthDep, file: UploadFile = File(...)) -> dict[str, str]:
+async def push_config(
+    _: AuthDep,
+    file: UploadFile = File(...),  # noqa: B008
+) -> dict[str, str]:
     """使用 multipart 表单字段 `file` 上传 YAML。"""
     data = await file.read()
     if not data:
@@ -329,6 +339,7 @@ async def get_config(_: AuthDep) -> dict[str, Any]:
 @app.post("/api/repos/clone")
 async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
     """在新建可写层目录中执行 ``git clone``（需系统已安装 git）。"""
+
     async def _publish(ev: dict[str, Any]) -> None:
         await hub.publish(ev)
 
@@ -370,11 +381,7 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
         }
     )
     try:
-        out_trim = (
-            out
-            if len(out) <= 120_000
-            else out[-120_000:] + "\n…(truncated)\n"
-        )
+        out_trim = out if len(out) <= 120_000 else out[-120_000:] + "\n…(truncated)\n"
         await store.register_clone_layer_job(
             layer_id,
             command=_git_clone_command_label(body.url, body.branch),
@@ -451,14 +458,67 @@ async def get_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     return _job_to_api_dict(rec)
 
 
+@app.get("/api/jobs/{job_id}/events")
+async def get_job_events(
+    _: AuthDep,
+    job_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """按行偏移读取任务结构化 JSONL 事件。"""
+    rec = store.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
+    p = job_events_file(job_id)
+    d = job_events_dir() / str(job_id)
+    events: list[dict[str, Any]] = []
+    if d.is_dir():
+        files = sorted(d.glob("step_*.json"))
+        total = len(files)
+        end = min(total, offset + limit)
+        for fp in files[offset:end]:
+            try:
+                row = json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(row, dict):
+                    events.append(row)
+            except (OSError, json.JSONDecodeError):
+                continue
+    elif p.is_file():
+        # 兼容旧版 JSONL
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"read job events failed: {e}") from e
+        total = len(lines)
+        end = min(total, offset + limit)
+        for line in lines[offset:end]:
+            try:
+                row = json.loads(line)
+                if isinstance(row, dict):
+                    events.append(row)
+            except json.JSONDecodeError:
+                continue
+    else:
+        total = 0
+        end = offset
+    return {
+        "job_id": job_id,
+        "events": events,
+        "offset": offset,
+        "next_offset": end,
+        "total": total,
+        "truncated": end < total,
+    }
+
+
 @app.get("/api/jobs/{job_id}/steps")
 async def job_agent_steps(_: AuthDep, job_id: str) -> dict[str, Any]:
-    """从任务可写层 `.trajectories/trajectory_*.json` 读取最新轨迹中的 ``agent_steps``。"""
+    """优先从该 job 的 ``.trae_agent_json/{job_id}`` 读取步骤；否则回退到层目录最新 ``.trajectories``。"""
     rec = store.get(job_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        payload = load_agent_steps_for_layer(rec.layer_path)
+        payload = load_agent_steps_for_job(rec.layer_path, job_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"job_id": job_id, "layer_id": rec.layer_id, **payload}
@@ -693,7 +753,9 @@ def _layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
 
 
 def _resolved_parent_layer_id(layer_id: str, known_ids: set[str], jobs: list[Any]) -> str | None:
-    p = infer_layer_parent_from_workspace(str(layer_id)) or _layer_parent_from_jobs(str(layer_id), jobs)
+    p = infer_layer_parent_from_workspace(str(layer_id)) or _layer_parent_from_jobs(
+        str(layer_id), jobs
+    )
     if p and p in known_ids:
         return p
     return None
@@ -745,9 +807,7 @@ async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
         with_git.append((item, lid_s))
 
     if with_git:
-        meta_list = await asyncio.gather(
-            *(_layer_git_meta(lid_s) for _item, lid_s in with_git)
-        )
+        meta_list = await asyncio.gather(*(_layer_git_meta(lid_s) for _item, lid_s in with_git))
         for (item, _lid_s), (dirty, remote) in zip(with_git, meta_list, strict=True):
             item["git_worktree_dirty"] = dirty
             item["git_remote"] = remote
@@ -796,9 +856,7 @@ async def api_layer_enqueue(_: AuthDep, layer_id: str, body: LayerQueueBody) -> 
     """向该层当前排队/运行中的任务追加待执行指令（队列在任务完成时消费）。"""
     lid = _valid_layer_id_param(layer_id)
     try:
-        return await store.enqueue_layer_command(
-            lid, body.command, command_kind=body.command_kind
-        )
+        return await store.enqueue_layer_command(lid, body.command, command_kind=body.command_kind)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -807,7 +865,9 @@ async def api_layer_enqueue(_: AuthDep, layer_id: str, body: LayerQueueBody) -> 
 async def api_list_layer_files(
     _: AuthDep,
     layer_id: str,
-    prefix: str | None = Query(default=None, description="可选：相对路径前缀过滤（只支持前缀，不支持 .. / 绝对路径）"),
+    prefix: str | None = Query(
+        default=None, description="可选：相对路径前缀过滤（只支持前缀，不支持 .. / 绝对路径）"
+    ),
     max_files: int = Query(default=2000, ge=1, le=5000),
 ) -> dict[str, Any]:
     return list_layer_files(layer_id=layer_id, prefix=prefix, max_files=max_files)
@@ -834,7 +894,9 @@ async def api_list_layer_children(
     _: AuthDep,
     layer_id: str,
     dir: str = Query(default="", description="目录（相对层内路径）；空表示根目录"),
-    prefix: str | None = Query(default=None, description="前缀过滤（相对路径，支持只看 src/ 之类）"),
+    prefix: str | None = Query(
+        default=None, description="前缀过滤（相对路径，支持只看 src/ 之类）"
+    ),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=2000),
 ) -> dict[str, Any]:

@@ -66,7 +66,7 @@ def parse_tool_response(answer: LLMResponse, finish_reason: str, sandbox_session
             tool_call_id = tool_call.call_id
             tool_name = tool_call.name
 
-            if tool_name == "str_replace_based_edit_tool":
+            if tool_name == "edit_file":
                 cmd = "cd /home/swe-bench/tools/ && /home/swe-bench/py312/bin/python3 execute_str_replace_editor.py"
             elif tool_name == "bash":
                 cmd = (
@@ -75,12 +75,12 @@ def parse_tool_response(answer: LLMResponse, finish_reason: str, sandbox_session
             else:
                 tool_message = LLMMessage(
                     role="user",
-                    content="The tool name you provided is not in the list. Please choose one from `str_replace_editor` or `bash`!",
+                    content="The tool name you provided is not in the list. Please choose one from `edit_file` or `bash`!",
                     tool_result=ToolResult(
                         call_id=tool_call_id,
                         name=tool_name,
                         success=False,
-                        error="The tool name you provided is not in the list. Please choose one from `str_replace_editor` or `bash`!",
+                        error="The tool name you provided is not in the list. Please choose one from `edit_file` or `bash`!",
                     ),
                 )
                 result.append(tool_message)
@@ -173,7 +173,7 @@ class SelectorAgent:
         self.issue_description: str = issue_description
         self.tools: list[Tool] = [
             tools_registry[tool_name](model_provider=llm_config.model_provider.provider)
-            for tool_name in ["bash", "str_replace_based_edit_tool"]
+            for tool_name in ["bash", "edit_file"]
         ]
         self.llm_client = LLMClient(llm_config)
         self.trajectory_recorder: TrajectoryRecorder = TrajectoryRecorder(trajectory_file_name)

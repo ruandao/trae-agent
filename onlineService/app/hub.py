@@ -1,6 +1,7 @@
 """In-process SSE event fan-out."""
 
 import asyncio
+import contextlib
 from typing import Any
 
 
@@ -27,11 +28,9 @@ class EventHub:
                     _ = q.get_nowait()
                 except asyncio.QueueEmpty:
                     continue
-                try:
+                # 极端并发下若再次满，放弃本次写入。
+                with contextlib.suppress(asyncio.QueueFull):
                     q.put_nowait(event)
-                except asyncio.QueueFull:
-                    # 极端并发下若再次满，放弃本次写入。
-                    pass
 
 
 hub = EventHub()

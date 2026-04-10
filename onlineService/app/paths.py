@@ -20,10 +20,7 @@ def state_root() -> Path:
     可用环境变量 ``ONLINE_PROJECT_STATE_ROOT`` 覆盖整棵状态树位置。
     """
     raw = os.environ.get("ONLINE_PROJECT_STATE_ROOT")
-    if raw:
-        root = Path(raw)
-    else:
-        root = repo_root() / "onlineProject_state"
+    root = Path(raw) if raw else repo_root() / "onlineProject_state"
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
 
@@ -61,6 +58,23 @@ def commands_log_path() -> Path:
     return runtime_dir() / "commands.json"
 
 
+def job_events_dir() -> Path:
+    """任务结构化事件目录（JSONL），按 job_id 分文件。"""
+    d = runtime_dir() / "job_events"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def job_events_file(job_id: str) -> Path:
+    return job_events_dir() / f"{job_id}.jsonl"
+
+
+def job_events_job_dir(job_id: str) -> Path:
+    d = job_events_dir() / str(job_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def online_project_root() -> Path:
     """仓库根下对外展示的联合视图路径（默认 ``<REPO_ROOT>/onlineProject``）。"""
     return Path(os.environ.get("ONLINE_PROJECT_ROOT", repo_root() / "onlineProject"))
@@ -72,10 +86,7 @@ def layers_root() -> Path:
     可选环境变量 ``ONLINE_PROJECT_LAYERS`` 覆盖可写层根目录。
     """
     raw = os.environ.get("ONLINE_PROJECT_LAYERS")
-    if raw:
-        root = Path(raw)
-    else:
-        root = state_root() / "layers"
+    root = Path(raw) if raw else state_root() / "layers"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

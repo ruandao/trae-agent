@@ -100,8 +100,8 @@ class DockerToolExecutor:
                     raise ValueError("Tool 'bash' requires a non-empty 'command' string argument.")
                 command_to_run = command_value
 
-            # --- Rule2 : Handling str_replace_based_edit_tool ---
-            elif tool_call.name == "str_replace_based_edit_tool":
+            # --- Rule2 : Handling edit_file ---
+            elif tool_call.name == "edit_file":
                 sub_command = processed_args.get("command")
                 if not sub_command:
                     raise ValueError("Edit tool called without a 'command' (sub-command).")
@@ -123,8 +123,8 @@ class DockerToolExecutor:
                         cmd_parts.append(f"--{key} '{str(value)}'")
 
                 command_to_run = " ".join(cmd_parts)
-            # --- Rule 3: Handling json_edit_tool ---
-            elif tool_call.name == "json_edit_tool":
+            # --- Rule 3: Handling edit_json ---
+            elif tool_call.name == "edit_json":
                 executable_path = f"{self._docker_manager.CONTAINER_TOOLS_PATH}/json_edit_tool"
                 cmd_parts = [executable_path]
                 for key, value in processed_args.items():

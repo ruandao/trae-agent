@@ -27,11 +27,11 @@ __all__ = [
 
 tools_registry: dict[str, type[Tool]] = {
     "bash": BashTool,
-    "str_replace_based_edit_tool": TextEditorTool,
-    "json_edit_tool": JSONEditTool,
-    "sequentialthinking": SequentialThinkingTool,
-    "task_done": TaskDoneTool,
-    "ckg": CKGTool,
+    "edit_file": TextEditorTool,
+    "edit_json": JSONEditTool,
+    "sequential_thinking": SequentialThinkingTool,
+    "complete_task": TaskDoneTool,
+    "code_knowledge_search": CKGTool,
 }
 
 

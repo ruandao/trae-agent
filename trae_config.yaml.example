@@ -8,6 +8,22 @@
 #   glm-5                 -> z-ai/glm-5
 #   MiniMax-M2.5          -> minimax/minimax-m2.5
 #   kimi-k2.5             -> moonshotai/kimi-k2.5
+#
+# --- 内置工具名（与代码 trae_agent.tools.tools_registry 一致；onlineService 的 service_config.yaml 同结构）---
+# 合法 id：bash, edit_file, edit_json, sequential_thinking, complete_task, code_knowledge_search
+# 配置方式二选一（不要同时写 tools 与 tools_blacklist）：
+#   - 省略二者：默认启用全部内置工具
+#   - tools：白名单，仅列出要启用的工具
+#   - tools_blacklist：黑名单，列出要禁用的工具
+#
+# 示例（白名单，按需取消注释并删减）：
+#     tools:
+#         - bash
+#         - edit_file
+#         - edit_json
+#         - sequential_thinking
+#         - complete_task
+#         - code_knowledge_search
 
 agents:
     trae_agent:
@@ -15,9 +31,9 @@ agents:
         # 在下方 models 中任选其一，将名称填到这里
         model: trae_agent_model
         max_steps: 200
-        # 内置工具为黑名单模式：列出要从 registry 中排除的名称；默认 [] 表示启用全部内置工具
+        # 内置工具：见文件顶部说明。默认 [] 表示启用全部内置工具
         # tools_blacklist:
-        #     - ckg
+        #     - code_knowledge_search
 allow_mcp_servers:
     - playwright
 mcp_servers:

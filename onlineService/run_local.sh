@@ -15,9 +15,22 @@ if [[ "${TRAE_ONLINE_DOCKER:-0}" == "1" || "${TRAE_ONLINE_DOCKER:-0}" == "true" 
   export REPO_ROOT="${REPO_ROOT:-$ROOT}"
   export TRAE_VENV="${TRAE_VENV:-$ROOT/.venv}"
   export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+  export BusinessApiEndPoint="${BusinessApiEndPoint:-${BUSINESS_API_ENDPOINT:-http://127.0.0.1:${PORT}/api}}"
   _local_no_proxy="localhost,127.0.0.1,::1"
+  # 容器内访问宿主机请用 IP；由 Docker host-gateway 解析出数值地址供 DOCKER_HOST_GATEWAY_IP / 配置替换
+  _trae_gw_ip="${DOCKER_HOST_GATEWAY_IP:-}"
+  if [[ -z "${_trae_gw_ip}" ]] && command -v docker >/dev/null 2>&1; then
+    _trae_gw_ip="$(docker run --rm --add-host=_trae_gw:host-gateway alpine:3.19 getent hosts _trae_gw 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if [[ -n "${_trae_gw_ip}" ]]; then
+    _local_no_proxy="${_local_no_proxy},${_trae_gw_ip}"
+  fi
   export NO_PROXY="${_local_no_proxy}${NO_PROXY:+,${NO_PROXY}}"
   export no_proxy="${_local_no_proxy}${no_proxy:+,${no_proxy}}"
+  _docker_extra_env=()
+  if [[ -n "${_trae_gw_ip}" ]]; then
+    _docker_extra_env+=(-e "DOCKER_HOST_GATEWAY_IP=${_trae_gw_ip}")
+  fi
   exec docker run --rm -i \
     -p "${PORT}:${PORT}" \
     -v "${ROOT}:${ROOT}" \
@@ -25,8 +38,10 @@ if [[ "${TRAE_ONLINE_DOCKER:-0}" == "1" || "${TRAE_ONLINE_DOCKER:-0}" == "true" 
     -e "TRAE_VENV=${ROOT}/.venv" \
     -e "PYTHONPATH=${PYTHONPATH}" \
     -e "ACCESS_TOKEN=${ACCESS_TOKEN}" \
+    -e "BusinessApiEndPoint=${BusinessApiEndPoint}" \
     -e "NO_PROXY=${NO_PROXY:-}" \
     -e "no_proxy=${no_proxy:-}" \
+    "${_docker_extra_env[@]}" \
     -w "${ROOT}/onlineService" \
     "${IMAGE}" \
     "${ROOT}/.venv/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"

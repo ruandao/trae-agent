@@ -67,7 +67,7 @@ class BaseAgent(ABC):
             self._tool_caller = DockerToolExecutor(
                 original_executor=original_tool_executor,
                 docker_manager=self.docker_manager,
-                docker_tools=["bash", "str_replace_based_edit_tool", "json_edit_tool"],
+                docker_tools=["bash", "edit_file", "edit_json"],
                 host_workspace_dir=docker_config.get("workspace_dir"),
                 container_workspace_dir=self.docker_manager.container_workspace,
             )

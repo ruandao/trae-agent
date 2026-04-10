@@ -9,10 +9,19 @@ import shutil
 import threading
 from pathlib import Path
 
-from .layer_meta import is_overlay_v1_layer, layer_chain_root_to_tip, read_layer_meta
+from .layer_meta import layer_chain_root_to_tip, read_layer_meta
 from .layers import layer_path
-from .overlay_diff import compute_diff_between_trees, materialize_merged_chain, prune_empty_dirs_under
-from .overlay_kernel import overlay_mount, overlay_umount, safe_rmtree_upper_work
+from .overlay_diff import (
+    compute_diff_between_trees,
+    materialize_merged_chain,
+    prune_empty_dirs_under,
+)
+from .overlay_kernel import (
+    is_merged_mountpoint,
+    overlay_mount,
+    overlay_umount,
+    safe_rmtree_upper_work,
+)
 from .paths import runtime_dir
 
 log = logging.getLogger(__name__)
@@ -26,6 +35,7 @@ MERGED = "merged"
 _darwin_parent_merged: dict[str, Path] = {}
 _materialize_locks: dict[str, threading.Lock] = {}
 _materialize_locks_guard = threading.Lock()
+_job_overlay_mode: dict[str, str] = {}
 
 
 def _materialize_lock_for_layer(layer_id: str) -> threading.Lock:
@@ -45,21 +55,36 @@ def use_kernel_overlay() -> bool:
 
 
 def storage_path_for_layer(layer_id: str) -> Path:
+    root = layer_path(layer_id)
     meta = read_layer_meta(layer_id)
     if not meta:
-        return layer_path(layer_id)
+        b = root / BASE
+        d = root / DIFF
+        if b.is_dir():
+            return b
+        if d.is_dir():
+            return d
+        return root
     if meta.kind == "clone":
-        return layer_path(layer_id) / BASE
-    return layer_path(layer_id) / DIFF
+        return root / BASE
+    return root / DIFF
 
 
 def lower_paths_parent_stack(parent_layer_id: str) -> list[Path]:
     chain = layer_chain_root_to_tip(parent_layer_id)
+    if not chain:
+        # 兼容旧层（无 layer_meta.json）：直接把父层自身作为 lower。
+        p = storage_path_for_layer(parent_layer_id)
+        return [p] if p.exists() else []
     return [storage_path_for_layer(lid) for lid in chain]
 
 
 def lower_paths_full_tip(layer_id: str) -> list[Path]:
     chain = layer_chain_root_to_tip(layer_id)
+    if not chain:
+        # 兼容旧层（无 layer_meta.json）：直接把该层自身作为完整视图来源。
+        p = storage_path_for_layer(layer_id)
+        return [p] if p.exists() else []
     return [storage_path_for_layer(lid) for lid in chain]
 
 
@@ -89,14 +114,23 @@ def prepare_job_run(layer_id: str, *, reuse_upper: bool = False) -> Path:
     lowers_top_first = list(reversed(lowers))
 
     if use_kernel_overlay():
-        overlay_umount(merged)
-        if not reuse_upper:
-            safe_rmtree_upper_work(lp, UPPER, WORK)
-            upper.mkdir(parents=True, exist_ok=True)
-            work.mkdir(parents=True, exist_ok=True)
-        merged.mkdir(parents=True, exist_ok=True)
-        overlay_mount(lowers_top_first, upper, work, merged)
-        return merged.resolve()
+        try:
+            overlay_umount(merged)
+            if not reuse_upper:
+                safe_rmtree_upper_work(lp, UPPER, WORK)
+                upper.mkdir(parents=True, exist_ok=True)
+                work.mkdir(parents=True, exist_ok=True)
+            if not is_merged_mountpoint(merged):
+                shutil.rmtree(merged, ignore_errors=True)
+            merged.mkdir(parents=True, exist_ok=True)
+            overlay_mount(lowers_top_first, upper, work, merged)
+            _job_overlay_mode[layer_id] = "kernel"
+            return merged.resolve()
+        except Exception:
+            # 某些容器/宿主环境不支持 overlay 嵌套挂载，失败时自动回退到用户态物化。
+            log.exception(
+                "kernel overlay unavailable for %s; fallback to materialized mode", layer_id
+            )
 
     # 用户态：merged 为完整可写副本；中断「继续」时复用已有 merged
     if reuse_upper and merged.is_dir():
@@ -107,6 +141,7 @@ def prepare_job_run(layer_id: str, *, reuse_upper: bool = False) -> Path:
         except StopIteration:
             pass
 
+    _job_overlay_mode[layer_id] = "materialized"
     mat = runtime_dir() / "materialized" / f"parent_stack_{layer_id}"
     if mat.exists():
         shutil.rmtree(mat)
@@ -138,7 +173,8 @@ def finalize_job_overlay_finished(layer_id: str) -> None:
     work = lp / WORK
     diff = lp / DIFF
 
-    if use_kernel_overlay():
+    mode = _job_overlay_mode.pop(layer_id, "kernel" if use_kernel_overlay() else "materialized")
+    if mode == "kernel":
         overlay_umount(merged)
         shutil.rmtree(work, ignore_errors=True)
         if diff.exists():
@@ -168,7 +204,8 @@ def finalize_job_overlay_finished(layer_id: str) -> None:
 
 def interrupt_job_overlay(layer_id: str) -> None:
     """中断：仅卸载内核 overlay；保留 upper/merged 供继续执行。"""
-    if not use_kernel_overlay():
+    mode = _job_overlay_mode.get(layer_id, "kernel" if use_kernel_overlay() else "materialized")
+    if mode != "kernel":
         return
     lp = layer_path(layer_id)
     merged = lp / MERGED

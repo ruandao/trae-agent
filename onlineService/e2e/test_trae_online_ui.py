@@ -18,7 +18,10 @@ Playwright 核验：http://127.0.0.1:8765/ui/dev-local-token
 
 from __future__ import annotations
 
+import json
 import os
+import re
+from pathlib import Path
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -26,9 +29,7 @@ from playwright.sync_api import Page, expect
 BASE_URL = os.environ.get("TRAE_UI_BASE", "http://127.0.0.1:8765")
 UI_PATH = os.environ.get("TRAE_UI_PATH", "/ui/dev-local-token")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "dev-local-token")
-TEST_REPO = os.environ.get(
-    "TRAE_E2E_REPO", "https://github.com/ruandao/somanyad.git"
-)
+TEST_REPO = os.environ.get("TRAE_E2E_REPO", "https://github.com/ruandao/somanyad.git")
 
 
 def _ui_url() -> str:
@@ -38,9 +39,7 @@ def _ui_url() -> str:
 def click_reset(page: Page) -> None:
     """点击「重置」并接受 confirm 对话框。"""
     page.once("dialog", lambda d: d.accept())
-    with page.expect_response(
-        lambda r: r.request.method == "POST" and "/api/jobs/reset" in r.url
-    ):
+    with page.expect_response(lambda r: r.request.method == "POST" and "/api/jobs/reset" in r.url):
         page.locator("#btnReset").click()
 
 
@@ -54,6 +53,16 @@ def reset_before_each_test(request: pytest.FixtureRequest, page: Page) -> None:
     page.locator("#btnReset").wait_for(state="visible", timeout=15_000)
     click_reset(page)
     page.locator("#btnClone").wait_for(state="visible", timeout=10_000)
+
+
+@pytest.mark.skip_reset
+def test_localhost_hostname_ui_page_loads(page: Page) -> None:
+    """run_local 默认端口下，浏览器使用 http://localhost（非仅 127.0.0.1）应能打开 /ui/<token>。"""
+    port = os.environ.get("PORT", "8765")
+    url = f"http://localhost:{port}/ui/{ACCESS_TOKEN}"
+    page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    assert "Trae" in (page.title() or "")
 
 
 @pytest.mark.skip_reset
@@ -249,12 +258,7 @@ def test_clone_sets_online_project_symlink_active_tip(page: Page) -> None:
     tip = res.get("active_tip_layer_id")
     assert isinstance(tip, str) and len(tip) > 8
     rp = res.get("resolved_path") or ""
-    assert (
-        "onlineService" in rp
-        or "layers" in rp
-        or "materialized" in rp
-        or "runtime" in rp
-    )
+    assert "onlineService" in rp or "layers" in rp or "materialized" in rp or "runtime" in rp
 
 
 def test_redo_button(page: Page) -> None:
@@ -299,9 +303,7 @@ def test_redo_button(page: Page) -> None:
         timeout=120_000,
     )
 
-    with page.expect_response(
-        lambda r: r.request.method == "POST" and "/interrupt" in r.url
-    ):
+    with page.expect_response(lambda r: r.request.method == "POST" and "/interrupt" in r.url):
         card.locator("[data-interrupt]").click()
     expect(card.locator(".status.interrupted")).to_be_visible(timeout=120_000)
 
@@ -313,9 +315,7 @@ def test_redo_button(page: Page) -> None:
         redo.click()
     assert redo_info.value.ok, redo_info.value.text()
 
-    expect(
-        card.locator(".status.pending, .status.running")
-    ).to_be_visible(timeout=60_000)
+    expect(card.locator(".status.pending, .status.running")).to_be_visible(timeout=60_000)
 
 
 @pytest.mark.skip_reset
@@ -411,3 +411,47 @@ def test_ztree_layer_nodes_unique_and_match_deduped_api(page: Page) -> None:
     if result.get("skip"):
         pytest.skip(str(result.get("reason", "skip")))
     assert result.get("ok") is True, result
+
+
+_STEP_DIR_RE = re.compile(r"^step_(\d+)$")
+
+
+@pytest.mark.skip_reset
+def test_overlay_job_steps_on_disk_appear_in_task_card(page: Page) -> None:
+    """Overlay 结束后 agent 步骤在 diff/.trae_agent_json；任务卡应加载到与磁盘 step 目录数一致的 UI。"""
+    repo_root = Path(__file__).resolve().parents[2]
+    state_path = repo_root / "onlineProject_state" / "runtime" / "jobs_state.json"
+    if not state_path.is_file():
+        pytest.skip("本地无 onlineProject_state/runtime/jobs_state.json")
+    jobs = (json.loads(state_path.read_text(encoding="utf-8")).get("jobs")) or []
+    sample_job_id = os.environ.get(
+        "TRAE_E2E_FIXTURE_JOB_ID", "fc51b93c-a499-419f-a064-685be1857b45"
+    ).strip()
+    target = next((j for j in jobs if j.get("id") == sample_job_id), None)
+    if not target:
+        pytest.skip(
+            f"jobs_state 中无 job id {sample_job_id}（可设 TRAE_E2E_FIXTURE_JOB_ID 或先跑过 overlay 任务）"
+        )
+    layer_path = Path(str(target.get("layer_path") or ""))
+    diff_agent_root = layer_path / "diff" / ".trae_agent_json" / sample_job_id
+    if not diff_agent_root.is_dir():
+        pytest.skip(f"非本场景：缺少 {diff_agent_root}")
+    step_dirs = [p for p in diff_agent_root.iterdir() if p.is_dir() and _STEP_DIR_RE.match(p.name)]
+    min_steps = len(step_dirs)
+    assert min_steps >= 1
+
+    page.goto(_ui_url(), wait_until="domcontentloaded")
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    card = page.locator(f'.job-card[data-id="{sample_job_id}"]')
+    card.wait_for(state="visible", timeout=15_000)
+    page.wait_for_function(
+        """(jobId) => {
+          const box = document.querySelector('.job-steps[data-job-id="' + jobId + '"]');
+          if (!box) return false;
+          return box.querySelectorAll('details.job-step-accordion').length >= 1;
+        }""",
+        arg=sample_job_id,
+        timeout=25_000,
+    )
+    ui_count = card.locator("details.job-step-accordion").count()
+    assert ui_count >= min_steps

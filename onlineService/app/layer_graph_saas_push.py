@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -91,10 +92,8 @@ async def run_layer_graph_saas_push_loop(build_snapshot: Any) -> None:
     interval = 4.0
     raw = (os.environ.get("LAYER_GRAPH_SAAS_PUSH_INTERVAL_SEC") or "").strip()
     if raw:
-        try:
+        with contextlib.suppress(ValueError):
             interval = max(2.0, float(raw))
-        except ValueError:
-            pass
     while True:
         await asyncio.sleep(interval)
         await push_layer_graph_snapshot_if_changed(

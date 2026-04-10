@@ -230,7 +230,7 @@ The trajectory file is a JSON document with the following structure:
         "tool_calls": [
           {
             "call_id": "call_123",
-            "name": "str_replace_based_edit_tool",
+            "name": "edit_file",
             "arguments": {
               "command": "create",
               "path": "hello.py",
@@ -239,7 +239,7 @@ The trajectory file is a JSON document with the following structure:
           }
         ]
       },
-      "tools_available": ["str_replace_based_edit_tool", "bash", "task_done"]
+      "tools_available": ["edit_file", "bash", "complete_task"]
     }
   ],
   "agent_steps": [
@@ -252,7 +252,7 @@ The trajectory file is a JSON document with the following structure:
       "tool_calls": [
         {
           "call_id": "call_123",
-          "name": "str_replace_based_edit_tool",
+          "name": "edit_file",
           "arguments": {...}
         }
       ],

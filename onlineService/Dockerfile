@@ -9,7 +9,7 @@ COPY --from=python:3.12-slim-bullseye /usr/local /usr/local
 RUN ldconfig 2>/dev/null || true
 
 WORKDIR /app
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml README.md trae_config.yaml.example /app/
 COPY trae_agent /app/trae_agent
 
 # 一次安装 trae-agent + online 依赖，避免第二次 pip 再拉 PyPI（易遇 SSL 截断 / JSONDecodeError）
@@ -32,6 +32,7 @@ ENV REPO_ROOT=/app
 ENV TRAE_VENV=/app/.venv
 ARG ACCESS_TOKEN=""
 ENV ACCESS_TOKEN="${ACCESS_TOKEN}"
+# 访问宿主机可用 host.docker.internal（Docker Desktop）或数值 IP；若注入 DOCKER_HOST_GATEWAY_IP，应用会将 URL 中的 host.docker.internal 替换为该 IP。
 # 任务云容器换票与功能参数（见 machine_container.md）；留空则跳过启动引导，仅本地 ACCESS_TOKEN 生效
 ARG TaskApiEndPoint=""
 ENV TaskApiEndPoint="${TaskApiEndPoint}"

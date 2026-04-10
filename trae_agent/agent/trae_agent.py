@@ -18,6 +18,7 @@ from trae_agent.utils.config import MCPServerConfig, TraeAgentConfig
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
 from trae_agent.utils.mcp_client import MCPClient
 
+
 class TraeAgent(BaseAgent):
     """Trae Agent specialized for software engineering tasks."""
 
@@ -219,7 +220,7 @@ class TraeAgent(BaseAgent):
         """Check if the LLM indicates that the task is completed."""
         if llm_response.tool_calls is None:
             return False
-        return any(tool_call.name == "task_done" for tool_call in llm_response.tool_calls)
+        return any(tool_call.name == "complete_task" for tool_call in llm_response.tool_calls)
 
     @override
     def _is_task_completed(self, llm_response: LLMResponse) -> bool:

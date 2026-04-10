@@ -102,6 +102,10 @@ select = [
     "I"
 ]
 
+# 容器 userdata 注入的 env 名与云平台约定一致（camelCase），不可改为全大写
+[tool.ruff.lint.per-file-ignores]
+"onlineService/app/task_api_bootstrap.py" = ["SIM112"]
+
 [dependency-groups]
 dev = [
     "types-pyyaml>=6.0.12.20250516",

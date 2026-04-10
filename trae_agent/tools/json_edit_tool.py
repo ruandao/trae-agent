@@ -26,7 +26,7 @@ class JSONEditTool(Tool):
 
     @override
     def get_name(self) -> str:
-        return "json_edit_tool"
+        return "edit_json"
 
     @override
     def get_description(self) -> str:

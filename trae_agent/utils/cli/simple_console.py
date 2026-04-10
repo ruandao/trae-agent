@@ -1,31 +1,38 @@
 # Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
-"""Simple CLI Console implementation."""
+"""Simple CLI Console implementation — 结构化输出写入文件系统（按步分子目录 + 分层 JSON 文件）。"""
+
+from __future__ import annotations
 
 import asyncio
+import json
 import os
-import shutil
+import re
 import sys
-from typing import override
+import time
+from dataclasses import asdict, is_dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, override
 
 from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.table import Table
 
 from trae_agent.agent.agent_basics import AgentExecution, AgentState, AgentStep, AgentStepState
 from trae_agent.utils.cli.cli_console import (
-    AGENT_STATE_INFO,
     CLIConsole,
     ConsoleMode,
     ConsoleStep,
-    generate_agent_step_table,
 )
 from trae_agent.utils.config import LakeviewConfig
 
 # 与 onlineService 子进程默认一致：Rich 无「无限宽」，用大整数近似不折行。
 _WIDE_CONSOLE_FALLBACK = 999_999
+
+
+def _console_mirror_enabled() -> bool:
+    raw = (os.environ.get("TRAE_AGENT_JSON_CONSOLE_MIRROR") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _simple_console_width() -> int | None:
@@ -45,40 +52,153 @@ def _simple_console_width() -> int | None:
     return _WIDE_CONSOLE_FALLBACK
 
 
+def _json_friendly(obj: Any) -> Any:
+    """将 dataclass / Enum / 容器递归转为 JSON 可序列化结构。"""
+    if obj is None:
+        return None
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_friendly(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_friendly(x) for x in obj]
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return _json_friendly(asdict(obj))
+    return str(obj)
+
+
+def _safe_tool_file_name(name: str, max_len: int = 48) -> str:
+    s = re.sub(r"[^\w\-.]+", "_", name.strip() or "tool", flags=re.UNICODE)
+    return (s[:max_len] if s else "tool").rstrip("_") or "tool"
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    path.write_text(text, encoding="utf-8")
+
+
 class SimpleCLIConsole(CLIConsole):
-    """Simple text-based CLI console that prints agent execution trace."""
+    """在运行目录下写入分层 JSON 文件；可选镜像到 stdout（TRAE_AGENT_JSON_CONSOLE_MIRROR）。"""
 
     def __init__(
         self, mode: ConsoleMode = ConsoleMode.RUN, lakeview_config: LakeviewConfig | None = None
     ):
-        """Initialize the simple CLI console.
-
-        Args:
-            config: Configuration object containing lakeview and other settings
-            mode: Console operation mode
-        """
         super().__init__(mode, lakeview_config)
         cw = _simple_console_width()
         self.console: Console = Console(width=cw) if cw is not None else Console()
+        self._file_log_root: Path | None = None
+
+    def _resolve_file_log_root(self) -> Path:
+        if self._file_log_root is not None:
+            return self._file_log_root
+        explicit = (os.environ.get("TRAE_AGENT_JSON_OUTPUT_DIR") or "").strip()
+        if explicit:
+            root = Path(explicit).expanduser().resolve()
+        else:
+            base = Path(os.getcwd()).resolve()
+            root = base / ".trae_agent_file_log" / f"run_{os.getpid()}_{time.time_ns()}"
+        root.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            root / "run_meta.json",
+            {
+                "type": "run_meta",
+                "path": str(root),
+                "pid": os.getpid(),
+                "cwd": str(Path.cwd().resolve()),
+                "created_at": time.time(),
+            },
+        )
+        self._file_log_root = root
+        return root
+
+    def _step_dir(self, step_number: int) -> Path:
+        return self._resolve_file_log_root() / f"step_{step_number:06d}"
+
+    def _maybe_mirror_stdout(self, payload: dict[str, Any]) -> None:
+        if not _console_mirror_enabled():
+            return
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        self.console.print(text, markup=False, highlight=False)
+
+    def _write_agent_step_tree(
+        self,
+        agent_step: AgentStep,
+        agent_execution: AgentExecution | None,
+    ) -> None:
+        """一步一目录：概要、全量快照、llm_response、tool_calls 子目录分层文件。"""
+        step_dir = self._step_dir(agent_step.step_number)
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        full_tree = _json_friendly(asdict(agent_step))
+        if not isinstance(full_tree, dict):
+            full_tree = {"value": full_tree}
+
+        llm_response = full_tree.pop("llm_response", None)
+        tool_calls = full_tree.pop("tool_calls", None)
+        tool_results = full_tree.pop("tool_results", None)
+
+        summary: dict[str, Any] = {"type": "agent_step", **full_tree}
+        if agent_execution and agent_execution.total_tokens:
+            summary["total_tokens_run"] = _json_friendly(asdict(agent_execution.total_tokens))
+
+        _write_json(step_dir / "agent_step.json", summary)
+        self._maybe_mirror_stdout(summary)
+
+        full_inner = _json_friendly(asdict(agent_step))
+        if not isinstance(full_inner, dict):
+            full_inner = {"data": full_inner}
+        full_payload: dict[str, Any] = {"type": "agent_step_full", **full_inner}
+        if agent_execution and agent_execution.total_tokens:
+            full_payload["total_tokens_run"] = _json_friendly(asdict(agent_execution.total_tokens))
+        _write_json(step_dir / "agent_step_full.json", full_payload)
+
+        if llm_response is not None:
+            lr_dir = step_dir / "llm_response"
+            lr_dir.mkdir(exist_ok=True)
+            _write_json(lr_dir / "body.json", llm_response)
+
+        if tool_calls:
+            tc_dir = step_dir / "tool_calls"
+            tc_dir.mkdir(exist_ok=True)
+            results_by_id: dict[Any, Any] = {}
+            if isinstance(tool_results, list):
+                for tr in tool_results:
+                    if isinstance(tr, dict):
+                        cid = tr.get("call_id")
+                        if cid is not None:
+                            results_by_id[cid] = tr
+            for i, call in enumerate(tool_calls):
+                if not isinstance(call, dict):
+                    call = {"raw": call}
+                cid = call.get("call_id")
+                name = _safe_tool_file_name(str(call.get("name") or "tool"))
+                fn = f"{i:03d}_{name}.json"
+                payload = {
+                    "type": "tool_invocation",
+                    "index": i,
+                    "call": call,
+                    "result": results_by_id.get(cid),
+                }
+                _write_json(tc_dir / fn, _json_friendly(payload))
 
     @override
     def update_status(
         self, agent_step: AgentStep | None = None, agent_execution: AgentExecution | None = None
     ):
-        """Update the console status with new agent step or execution info."""
         if agent_step:
             if agent_step.step_number not in self.console_step_history:
-                # update step history
                 self.console_step_history[agent_step.step_number] = ConsoleStep(agent_step)
 
             if (
                 agent_step.state in [AgentStepState.COMPLETED, AgentStepState.ERROR]
                 and not self.console_step_history[agent_step.step_number].agent_step_printed
             ):
-                self._print_step_update(agent_step, agent_execution)
+                self._write_agent_step_tree(agent_step, agent_execution)
                 self.console_step_history[agent_step.step_number].agent_step_printed = True
 
-                # If lakeview is enabled, generate lakeview panel in the background
                 if (
                     self.lake_view
                     and not self.console_step_history[
@@ -95,119 +215,75 @@ class SimpleCLIConsole(CLIConsole):
 
     @override
     async def start(self):
-        """Start the console - wait for completion and then print summary."""
         while self.agent_execution is None or (
             self.agent_execution.agent_state != AgentState.COMPLETED
             and self.agent_execution.agent_state != AgentState.ERROR
         ):
             await asyncio.sleep(1)
 
-        # Print lakeview summary if enabled
         if self.lake_view and self.agent_execution:
-            await self._print_lakeview_summary()
+            await self._write_lakeview_files()
 
-        # Print execution summary
         if self.agent_execution:
-            self._print_execution_summary()
+            self._write_execution_summary_file()
 
-    def _print_step_update(
-        self, agent_step: AgentStep, agent_execution: AgentExecution | None = None
-    ):
-        """Print a step update as it progresses."""
-
-        table = generate_agent_step_table(agent_step)
-
-        if agent_step.llm_usage:
-            table.add_row(
-                "Token Usage",
-                f"Input: {agent_step.llm_usage.input_tokens} Output: {agent_step.llm_usage.output_tokens}",
-            )
-
-        if agent_execution and agent_execution.total_tokens:
-            table.add_row(
-                "Total Tokens",
-                f"Input: {agent_execution.total_tokens.input_tokens} Output: {agent_execution.total_tokens.output_tokens}",
-            )
-
-        self.console.print(table)
-
-    async def _print_lakeview_summary(self):
-        """Print lakeview summary of all completed steps."""
-        self.console.print("\n" + "=" * 60)
-        self.console.print("[bold cyan]Lakeview Summary[/bold cyan]")
-        self.console.print("=" * 60)
+    async def _write_lakeview_files(self):
+        root = self._resolve_file_log_root()
+        _write_json(
+            root / "lakeview_summary.json",
+            {"type": "lakeview_summary", "steps": list(self.console_step_history.keys())},
+        )
+        self._maybe_mirror_stdout({"type": "lakeview_summary"})
 
         for step in self.console_step_history.values():
             if step.lake_view_panel_generator:
-                lake_view_panel = await step.lake_view_panel_generator
-                if lake_view_panel:
-                    self.console.print(lake_view_panel)
+                lake_view_step = await step.lake_view_panel_generator
+                if lake_view_step:
+                    payload = {
+                        "type": "lakeview_step",
+                        "step_number": step.agent_step.step_number,
+                        **_json_friendly(asdict(lake_view_step)),
+                    }
+                    _write_json(
+                        self._step_dir(step.agent_step.step_number) / "lakeview_step.json",
+                        payload,
+                    )
+                    self._maybe_mirror_stdout(payload)
 
-    def _print_execution_summary(self):
-        """Print the final execution summary."""
+    def _write_execution_summary_file(self):
         if not self.agent_execution:
             return
-
-        self.console.print("\n" + "=" * 60)
-        self.console.print("[bold green]Execution Summary[/bold green]")
-        self.console.print("=" * 60)
-
-        # Create summary table（不限制宽度，避免长任务描述被折行或省略号截断）
-        table = Table(show_header=False)
-        table.add_column("Metric", style="cyan", no_wrap=True)
-        table.add_column("Value", style="green", no_wrap=True, overflow="ignore")
-
-        table.add_row("Task", self.agent_execution.task)
-        table.add_row("Success", "✅ Yes" if self.agent_execution.success else "❌ No")
-        table.add_row("Steps", str(len(self.agent_execution.steps)))
-        table.add_row("Execution Time", f"{self.agent_execution.execution_time:.2f}s")
-
+        summary: dict[str, Any] = {
+            "type": "execution_summary",
+            "task": self.agent_execution.task,
+            "success": self.agent_execution.success,
+            "steps": len(self.agent_execution.steps),
+            "execution_time_s": round(self.agent_execution.execution_time, 4),
+            "agent_state": self.agent_execution.agent_state.value,
+        }
         if self.agent_execution.total_tokens:
-            total_tokens = (
-                self.agent_execution.total_tokens.input_tokens
-                + self.agent_execution.total_tokens.output_tokens
-            )
-            table.add_row("Total Tokens", str(total_tokens))
-            table.add_row("Input Tokens", str(self.agent_execution.total_tokens.input_tokens))
-            table.add_row("Output Tokens", str(self.agent_execution.total_tokens.output_tokens))
-
-        self.console.print(table)
-
-        # Display final result
-        if self.agent_execution.final_result:
-            self.console.print(
-                Panel(
-                    Markdown(self.agent_execution.final_result),
-                    title="Final Result",
-                    border_style="green" if self.agent_execution.success else "red",
-                )
-            )
+            summary["total_tokens"] = _json_friendly(asdict(self.agent_execution.total_tokens))
+        if self.agent_execution.final_result is not None:
+            summary["final_result"] = self.agent_execution.final_result
+        path = self._resolve_file_log_root() / "execution_summary.json"
+        _write_json(path, summary)
+        self._maybe_mirror_stdout(summary)
 
     @override
     def print_task_details(self, details: dict[str, str]):
-        """Print initial task configuration details."""
-        renderable = ""
-        for key, value in details.items():
-            renderable += f"[bold]{key}:[/bold] {value}\n"
-        renderable = renderable.strip()
-        self.console.print(
-            Panel(
-                renderable,
-                title="Task Details",
-                border_style="blue",
-            )
-        )
+        payload = {"type": "task_details", "details": details}
+        path = self._resolve_file_log_root() / "task_details.json"
+        _write_json(path, payload)
+        self._maybe_mirror_stdout(payload)
 
     @override
     def print(self, message: str, color: str = "blue", bold: bool = False):
-        """Print a message to the console."""
         message = f"[bold]{message}[/bold]" if bold else message
         message = f"[{color}]{message}[/{color}]"
         self.console.print(message)
 
     @override
     def get_task_input(self) -> str | None:
-        """Get task input from user (for interactive mode)."""
         if self.mode != ConsoleMode.INTERACTIVE:
             return None
 
@@ -222,7 +298,6 @@ class SimpleCLIConsole(CLIConsole):
 
     @override
     def get_working_dir_input(self) -> str:
-        """Get working directory input from user (for interactive mode)."""
         if self.mode != ConsoleMode.INTERACTIVE:
             return ""
 
@@ -234,12 +309,9 @@ class SimpleCLIConsole(CLIConsole):
 
     @override
     def stop(self):
-        """Stop the console and cleanup resources."""
-        # Simple console doesn't need explicit cleanup
         pass
 
-    async def _create_lakeview_step_display(self, agent_step: AgentStep) -> Panel | None:
-        """Create lakeview display for a step."""
+    async def _create_lakeview_step_display(self, agent_step: AgentStep):
         if self.lake_view is None:
             return None
 
@@ -248,12 +320,4 @@ class SimpleCLIConsole(CLIConsole):
         if lake_view_step is None:
             return None
 
-        color, _ = AGENT_STATE_INFO.get(agent_step.state, ("white", "❓"))
-
-        return Panel(
-            f"""[{lake_view_step.tags_emoji}] The agent [bold]{lake_view_step.desc_task}[/bold]
-{lake_view_step.desc_details}""",
-            title=f"Step {agent_step.step_number} (Lakeview)",
-            border_style=color,
-            width=80,
-        )
+        return lake_view_step

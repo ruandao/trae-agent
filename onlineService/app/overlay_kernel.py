@@ -11,7 +11,9 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-def overlay_mount(lower_paths_top_to_bottom: list[Path], upper: Path, work: Path, merged: Path) -> None:
+def overlay_mount(
+    lower_paths_top_to_bottom: list[Path], upper: Path, work: Path, merged: Path
+) -> None:
     """lower_paths: 自顶向下（最先出现的目录在 overlay 中最优先）。"""
     if os.name != "posix":
         raise OSError("overlay mount requires POSIX")
@@ -33,14 +35,29 @@ def overlay_mount(lower_paths_top_to_bottom: list[Path], upper: Path, work: Path
         str(merged),
     ]
     log.debug("overlay mount: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        log.warning("overlay mount failed (%s): %s", r.returncode, err or "(no stderr)")
+        raise RuntimeError(
+            f"overlay mount failed (code={r.returncode}): {err or 'no stderr'}; cmd={' '.join(cmd)}"
+        )
 
 
 def overlay_umount(merged: Path) -> None:
+    if not merged.exists():
+        return
+    mp = str(merged.resolve())
     try:
-        subprocess.run(["umount", "-l", str(merged)], check=False, capture_output=True)
+        r = subprocess.run(["umount", mp], check=False, capture_output=True)
+        if r.returncode == 0:
+            return
     except OSError as e:
         log.debug("umount %s: %s", merged, e)
+    try:
+        subprocess.run(["umount", "-l", mp], check=False, capture_output=True)
+    except OSError as e:
+        log.debug("umount -l %s: %s", merged, e)
 
 
 def is_merged_mountpoint(merged: Path) -> bool:

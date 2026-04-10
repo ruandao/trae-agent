@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import threading
 from collections.abc import Awaitable, Callable
@@ -13,9 +16,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .layers import create_clone_layer, new_layer_id
+from .paths import layers_root
 
 PublishFn = Callable[[dict[str, Any]], Awaitable[None]]
-from .paths import layers_root
 
 _clone_log_lock = threading.Lock()
 _clone_logs: dict[str, str] = {}
@@ -42,7 +45,7 @@ async def append_clone_layer_log(layer_id: str, text: str) -> None:
     with _clone_log_lock:
         cur = _clone_logs.get(layer_id, "") + text
         if len(cur) > _MAX_CLONE_LOG_CHARS:
-            cur = "\n…(日志过长，仅保留末尾)\n" + cur[-_MAX_CLONE_LOG_CHARS :]
+            cur = "\n…(日志过长，仅保留末尾)\n" + cur[-_MAX_CLONE_LOG_CHARS:]
         _clone_logs[layer_id] = cur
 
 
@@ -52,14 +55,19 @@ def _clone_title_url(u: str, max_len: int = 72) -> str:
         return s
     return s[: max_len - 1] + "…"
 
+
 _MAX_URL_LEN = 4096
 _MAX_BRANCH_LEN = 256
 _DEFAULT_TIMEOUT = int(os.environ.get("GIT_CLONE_TIMEOUT_SEC", "1800"))
+
+
 def _max_clone_attempts() -> int:
     try:
         return max(1, int(os.environ.get("GIT_CLONE_MAX_RETRIES", "3")))
     except ValueError:
         return 3
+
+
 # 大仓库 HTTPS 易出现 curl 18 / early EOF；增大 postBuffer、默认 HTTP/1.1 可缓解
 _DEFAULT_POST_BUFFER = int(os.environ.get("GIT_HTTP_POST_BUFFER", "524288000"))
 
@@ -77,10 +85,7 @@ def _git_config_prefix() -> list[str]:
         pass
     # 空字符串表示不强制版本（需 HTTP/2 时可设 GIT_HTTP_VERSION=""）
     ver_raw = os.environ.get("GIT_HTTP_VERSION")
-    if ver_raw is None:
-        ver = "HTTP/1.1"
-    else:
-        ver = ver_raw.strip()
+    ver = "HTTP/1.1" if ver_raw is None else ver_raw.strip()
     if ver:
         prefix.extend(["-c", f"http.version={ver}"])
     for key, env_key, default in (
@@ -98,14 +103,10 @@ def _git_config_prefix() -> list[str]:
 
 
 async def _kill_git_proc(proc: asyncio.subprocess.Process) -> None:
-    try:
+    with contextlib.suppress(ProcessLookupError):
         proc.kill()
-    except ProcessLookupError:
-        pass
-    try:
+    with contextlib.suppress(OSError):
         await proc.wait()
-    except OSError:
-        pass
 
 
 async def _drain_git_stdout(
@@ -193,6 +194,65 @@ async def _sleep_before_retry(attempt_index: int) -> None:
         await asyncio.sleep(sec)
 
 
+# Git 默认识别为 40 位 SHA-1；启用 sha256 对象格式时为 64 位十六进制
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$", re.IGNORECASE)
+
+
+def _git_verify_timeout_sec() -> float:
+    raw = os.environ.get("GIT_CLONE_VERIFY_TIMEOUT_SEC", "").strip()
+    if not raw:
+        return 120.0
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 120.0
+
+
+def verify_git_clone_workspace(
+    repo_root: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """确认目录为 Git 工作区且 HEAD 指向有效提交（下载/对象库完整性的基本验证）。
+
+    若环境变量 ``GIT_CLONE_SKIP_POST_VERIFY`` 为真则跳过并返回 ``None``。
+    否则返回 ``HEAD`` 的完整对象名（十六进制小写，常见为 40 位 SHA-1）。
+    """
+    flag = os.environ.get("GIT_CLONE_SKIP_POST_VERIFY", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return None
+    rr = repo_root.resolve()
+    if not rr.is_dir():
+        raise RuntimeError(f"克隆目录不存在或不是目录: {rr}")
+    e = dict(env or os.environ)
+    e.setdefault("GIT_TERMINAL_PROMPT", "0")
+    timeout = _git_verify_timeout_sec()
+
+    def _run_git(args: list[str]) -> str:
+        r = subprocess.run(
+            ["git", "-C", str(rr), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=e,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise RuntimeError(f"git {' '.join(args)} 失败 (exit={r.returncode}): {err}")
+        return (r.stdout or "").strip()
+
+    inside = _run_git(["rev-parse", "--is-inside-work-tree"])
+    if inside != "true":
+        raise RuntimeError(f"非 Git 工作区 (rev-parse --is-inside-work-tree → {inside!r})")
+    head = _run_git(["rev-parse", "--verify", "HEAD"])
+    if not _SHA_RE.match(head):
+        raise RuntimeError(f"HEAD 解析结果异常（非预期对象名格式）: {head!r}")
+    kind = _run_git(["cat-file", "-t", "HEAD"])
+    if kind != "commit":
+        raise RuntimeError(f"HEAD 不是 commit 对象（cat-file -t → {kind!r}）")
+    return head.lower()
+
+
 def _clone_subprocess_env() -> dict[str, str]:
     """子进程环境：默认继承；可选去掉代理（部分环境 HTTPS 代理会导致 GitHub SSL 握手失败）。"""
     e = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
@@ -210,7 +270,6 @@ def _clone_subprocess_env() -> dict[str, str]:
     return e
 
 
-
 def _make_ipv4_curl_config_file() -> Path | None:
     """返回含 ``ipv4`` 的 curl 配置文件路径，供 ``git -c http.curlConfig=…`` 使用；调用方负责删除。"""
     flag = os.environ.get("GIT_HTTP_IPV4", "").strip().lower()
@@ -221,10 +280,8 @@ def _make_ipv4_curl_config_file() -> Path | None:
         with os.fdopen(fd, "w") as f:
             f.write("ipv4\n")
     except OSError:
-        try:
+        with contextlib.suppress(OSError):
             os.close(fd)
-        except OSError:
-            pass
         raise
     return Path(path)
 
@@ -407,7 +464,9 @@ async def clone_into_new_layer(
                 await _kill_git_proc(proc)
                 out = "".join(acc) + "\n[git clone: process wait timed out]\n"
                 if publish:
-                    await append_clone_layer_log(layer_id, "\n[git clone: process wait timed out]\n")
+                    await append_clone_layer_log(
+                        layer_id, "\n[git clone: process wait timed out]\n"
+                    )
                     await publish(
                         {
                             "type": "repo_clone_delta",
@@ -433,6 +492,37 @@ async def clone_into_new_layer(
             out = "".join(acc)
 
             if code == 0:
+                venv = _clone_subprocess_env()
+                try:
+                    head_sha = await asyncio.to_thread(
+                        verify_git_clone_workspace,
+                        lp / "base",
+                        env=venv,
+                    )
+                except RuntimeError as ver_e:
+                    out = out + f"\n[clone-verify] {ver_e}\n"
+                    _safe_rmtree_if_under(lp, root)
+                    if attempt < max_attempts - 1:
+                        if publish:
+                            await append_clone_layer_log(
+                                layer_id,
+                                f"\n[克隆后校验失败，将重试] {ver_e}\n",
+                            )
+                            await publish(
+                                {
+                                    "type": "repo_clone_retry",
+                                    "layer_id": layer_id,
+                                    "title": f"校验失败，重试 {attempt + 2}/{max_attempts} …",
+                                }
+                            )
+                        await _sleep_before_retry(attempt)
+                        continue
+                    return layer_id, lp, out, -1
+                if head_sha and publish:
+                    await append_clone_layer_log(
+                        layer_id,
+                        f"\n[校验] 拉取验证通过 HEAD={head_sha[:12]}\n",
+                    )
                 return layer_id, lp, out, code
 
             _safe_rmtree_if_under(lp, root)
@@ -450,10 +540,8 @@ async def clone_into_new_layer(
             return layer_id, lp, out, code
         finally:
             if ipv4_curl_cfg is not None:
-                try:
+                with contextlib.suppress(OSError):
                     ipv4_curl_cfg.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
 
 def _safe_rmtree(path: Path) -> None:

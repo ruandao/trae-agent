@@ -36,7 +36,7 @@ class TextEditorTool(Tool):
 
     @override
     def get_name(self) -> str:
-        return "str_replace_based_edit_tool"
+        return "edit_file"
 
     @override
     def get_description(self) -> str:
@@ -54,7 +54,7 @@ Notes for using the `str_replace` command:
 
     @override
     def get_parameters(self) -> list[ToolParameter]:
-        """Get the parameters for the str_replace_based_edit_tool."""
+        """Get the parameters for the edit_file tool."""
         return [
             ToolParameter(
                 name="command",

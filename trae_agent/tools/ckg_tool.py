@@ -32,7 +32,7 @@ class CKGTool(Tool):
 
     @override
     def get_name(self) -> str:
-        return "ckg"
+        return "code_knowledge_search"
 
     @override
     def get_description(self) -> str:

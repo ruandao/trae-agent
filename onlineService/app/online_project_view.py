@@ -8,14 +8,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
 import shutil
-from pathlib import Path
 
-from .layer_meta import is_overlay_v1_layer
 from .layer_merge import layer_merged_root_for_api
+from .layer_meta import is_overlay_v1_layer
 from .layers import _LAYER_ID_RE
 from .paths import layers_root, online_project_root, repo_root, runtime_dir
 
@@ -34,10 +34,7 @@ def set_online_project_tip(layer_id: str) -> None:
     lid = (layer_id or "").strip()
     if not lid:
         raise ValueError("empty layer_id")
-    if is_overlay_v1_layer(lid):
-        tip = layer_merged_root_for_api(lid)
-    else:
-        tip = layers_root() / lid
+    tip = layer_merged_root_for_api(lid) if is_overlay_v1_layer(lid) else layers_root() / lid
     if not tip.is_dir():
         raise ValueError(f"layer directory not found: {tip}")
 
@@ -65,10 +62,8 @@ def set_online_project_tip(layer_id: str) -> None:
         op.symlink_to(rel, target_is_directory=True)
     except OSError as e:
         if getattr(e, "errno", None) == errno.EEXIST:
-            try:
+            with contextlib.suppress(OSError):
                 op.unlink()
-            except OSError:
-                pass
             op.symlink_to(rel, target_is_directory=True)
         else:
             raise
@@ -119,8 +114,8 @@ def get_online_project_active_info() -> dict[str, str | bool | None]:
                 pass
             rt = (runtime_dir() / "materialized").resolve()
             try:
-                relm = resolved.relative_to(rt)
-                name_m = relm.parts[0] if relm.parts else ""
+                rel_mat = resolved.relative_to(rt)
+                name_m = rel_mat.parts[0] if rel_mat.parts else ""
                 if _LAYER_ID_RE.match(name_m):
                     out["active_tip_layer_id"] = name_m
             except ValueError:

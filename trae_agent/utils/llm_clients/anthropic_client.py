@@ -4,12 +4,11 @@
 """Anthropic API client wrapper with tool integration."""
 
 import json
+import time
 from typing import override
 
 import anthropic
 from anthropic.types.tool_union_param import TextEditor20250429
-
-import time
 
 from trae_agent.tools.base import Tool, ToolCall, ToolResult
 from trae_agent.utils.config import ModelConfig
@@ -77,10 +76,10 @@ class AnthropicClient(BaseLLMClient):
         if tools:
             tool_schemas = []
             for tool in tools:
-                if tool.name == "str_replace_based_edit_tool":
+                if tool.name == "edit_file":
                     tool_schemas.append(
                         TextEditor20250429(
-                            name="str_replace_based_edit_tool",
+                            name="edit_file",
                             type="text_editor_20250429",
                         )
                     )

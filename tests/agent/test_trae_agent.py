@@ -103,11 +103,11 @@ class TestTraeAgentExtended(unittest.TestCase):
 
         self.assertEqual(len(self.agent.tools), 6)
         self.assertIn("bash", tool_names)
-        self.assertIn("str_replace_based_edit_tool", tool_names)
-        self.assertIn("sequentialthinking", tool_names)
-        self.assertIn("task_done", tool_names)
-        self.assertIn("json_edit_tool", tool_names)
-        self.assertIn("ckg", tool_names)
+        self.assertIn("edit_file", tool_names)
+        self.assertIn("sequential_thinking", tool_names)
+        self.assertIn("complete_task", tool_names)
+        self.assertIn("edit_json", tool_names)
+        self.assertIn("code_knowledge_search", tool_names)
 
     def test_protected_attributes_access_restrictions(self):
         """Test that protected attributes cannot be accessed directly from outside the class."""

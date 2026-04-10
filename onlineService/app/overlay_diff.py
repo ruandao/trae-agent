@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import filecmp
 import os
 import shutil
@@ -18,7 +19,11 @@ def is_whiteout(path: Path) -> bool:
         st = path.lstat()
     except OSError:
         return False
-    return stat.S_ISCHR(st.st_mode) and os.major(st.st_rdev) == WHITEOUT_MAJOR and os.minor(st.st_rdev) == WHITEOUT_MINOR
+    return (
+        stat.S_ISCHR(st.st_mode)
+        and os.major(st.st_rdev) == WHITEOUT_MAJOR
+        and os.minor(st.st_rdev) == WHITEOUT_MINOR
+    )
 
 
 def is_opaque_dir(path: Path) -> bool:
@@ -44,10 +49,8 @@ def prune_empty_dirs_under(diff_root: Path) -> None:
     for child in list(diff_root.iterdir()):
         if child.is_dir() and not child.is_symlink():
             prune_empty_dirs_under(child)
-            try:
+            with contextlib.suppress(OSError):
                 child.rmdir()
-            except OSError:
-                pass
 
 
 def create_whiteout_file(target: Path) -> None:
@@ -126,13 +129,14 @@ def compute_diff_between_trees(parent_merged: Path, child_merged: Path, diff_out
             continue
         if path.is_file() or path.is_symlink():
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if not p.exists():
-                shutil.copy2(path, dest, follow_symlinks=False)
-            elif p.is_dir():
-                shutil.copy2(path, dest, follow_symlinks=False)
-            elif path.is_symlink() or p.is_symlink():
-                shutil.copy2(path, dest, follow_symlinks=False)
-            elif p.is_file() and not filecmp.cmp(path, p, shallow=False):
+            if (
+                not p.exists()
+                or p.is_dir()
+                or path.is_symlink()
+                or p.is_symlink()
+                or p.is_file()
+                and not filecmp.cmp(path, p, shallow=False)
+            ):
                 shutil.copy2(path, dest, follow_symlinks=False)
     for path in sorted(parent_merged.rglob("*")):
         rel = path.relative_to(parent_merged)

@@ -18,7 +18,7 @@ class TaskDoneTool(Tool):
 
     @override
     def get_name(self) -> str:
-        return "task_done"
+        return "complete_task"
 
     @override
     def get_description(self) -> str:

@@ -14,11 +14,23 @@ ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "dev-local-token")
 TRAE_UI_BASE = os.environ.get("TRAE_UI_BASE", "http://127.0.0.1:8765")
 
 
+def _urllib_reachable_base(base_url: str) -> str:
+    """urllib 在部分环境下对 localhost 先连 ::1，而 uvicorn --host 0.0.0.0 仅监听 IPv4 会超时。"""
+    p = urllib.parse.urlsplit(base_url)
+    host = (p.hostname or "").lower()
+    if host in {"localhost", "::1"}:
+        h = "127.0.0.1"
+        netloc = f"{h}:{p.port}" if p.port else h
+        return urllib.parse.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
+    return base_url
+
+
 @pytest.fixture(scope="module", autouse=True)
 def require_task_gate_endpoint() -> None:
     """若服务为旧版本无 task-gate 路由，跳过本文件全部用例并提示重启。"""
+    probe_base = _urllib_reachable_base(TRAE_UI_BASE)
     url = (
-        f"{TRAE_UI_BASE.rstrip('/')}/api/requirements/task-gate"
+        f"{probe_base.rstrip('/')}/api/requirements/task-gate"
         f"?access_token={urllib.parse.quote(ACCESS_TOKEN)}"
     )
     req = urllib.request.Request(
@@ -37,14 +49,15 @@ def require_task_gate_endpoint() -> None:
             )
         raise
     except OSError as e:
-        pytest.skip(f"无法连接 {TRAE_UI_BASE}：{e}")
+        pytest.skip(f"无法连接 {probe_base}（TRAE_UI_BASE={TRAE_UI_BASE}）：{e}")
 
 
 @pytest.fixture(scope="module", autouse=True)
 def require_redo_endpoint() -> None:
     """若服务无 POST /api/jobs/{id}/redo，跳过依赖该能力的用例。"""
+    probe_base = _urllib_reachable_base(TRAE_UI_BASE)
     url = (
-        f"{TRAE_UI_BASE.rstrip('/')}/api/jobs/"
+        f"{probe_base.rstrip('/')}/api/jobs/"
         "00000000-0000-0000-0000-000000000000/redo"
         f"?access_token={urllib.parse.quote(ACCESS_TOKEN)}"
     )
@@ -57,20 +70,16 @@ def require_redo_endpoint() -> None:
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             if resp.status == 404:
-                pytest.skip(
-                    "POST /api/jobs/…/redo 为 404：请用当前仓库代码重启 onlineService。"
-                )
+                pytest.skip("POST /api/jobs/…/redo 为 404：请用当前仓库代码重启 onlineService。")
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            pytest.skip(
-                "POST /api/jobs/…/redo 为 404：请用当前仓库代码重启 onlineService。"
-            )
+            pytest.skip("POST /api/jobs/…/redo 为 404：请用当前仓库代码重启 onlineService。")
         if e.code == 400:
             # 预期：占位 UUID 无对应任务
             return
         raise
     except OSError as e:
-        pytest.skip(f"无法连接 {TRAE_UI_BASE}：{e}")
+        pytest.skip(f"无法连接 {probe_base}（TRAE_UI_BASE={TRAE_UI_BASE}）：{e}")
 
 
 @pytest.fixture(scope="session")

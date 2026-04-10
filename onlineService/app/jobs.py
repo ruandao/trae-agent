@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import contextlib
 import json
 import logging
 import os
-import sys
 import shutil
 import signal
 import subprocess
+import sys
+import threading
+import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,26 +22,27 @@ from uuid import uuid4
 
 from .hub import hub
 from .layer_fs import any_layer_has_git_repo
-from .layer_meta import is_overlay_v1_layer, read_layer_meta
+from .layer_git import git_checkout
 from .layer_merge import (
     finalize_job_overlay_finished,
     interrupt_job_overlay,
     prepare_job_run,
 )
-from .online_project_view import clear_online_project_tip, set_online_project_tip
-from .layer_git import git_checkout
+from .layer_meta import is_overlay_v1_layer, read_layer_meta
 from .layers import (
     _LAYER_ID_RE,
     cleanup_layers,
     create_job_layer,
     create_root_layer,
-    create_stacked_layer,
     layer_path,
     new_layer_id,
 )
+from .online_project_view import clear_online_project_tip, set_online_project_tip
 from .paths import (
     commands_log_path,
     config_file_path,
+    job_events_dir,
+    job_events_job_dir,
     jobs_state_path,
     layers_root,
     repo_root,
@@ -50,9 +54,7 @@ log = logging.getLogger(__name__)
 JobStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 CommandKind = Literal["trae", "shell", "clone"]
 
-_GIT_LOCK_MSG = (
-    "该任务可写层在运行开始后已有 git 提交（HEAD 已变化），已禁止中断、重新执行与删除。"
-)
+_GIT_LOCK_MSG = "该任务可写层在运行开始后已有 git 提交（HEAD 已变化），已禁止中断、重新执行与删除。"
 
 
 def _git_rev_parse_head_sync(workdir: Path) -> str | None:
@@ -104,6 +106,43 @@ def _git_workdir_for_lock_probe(rec: JobRecord) -> Path:
 # TRAE_JOB_COLUMNS=0 / unlimited / max 等均表示使用该默认值；也可设具体正整数（上限见实现）。
 _DEFAULT_JOB_WIDE_COLUMNS = 999_999
 _MAX_JOB_COLUMNS = 9_999_999
+_job_event_step_no: dict[str, int] = {}
+_job_event_step_no_lock = threading.Lock()
+
+
+def _append_job_event_line(
+    rec: "JobRecord", phase: str, *, message: str = "", **extra: Any
+) -> None:
+    """将任务运行状态落盘为「每指令目录 + 每 step 一个 JSON 文件」。"""
+    try:
+        d = job_events_job_dir(rec.id)
+        with _job_event_step_no_lock:
+            n = _job_event_step_no.get(rec.id, 0) + 1
+            _job_event_step_no[rec.id] = n
+        p = d / f"step_{n:06d}.json"
+        event: dict[str, Any] = {
+            "ts": time.time(),
+            "job_id": rec.id,
+            "layer_id": rec.layer_id,
+            "status": rec.status,
+            "phase": phase,
+            "message": message,
+        }
+        if extra:
+            event.update(extra)
+        p.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        log.exception("append job event failed: job_id=%s phase=%s", rec.id, phase)
+
+
+def _remove_job_event_file(job_id: str) -> None:
+    try:
+        with _job_event_step_no_lock:
+            _job_event_step_no.pop(job_id, None)
+        shutil.rmtree(job_events_dir() / str(job_id), ignore_errors=True)
+    except OSError:
+        log.exception("remove job event file failed: job_id=%s", job_id)
+
 
 # 按块读取 stdout，减少「一行一条 SSE」的风暴（仍保持 UTF-8 边界正确）。
 
@@ -145,12 +184,14 @@ def _job_subprocess_columns() -> str:
     return str(_DEFAULT_JOB_WIDE_COLUMNS)
 
 
-def _job_subprocess_env() -> dict[str, str]:
+def _job_subprocess_env(*, trae_json_log_dir: str | None = None) -> dict[str, str]:
     base = {**os.environ, "PYTHONUNBUFFERED": "1"}
     base["COLUMNS"] = _job_subprocess_columns()
     if not base.get("PYTHONPATH"):
         # 允许在未安装 console script 时回退到 `python -m trae_agent.cli`
         base["PYTHONPATH"] = str(repo_root())
+    if trae_json_log_dir:
+        base["TRAE_AGENT_JSON_OUTPUT_DIR"] = trae_json_log_dir
     return base
 
 
@@ -308,19 +349,15 @@ class JobStore:
                     proc.terminate()
         elif rec.status == "pending" and runner_task and not runner_task.done():
             runner_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await runner_task
-            except asyncio.CancelledError:
-                pass
         elif runner_task and not runner_task.done():
             try:
                 await asyncio.wait_for(runner_task, timeout=120.0)
             except TimeoutError:
                 runner_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await runner_task
-                except asyncio.CancelledError:
-                    pass
 
         layer_path_obj = Path(rec.layer_path)
         async with self._lock:
@@ -382,9 +419,7 @@ class JobStore:
                             ck = item.get("command_kind", "trae")
                             if ck not in ("trae", "shell"):
                                 ck = "trae"
-                            norm.append(
-                                {"command": str(item["command"]), "command_kind": ck}
-                            )
+                            norm.append({"command": str(item["command"]), "command_kind": ck})
                         elif isinstance(item, str) and item.strip():
                             norm.append({"command": item.strip(), "command_kind": "trae"})
                     if norm:
@@ -462,11 +497,7 @@ class JobStore:
                 await self._wait_until_layer_idle(stack_parent)
 
             layer_id = new_layer_id()
-            if parent_job_id:
-                if stack_parent is None:
-                    raise ValueError("内部错误：未解析父层 layer_id")
-                lp = create_job_layer(layer_id, stack_parent)
-            elif repo_layer_id:
+            if parent_job_id or repo_layer_id:
                 if stack_parent is None:
                     raise ValueError("内部错误：未解析父层 layer_id")
                 lp = create_job_layer(layer_id, stack_parent)
@@ -492,9 +523,7 @@ class JobStore:
             await hub.publish(sse_job_event("job_created", rec, rec.id))
             task = asyncio.create_task(self._run_job(jid))
             self._runner_tasks[jid] = task
-            task.add_done_callback(
-                lambda _t, job_id=jid: self._runner_tasks.pop(job_id, None)
-            )
+            task.add_done_callback(lambda _t, job_id=jid: self._runner_tasks.pop(job_id, None))
             return rec
 
     async def register_clone_layer_job(
@@ -594,6 +623,7 @@ class JobStore:
             except Exception as e:
                 rec.status = "failed"
                 rec.output = f"overlay prepare failed: {e}\n"
+                _append_job_event_line(rec, "error", message=f"overlay prepare failed: {e}")
                 rec.exit_code = -1
                 async with self._lock:
                     self._layer_queues.pop(rec.layer_id, None)
@@ -632,10 +662,16 @@ class JobStore:
         await self._save()
 
         rec.status = "running"
+        _append_job_event_line(rec, "start")
         if preserve_output:
-            rec.output += "\n\n--- 继续执行（指令：继续）---\n"
+            rec.output += "\n\n继续执行（指令：继续）\n"
         elif not (rec.git_branch and rec.output.strip()):
             rec.output = ""
+        trae_json_root: str | None = None
+        if rec.command_kind == "trae":
+            trae_json_root = str((Path(work).resolve() / ".trae_agent_json" / job_id))
+            rec.output += f"[trae_agent JSON log] {trae_json_root}\n"
+            _append_job_event_line(rec, "meta", message="trae_agent_json_dir", path=trae_json_root)
         await self._save()
         await hub.publish(sse_job_event("job_started", rec, job_id))
 
@@ -645,7 +681,7 @@ class JobStore:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(work_dir),
-                env=_job_subprocess_env(),
+                env=_job_subprocess_env(trae_json_log_dir=trae_json_root),
                 start_new_session=True,
             )
         except Exception as e:
@@ -669,6 +705,7 @@ class JobStore:
         try:
             async for text in _iter_stdout_text(proc.stdout):
                 rec.output += text
+                _append_job_event_line(rec, "chunk", message=text)
                 await hub.publish(sse_job_event("job_output", rec, job_id))
             code = await proc.wait()
             rec.exit_code = code
@@ -695,6 +732,12 @@ class JobStore:
                     self._layer_queues.pop(rec.layer_id, None)
             await self._save()
             await hub.publish(sse_job_event("job_finished", rec, job_id))
+            _append_job_event_line(
+                rec,
+                "done" if rec.status == "completed" else "error",
+                job_status=rec.status,
+                exit_code=rec.exit_code,
+            )
             await _finalize_overlay_if_needed()
             try:
                 await asyncio.to_thread(set_online_project_tip, rec.layer_id)
@@ -802,9 +845,7 @@ class JobStore:
         for jid in self._post_order_job_ids(job.id):
             await self.delete_job(jid)
         await self._save()
-        await hub.publish(
-            {"type": "layer_deleted", "layer_id": layer_id, "title": "可写层已删除"}
-        )
+        await hub.publish({"type": "layer_deleted", "layer_id": layer_id, "title": "可写层已删除"})
         return {"layer_id": layer_id, "job_id": job.id, "status": "deleted"}
 
     async def interrupt(self, job_id: str) -> bool:
@@ -835,9 +876,7 @@ class JobStore:
                 runner_task = self._runner_tasks.get(job_id)
 
             if rec.command_kind == "clone":
-                raise ValueError(
-                    "克隆层任务不支持重新执行，请使用「克隆仓库」新建可写层。"
-                )
+                raise ValueError("克隆层任务不支持重新执行，请使用「克隆仓库」新建可写层。")
 
             if job_layer_git_destructive_locked(rec):
                 raise ValueError(_GIT_LOCK_MSG)
@@ -846,19 +885,15 @@ class JobStore:
                 _ = await self.interrupt(job_id)
             elif rec.status == "pending" and runner_task and not runner_task.done():
                 runner_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await runner_task
-                except asyncio.CancelledError:
-                    pass
             elif runner_task and not runner_task.done():
                 try:
                     await asyncio.wait_for(runner_task, timeout=120.0)
                 except TimeoutError:
                     runner_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await runner_task
-                    except asyncio.CancelledError:
-                        pass
 
             async with self._lock:
                 rec = self._jobs.get(job_id)
@@ -873,16 +908,12 @@ class JobStore:
                 if rec.parent_job_id:
                     parent = self._jobs.get(rec.parent_job_id)
                     if not parent:
-                        raise ValueError(
-                            f"parent_job_id not found: {rec.parent_job_id}"
-                        )
+                        raise ValueError(f"parent_job_id not found: {rec.parent_job_id}")
                     lp = create_job_layer(new_lid, str(parent.layer_id))
                 elif rec.repo_layer_id:
                     src = layer_path(rec.repo_layer_id)
                     if not src.is_dir():
-                        raise ValueError(
-                            f"repo_layer_id not found: {rec.repo_layer_id}"
-                        )
+                        raise ValueError(f"repo_layer_id not found: {rec.repo_layer_id}")
                     lp = create_job_layer(new_lid, str(rec.repo_layer_id))
                 else:
                     lp = create_root_layer(new_lid)
@@ -899,9 +930,7 @@ class JobStore:
 
             task = asyncio.create_task(self._run_job(job_id))
             self._runner_tasks[job_id] = task
-            task.add_done_callback(
-                lambda _t, jid=job_id: self._runner_tasks.pop(jid, None)
-            )
+            task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
             return rec
 
     async def continue_job(self, job_id: str) -> JobRecord:
@@ -930,9 +959,7 @@ class JobStore:
                 self._run_job(job_id, run_command="继续", preserve_output=True)
             )
             self._runner_tasks[job_id] = task
-            task.add_done_callback(
-                lambda _t, jid=job_id: self._runner_tasks.pop(jid, None)
-            )
+            task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
             return rec
 
     async def reset_all(self) -> dict[str, Any]:
@@ -974,10 +1001,10 @@ class JobStore:
             await self._save()
 
             def _unlink_commands_log() -> None:
-                try:
+                with contextlib.suppress(OSError):
                     commands_log_path().unlink(missing_ok=True)
-                except OSError:
-                    pass
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(job_events_dir(), ignore_errors=True)
 
             await asyncio.to_thread(_unlink_commands_log)
             await asyncio.to_thread(clear_online_project_tip)
@@ -1019,19 +1046,15 @@ class JobStore:
             _ = await self.interrupt(job_id)
         elif rec.status == "pending" and runner_task and not runner_task.done():
             runner_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await runner_task
-            except asyncio.CancelledError:
-                pass
         elif runner_task and not runner_task.done():
             try:
                 await asyncio.wait_for(runner_task, timeout=120.0)
             except TimeoutError:
                 runner_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await runner_task
-                except asyncio.CancelledError:
-                    pass
 
         layer_path_obj = Path(rec.layer_path)
         async with self._lock:
@@ -1046,11 +1069,10 @@ class JobStore:
 
         if self._is_managed_layer_dir(layer_path_obj) and layer_path_obj.is_dir():
             await asyncio.to_thread(shutil.rmtree, layer_path_obj, True)
+        await asyncio.to_thread(_remove_job_event_file, job_id)
 
         await self._save()
-        await hub.publish(
-            {"type": "job_deleted", "job_id": job_id, "title": "任务已删除"}
-        )
+        await hub.publish({"type": "job_deleted", "job_id": job_id, "title": "任务已删除"})
         return {"job_id": job_id, "status": "deleted"}
 
 

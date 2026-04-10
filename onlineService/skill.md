@@ -14,13 +14,13 @@
 
 运行时与任务行为还可通过 `TRAE_JOB_COLUMNS`、`TRAE_JOB_STDOUT_CHUNK_BYTES`、`TRAE_JOB_STEPS_MAX_CELL_CHARS` 等调节（见实现代码）；克隆相关有 `GIT_CLONE_TIMEOUT_SEC`、`GIT_CLONE_MAX_RETRIES` 等。
 
-配置文件固定路径：`onlineProject_state/runtime/service_config.yaml`（由 API 写入）。任务状态持久化：`onlineProject_state/runtime/jobs_state.json`。
+配置文件固定路径：`onlineProject_state/runtime/service_config.yaml`（由 API 写入；内容与仓库根目录 `trae_config.yaml.example` 同结构，内含合法内置工具名说明）。任务状态持久化：`onlineProject_state/runtime/jobs_state.json`。Docker 镜像内同一份示例路径：`/app/trae_config.yaml.example`。
 
 ## 推荐调用顺序
 
-1. `POST /api/config`（或 `POST /api/config/raw`）推送有效 YAML。  
-2. 确认虚拟环境存在且含 `trae-cli`（否则创建任务会失败）。  
-3. `POST /api/repos/clone` 将远程仓库克隆到**新的**可写层（需系统已安装 `git`）。  
+1. `POST /api/config`（或 `POST /api/config/raw`）推送有效 YAML。
+2. 确认虚拟环境存在且含 `trae-cli`（否则创建任务会失败）。
+3. `POST /api/repos/clone` 将远程仓库克隆到**新的**可写层（需系统已安装 `git`）。
 4. 再 `POST /api/jobs` 创建任务（服务端要求：至少曾成功存在过含 `.git` 的可写层，见下文「任务门控」）。
 
 ## 公开端点（无需令牌）
@@ -70,13 +70,13 @@
 
 ### `POST /api/jobs` 行为说明
 
-- **前置**：已存在有效 `service_config.yaml`、venv 可激活，且全局已有至少一层含 `.git`（通常来自克隆）。  
-- **无 `parent_job_id` 且无 `repo_layer_id`**：在 `onlineProject/layers/<layer_id>/` 新建**空**根层再执行。  
-- **`parent_job_id` 有值**：从父任务对应目录**复制**出新层（不复制 `.git`，子层通过符号链接共享父层 `.git`），再执行。不可与 `repo_layer_id` 同时出现。  
-- **`repo_layer_id` 有值**（且无父任务）：从指定 `layer_id` 对应目录复制出新层并链接 `.git`，再执行。  
-- **`git_branch`**：任务启动前在工作区内执行 `git checkout`；须同时提供 `parent_job_id` 或 `repo_layer_id`（不能单独用于纯空根层）。  
-- 执行命令等价于：  
-  `source <venv>/bin/activate && trae-cli run "<command>" --config-file=<service_config.yaml> --working-dir=<层目录>`  
+- **前置**：已存在有效 `service_config.yaml`、venv 可激活，且全局已有至少一层含 `.git`（通常来自克隆）。
+- **无 `parent_job_id` 且无 `repo_layer_id`**：在 `onlineProject/layers/<layer_id>/` 新建**空**根层再执行。
+- **`parent_job_id` 有值**：从父任务对应目录**复制**出新层（不复制 `.git`，子层通过符号链接共享父层 `.git`），再执行。不可与 `repo_layer_id` 同时出现。
+- **`repo_layer_id` 有值**（且无父任务）：从指定 `layer_id` 对应目录复制出新层并链接 `.git`，再执行。
+- **`git_branch`**：任务启动前在工作区内执行 `git checkout`；须同时提供 `parent_job_id` 或 `repo_layer_id`（不能单独用于纯空根层）。
+- 执行命令等价于：
+  `source <venv>/bin/activate && trae-cli run "<command>" --config-file=<service_config.yaml> --working-dir=<层目录>`
 - 「继续」类任务在内部使用 `trae-cli run "继续"` 并保留先前输出（见 `POST .../continue`）。
 
 ### 运行中控制与清理
@@ -112,18 +112,18 @@
 
 ## 实时事件（SSE）
 
-- **路径**：`GET /api/events/stream?access_token=<ACCESS_TOKEN>`  
-- **格式**：`text/event-stream`，每条为 `data: <JSON>\n\n`。连接后首条一般为 `{"type":"connected"}`。  
-- **保活**：约 30s 无事件发送注释行 `: ping`。  
+- **路径**：`GET /api/events/stream?access_token=<ACCESS_TOKEN>`
+- **格式**：`text/event-stream`，每条为 `data: <JSON>\n\n`。连接后首条一般为 `{"type":"connected"}`。
+- **保活**：约 30s 无事件发送注释行 `: ping`。
 - **浏览器**：`EventSource` 无法自定义 Header，**必须**用查询参数传令牌。
 
 常见 `type` 包括：
 
-- `connected` — 连接建立。  
-- `repo_clone_finished` — 克隆结束（含 `layer_id`、`status`、`exit_code` 等）。  
-- `repo_cloned` — 克隆成功后的补充事件。  
-- `job_created`、`job_started`、`job_output`（含 `chunk`）、`job_finished` — 任务生命周期。  
-- `job_interrupt_requested`、`job_redone`、`job_continued`、`job_deleted`。  
+- `connected` — 连接建立。
+- `repo_clone_finished` — 克隆结束（含 `layer_id`、`status`、`exit_code` 等）。
+- `repo_cloned` — 克隆成功后的补充事件。
+- `job_created`、`job_started`、`job_output`（含 `chunk`）、`job_finished` — 任务生命周期。
+- `job_interrupt_requested`、`job_redone`、`job_continued`、`job_deleted`。
 - `jobs_reset` — 全局重置完成。
 
 ## Web 控制台
@@ -138,13 +138,13 @@
 
 ```bash
 export ACCESS_TOKEN='your-secret'
-cp trae_config.yaml onlineProject_state/runtime/service_config.yaml   # 或使用 UI/API 上传
+cp trae_config.yaml.example onlineProject_state/runtime/service_config.yaml   # 编辑密钥；或用 UI/API 上传
 cd onlineService
 # 依赖：在仓库根目录执行 uv pip install -r onlineService/requirements.txt（或可用 pip）
 ../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765
 ```
 
-浏览器打开：`http://127.0.0.1:8765/ui/your-secret`  
+浏览器打开：`http://127.0.0.1:8765/ui/your-secret`
 本 Skill 文档：`http://127.0.0.1:8765/skill.md`
 
 ## Docker 与多架构镜像
@@ -156,12 +156,12 @@ chmod +x onlineService/docker-build.sh
 PUSH_IMAGE=1 IMAGE=your-registry/trae-online:latest onlineService/docker-build.sh
 ```
 
-构建时可通过 `Dockerfile` 的 `ENV ACCESS_TOKEN=` 传入默认令牌；运行时仍可用 `-e ACCESS_TOKEN=...` 覆盖。
+构建时可通过 `Dockerfile` 的 `ENV ACCESS_TOKEN=` 传入默认令牌；运行时仍可用 `-e ACCESS_TOKEN=...` 覆盖。镜像内已含 `/app/trae_config.yaml.example`，可复制为运行时配置：例如 `docker exec ... cp /app/trae_config.yaml.example /app/onlineProject_state/runtime/service_config.yaml` 后再改密钥或通过 `/api/config` 上传。
 
 ## 注意事项
 
-- 任务输出保存在内存与 `jobs_state.json`；服务重启后原 `running` 会记为 `interrupted`。  
-- 子层叠加时**不复制** `.git`，而用符号链接指回父层 `.git`，多子层共享同一仓库元数据；与旧版「逐层完整复制」行为不同。  
-- `git_destructive_locked` 用于在已有新提交后禁止误删/误中断破坏历史。  
-- `POST /api/jobs/reset` 会删除可写层目录下符合命名规则的全部层，慎用。  
+- 任务输出保存在内存与 `jobs_state.json`；服务重启后原 `running` 会记为 `interrupted`。
+- 子层叠加时**不复制** `.git`，而用符号链接指回父层 `.git`，多子层共享同一仓库元数据；与旧版「逐层完整复制」行为不同。
+- `git_destructive_locked` 用于在已有新提交后禁止误删/误中断破坏历史。
+- `POST /api/jobs/reset` 会删除可写层目录下符合命名规则的全部层，慎用。
 - 配置、克隆日志与任务输出可能含敏感信息，请妥善保管 `ACCESS_TOKEN` 与运行时文件。

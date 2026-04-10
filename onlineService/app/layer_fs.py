@@ -17,8 +17,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from .layer_meta import is_overlay_v1_layer, read_layer_meta
 from .layer_merge import layer_merged_root_for_api
+from .layer_meta import is_overlay_v1_layer, read_layer_meta
 from .layers import layer_path
 from .paths import layers_root
 
@@ -31,6 +31,7 @@ def _layer_browser_root(layer_id: str) -> Path:
     if is_overlay_v1_layer(layer_id):
         return layer_merged_root_for_api(layer_id)
     return layer_path(layer_id)
+
 
 _MAX_BYTES_DEFAULT = int(os.environ.get("LAYER_FILE_MAX_BYTES", "2000000"))  # 2MB
 _MAX_BYTES_CAP = int(os.environ.get("LAYER_FILE_MAX_BYTES_CAP", "20000000"))  # 20MB
@@ -228,6 +229,7 @@ def list_layer_files(layer_id: str, prefix: str | None, max_files: int) -> dict[
 
     return {"layer_id": layer_id, "files": files, "truncated": False}
 
+
 def list_layer_children(
     *,
     layer_id: str,
@@ -242,10 +244,7 @@ def list_layer_children(
 
     # Allow '' for root; otherwise validate directory path parts.
     dir_norm = (dir_rel_posix or "").replace("\\", "/").strip()
-    if dir_norm == "":
-        dir_rel = PurePosixPath(".")
-    else:
-        dir_rel = _validate_safe_rel_posix(dir_norm)
+    dir_rel = PurePosixPath(".") if dir_norm == "" else _validate_safe_rel_posix(dir_norm)
 
     dir_fs = layer_dir.resolve()
     target = dir_fs / Path(*dir_rel.parts) if str(dir_rel) != "." else dir_fs
@@ -279,12 +278,12 @@ def list_layer_children(
             rel_parent = "" if dir_norm in ("", ".") else dir_norm.strip("/")
             full_rel = name if not rel_parent else f"{rel_parent}/{name}"
             # Prefix filtering: keep ancestors of the prefix.
-            if prefix_norm:
-                # Show entry if:
-                # - prefix is inside this entry, or
-                # - this entry is inside prefix.
-                if not (full_rel.startswith(prefix_norm) or prefix_norm.startswith(full_rel.rstrip("/") + "/")):
-                    continue
+            # Show entry if prefix is inside this entry, or this entry is inside prefix.
+            if prefix_norm and not (
+                full_rel.startswith(prefix_norm)
+                or prefix_norm.startswith(full_rel.rstrip("/") + "/")
+            ):
+                continue
 
             st = child.stat()
             entries.append(
@@ -405,4 +404,3 @@ def read_layer_file(
         "truncated": truncated,
         "text": text,
     }
-

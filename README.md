@@ -58,9 +58,9 @@ agents:
     max_steps: 200  # max number of agent steps
     tools:  # tools used with Trae Agent
       - bash
-      - str_replace_based_edit_tool
-      - sequentialthinking
-      - task_done
+      - edit_file
+      - sequential_thinking
+      - complete_task
 
 model_providers:  # model providers configuration
   anthropic:

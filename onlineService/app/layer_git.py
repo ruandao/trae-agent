@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import subprocess
@@ -18,8 +19,8 @@ from trae_agent.utils.auto_commit_message import (
 )
 
 from .git_clone import _validate_branch
-from .layer_meta import is_overlay_v1_layer
 from .layer_merge import layer_merged_root_for_api
+from .layer_meta import is_overlay_v1_layer
 from .layers import layer_path
 
 
@@ -28,6 +29,7 @@ def layer_git_workspace_root(layer_id: str) -> Path:
     if is_overlay_v1_layer(layer_id):
         return layer_merged_root_for_api(layer_id)
     return layer_path(layer_id)
+
 
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 
@@ -194,8 +196,12 @@ async def commit_layer_worktree(
 
     explicit = (message or "").strip()
 
-    author_name = (os.environ.get("TRAE_GIT_COMMITTER_NAME") or "trae-online-service").strip() or "trae-online-service"
-    author_email = (os.environ.get("TRAE_GIT_COMMITTER_EMAIL") or "trae-online@local").strip() or "trae-online@local"
+    author_name = (
+        os.environ.get("TRAE_GIT_COMMITTER_NAME") or "trae-online-service"
+    ).strip() or "trae-online-service"
+    author_email = (
+        os.environ.get("TRAE_GIT_COMMITTER_EMAIL") or "trae-online@local"
+    ).strip() or "trae-online@local"
 
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 
@@ -215,7 +221,9 @@ async def commit_layer_worktree(
 
     names_out, code_n = await _git_diff_cached_text(root, env, "--name-only", "-z")
     if code_n != 0:
-        raise HTTPException(status_code=400, detail=f"git diff --cached failed:\n{names_out.strip()}")
+        raise HTTPException(
+            status_code=400, detail=f"git diff --cached failed:\n{names_out.strip()}"
+        )
     files = [p for p in names_out.split("\0") if p.strip()]
     if not files:
         return {
@@ -228,7 +236,9 @@ async def commit_layer_worktree(
 
     stat_text, code_s = await _git_diff_cached_text(root, env, "--stat")
     if code_s != 0:
-        raise HTTPException(status_code=400, detail=f"git diff --cached --stat failed:\n{stat_text.strip()}")
+        raise HTTPException(
+            status_code=400, detail=f"git diff --cached --stat failed:\n{stat_text.strip()}"
+        )
 
     shortstat, code_ss = await _git_diff_cached_text(root, env, "--shortstat")
     if code_ss != 0:
@@ -273,10 +283,8 @@ async def commit_layer_worktree(
         out_commit = out_commit_b.decode(errors="replace")
         code = proc_commit.returncode or 0
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(path)
-        except OSError:
-            pass
 
     low = out_commit.lower()
     if code != 0:
@@ -618,7 +626,10 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
 
     truncated = False
     if len(out) > _MAX_PARENT_DIFF_CHARS:
-        out = out[:_MAX_PARENT_DIFF_CHARS] + "\n\n…（输出已截断，可在本地对两层目录执行 diff -ruN -x .git）"
+        out = (
+            out[:_MAX_PARENT_DIFF_CHARS]
+            + "\n\n…（输出已截断，可在本地对两层目录执行 diff -ruN -x .git）"
+        )
         truncated = True
 
     return {
