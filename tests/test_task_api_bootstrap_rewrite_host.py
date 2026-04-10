@@ -40,3 +40,49 @@ def test_rewrite_host_docker_internal_preserves_userinfo(monkeypatch) -> None:
         _rewrite_host_docker_internal_url("http://u:p@host.docker.internal:99/x")
         == "http://u:p@10.0.0.2:99/x"
     )
+
+
+def test_extract_git_repo_urls_supports_project_repos_git_repos() -> None:
+    from onlineService.app.task_api_bootstrap import _extract_git_repo_urls
+
+    payload = {
+        "project_repos": [
+            {
+                "project_id": "p1",
+                "project_name": "repo-1",
+                "git_repos": [
+                    "https://github.com/example/repo-1.git",
+                    "https://github.com/example/repo-2.git",
+                ],
+            },
+            {
+                "project_id": "p2",
+                "project_name": "repo-2",
+                "git_repos": ["https://github.com/example/repo-3.git"],
+            },
+        ]
+    }
+    assert _extract_git_repo_urls(payload) == [
+        "https://github.com/example/repo-1.git",
+        "https://github.com/example/repo-2.git",
+        "https://github.com/example/repo-3.git",
+    ]
+
+
+def test_extract_git_repo_urls_supports_task_parameters_git_repos() -> None:
+    from onlineService.app.task_api_bootstrap import _extract_git_repo_urls
+
+    payload = {
+        "task": {
+            "parameters": {
+                "git_repos": [
+                    "https://github.com/example/repo-a.git",
+                    {"git_repo": "https://github.com/example/repo-b.git"},
+                ]
+            }
+        }
+    }
+    assert _extract_git_repo_urls(payload) == [
+        "https://github.com/example/repo-a.git",
+        "https://github.com/example/repo-b.git",
+    ]

@@ -301,7 +301,7 @@ def _bootstrap_git_clone_timeout_sec() -> int | None:
 
 
 def _extract_git_repo_urls(task_detail: dict) -> list[str]:
-    """从 task-detail 响应收集待克隆地址：优先 `project_repos[].git_repo`，并兼容 `task.parameters` 中的列表。"""
+    """从 task-detail 响应收集待克隆地址，兼容 `git_repo` 与 `git_repos[]` 结构。"""
     out: list[str] = []
     seen: set[str] = set()
 
@@ -314,21 +314,34 @@ def _extract_git_repo_urls(task_detail: dict) -> list[str]:
         seen.add(u)
         out.append(u)
 
-    for item in task_detail.get("project_repos") or []:
-        if isinstance(item, dict):
-            _add(item.get("git_repo") or item.get("url") or item.get("repo_url"))
+    def _collect_repo_list(value: Any) -> None:
+        if isinstance(value, str):
+            _add(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                _collect_repo_list(item)
+            return
+        if not isinstance(value, dict):
+            return
+        _add(value.get("git_repo") or value.get("url") or value.get("repo_url"))
+        nested = value.get("git_repos")
+        if nested is not None:
+            _collect_repo_list(nested)
+
+    # 任务详情主结构：project_repos[].git_repos[]（多项目多仓库）。
+    _collect_repo_list(task_detail.get("project_repos"))
+    # 兼容直接平铺到根节点的 git_repos。
+    _collect_repo_list(task_detail.get("git_repos"))
+
     task_obj = task_detail.get("task")
     if isinstance(task_obj, dict):
+        # 兼容 task.git_repos。
+        _collect_repo_list(task_obj.get("git_repos"))
         params = task_obj.get("parameters")
         if isinstance(params, dict):
-            for key in ("project_urls", "project_repos", "repos", "repositories"):
-                val = params.get(key)
-                if isinstance(val, list):
-                    for item in val:
-                        if isinstance(item, str):
-                            _add(item)
-                        elif isinstance(item, dict):
-                            _add(item.get("git_repo") or item.get("url") or item.get("repo_url"))
+            for key in ("git_repos", "project_urls", "project_repos", "repos", "repositories"):
+                _collect_repo_list(params.get(key))
     return out
 
 
@@ -713,9 +726,10 @@ def bootstrap_container_config() -> None:
             step="refresh-access",
             timeout=timeout,
         )
-        new_access = ref.get("access_token")
-        if not new_access:
+        new_access_raw = ref.get("access_token")
+        if not isinstance(new_access_raw, str) or not new_access_raw:
             raise RuntimeError(f"refresh-access 响应缺少 access_token: {ref!r}")
+        new_access = new_access_raw
 
         os.environ["ACCESS_TOKEN"] = new_access
 

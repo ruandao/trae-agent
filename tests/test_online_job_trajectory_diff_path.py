@@ -60,3 +60,33 @@ def test_prefers_root_with_more_steps(monkeypatch, tmp_path: Path) -> None:
 
     out = load_agent_steps_for_job(str(layer.resolve()), job_id)
     assert len(out["steps"]) == 2
+
+
+def test_backfills_llm_response_content_from_delivery_summary(monkeypatch, tmp_path: Path) -> None:
+    layers = tmp_path / "layers"
+    layers.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("ONLINE_PROJECT_LAYERS", str(layers))
+
+    layer = layers / "20260103_000000_abcd12"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "33333333-3333-3333-3333-333333333333"
+    step_dir = layer / ".trae_agent_json" / job_id / "step_000001"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "type": "agent_step_full",
+        "step_number": 1,
+        "state": "calling_tool",
+        "delivery_summary": "ReadFile README.md",
+        "llm_response": {"content": "", "model": "m"},
+        "tool_calls": [{"name": "ReadFile", "call_id": "c1", "arguments": {"path": "README.md"}}],
+    }
+    (step_dir / "agent_step_full.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    from onlineService.app.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    got = out["steps"][0]["llm_response"]["content"]
+    assert got == "ReadFile README.md"

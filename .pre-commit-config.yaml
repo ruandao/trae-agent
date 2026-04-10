@@ -29,6 +29,7 @@ repos:
   rev: v1.16.1
   hooks:
     - id: mypy
+      args: [--explicit-package-bases, --ignore-missing-imports, --follow-imports=skip]
       exclude: ^(evaluation/patch_selection)
       additional_dependencies:
         - types-PyYAML

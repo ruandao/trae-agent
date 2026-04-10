@@ -250,6 +250,12 @@ class LayerGitCommitBody(BaseModel):
     message: str | None = Field(default=None, max_length=4096)
 
 
+class LayerGitPushBody(BaseModel):
+    """在工作区内执行 ``git push``；可指定推送目标分支。"""
+
+    target_branch: str | None = Field(default=None, max_length=256)
+
+
 def _command_for_layer_id(layer_id: str) -> str | None:
     for j in store.list_jobs():
         if j.layer_id == layer_id:
@@ -647,9 +653,16 @@ async def api_layer_git_commit(
 
 
 @app.post("/api/layers/{layer_id}/git/push")
-async def api_layer_git_push(_: AuthDep, layer_id: str) -> dict[str, Any]:
+async def api_layer_git_push(
+    _: AuthDep,
+    layer_id: str,
+    body: LayerGitPushBody | None = None,
+) -> dict[str, Any]:
     """将当前分支推送到已配置的上游远程。"""
-    return await push_layer_worktree(layer_id)
+    target_branch = None
+    if body is not None and body.target_branch is not None:
+        target_branch = body.target_branch.strip() or None
+    return await push_layer_worktree(layer_id, target_branch=target_branch)
 
 
 @app.get("/api/layers/{layer_id}/diff/parent/files")

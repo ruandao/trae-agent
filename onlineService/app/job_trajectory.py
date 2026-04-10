@@ -80,6 +80,33 @@ def _truncate_step(step: dict[str, Any], max_cell: int) -> None:
             _truncate_tool_result_block(tr, max_cell)
 
 
+def _fallback_llm_content_from_step(step: dict[str, Any]) -> str:
+    """当 llm_response.content 为空时，回填可读摘要，避免前端全空白。"""
+    for key in ("lakeview_summary", "delivery_summary", "reflection", "error"):
+        v = step.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    calls = step.get("tool_calls")
+    if isinstance(calls, list):
+        names = [str(c.get("name") or "").strip() for c in calls if isinstance(c, dict)]
+        names = [n for n in names if n]
+        if names:
+            return "调用工具: " + ", ".join(names[:6])
+    return ""
+
+
+def _ensure_step_llm_content(step: dict[str, Any]) -> None:
+    lr = step.get("llm_response")
+    if not isinstance(lr, dict):
+        return
+    content = lr.get("content")
+    if isinstance(content, str) and content.strip():
+        return
+    fallback = _fallback_llm_content_from_step(step)
+    if fallback:
+        lr["content"] = fallback
+
+
 def _safe_job_id_segment(job_id: str) -> bool:
     s = str(job_id).strip()
     if not s or "/" in s or "\\" in s or s in (".", ".."):
@@ -115,10 +142,14 @@ def _load_agent_steps_from_trajectory_dir(layer_dir: Path) -> dict[str, Any]:
     max_cell = _max_cell_chars()
     if max_cell is None:
         steps_out: list[Any] = deepcopy(steps_raw)
+        for s in steps_out:
+            if isinstance(s, dict):
+                _ensure_step_llm_content(s)
     else:
         steps_out = deepcopy(steps_raw)
         for s in steps_out:
             if isinstance(s, dict):
+                _ensure_step_llm_content(s)
                 _truncate_step(s, max_cell)
 
     return {
@@ -176,10 +207,14 @@ def _steps_from_tae_agent_job_root(root: Path) -> dict[str, Any] | None:
     max_cell = _max_cell_chars()
     if max_cell is None:
         steps_out = deepcopy(steps_raw)
+        for s in steps_out:
+            if isinstance(s, dict):
+                _ensure_step_llm_content(s)
     else:
         steps_out = deepcopy(steps_raw)
         for s in steps_out:
             if isinstance(s, dict):
+                _ensure_step_llm_content(s)
                 _truncate_step(s, max_cell)
 
     return {
