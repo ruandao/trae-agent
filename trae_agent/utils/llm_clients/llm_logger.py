@@ -82,6 +82,7 @@ class LLMLogger:
             log_entry: The log entry to write.
         """
         safe_entry = self._to_json_safe(log_entry)
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         with open(self.log_file, "a", encoding="utf-8") as f:
             json.dump(safe_entry, f, ensure_ascii=False)
             f.write("\n")

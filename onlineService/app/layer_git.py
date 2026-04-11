@@ -33,10 +33,34 @@ _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 _SKIP_PARTS = {".git", "__pycache__", ".DS_Store"}
 log = logging.getLogger(__name__)
 
+_runtime_git_identity: dict[str, str] = {}
+
 
 def _ensure_layer_id(layer_id: str) -> None:
     if not layer_id or not _LAYER_ID_RE.match(layer_id):
         raise HTTPException(status_code=400, detail="invalid layer_id")
+
+
+def set_runtime_git_identity(name: str, email: str) -> dict[str, str]:
+    clean_name = str(name or "").strip()
+    clean_email = str(email or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="git identity name is empty")
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="git identity email is empty")
+    if "@" not in clean_email:
+        raise HTTPException(status_code=400, detail="git identity email is invalid")
+    _runtime_git_identity["name"] = clean_name
+    _runtime_git_identity["email"] = clean_email
+    return {"name": clean_name, "email": clean_email}
+
+
+def get_runtime_git_identity() -> dict[str, str]:
+    name = str(_runtime_git_identity.get("name") or "").strip()
+    email = str(_runtime_git_identity.get("email") or "").strip()
+    if not name or not email:
+        return {"name": "", "email": ""}
+    return {"name": name, "email": email}
 
 
 def _dir_has_git_metadata(p: Path) -> bool:
@@ -322,11 +346,16 @@ async def commit_layer_worktree(
 
     explicit = (message or "").strip()
 
+    runtime_identity = get_runtime_git_identity()
     author_name = (
-        os.environ.get("TRAE_GIT_COMMITTER_NAME") or "trae-online-service"
+        runtime_identity.get("name")
+        or os.environ.get("TRAE_GIT_COMMITTER_NAME")
+        or "trae-online-service"
     ).strip() or "trae-online-service"
     author_email = (
-        os.environ.get("TRAE_GIT_COMMITTER_EMAIL") or "trae-online@local"
+        runtime_identity.get("email")
+        or os.environ.get("TRAE_GIT_COMMITTER_EMAIL")
+        or "trae-online@local"
     ).strip() or "trae-online@local"
 
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}

@@ -4,7 +4,7 @@
 import unittest
 from unittest.mock import patch
 
-from trae_agent.utils.config import Config, ModelConfig, ModelProvider
+from trae_agent.utils.config import Config, ModelConfig, ModelProvider, TraeAgentConfig
 from trae_agent.utils.legacy_config import LegacyConfig
 from trae_agent.utils.llm_clients.anthropic_client import AnthropicClient
 from trae_agent.utils.llm_clients.openai_client import OpenAIClient
@@ -230,6 +230,33 @@ class TestLakeviewConfig(unittest.TestCase):
         config = Config.create_from_legacy_config(legacy_config=LegacyConfig(config_data))
 
         self.assertEqual(config.trae_agent.mcp_servers_config, {})
+
+
+class TestTraeAgentMaxStepsEnv(unittest.TestCase):
+    def test_trae_max_steps_env_overrides_config_when_cli_missing(self):
+        model_config = ModelConfig(
+            model="gpt-4o",
+            model_provider=ModelProvider(
+                api_key="test-api-key",
+                provider="openai",
+            ),
+            max_tokens=4096,
+            temperature=0.5,
+            top_p=1,
+            top_k=0,
+            parallel_tool_calls=False,
+            max_retries=10,
+        )
+        cfg = TraeAgentConfig(
+            allow_mcp_servers=[],
+            mcp_servers_config={},
+            max_steps=20,
+            model=model_config,
+            tools_blacklist=[],
+        )
+        with patch.dict("os.environ", {"TRAE_MAX_STEPS": "233"}, clear=False):
+            cfg.resolve_config_values(max_steps=None)
+        self.assertEqual(cfg.max_steps, 233)
 
 
 if __name__ == "__main__":

@@ -42,10 +42,12 @@ from .layer_git import (
     commit_layer_worktree,
     diff_layer_one_path_vs_parent,
     diff_layer_worktree_vs_parent,
+    get_runtime_git_identity,
     git_ahead_of_upstream,
     git_worktree_dirty,
     list_layer_changes_vs_parent,
     push_layer_worktree,
+    set_runtime_git_identity,
 )
 from .layer_git import (
     list_branches as list_layer_git_branches,
@@ -191,6 +193,77 @@ def _job_to_api_dict(rec: JobRecord) -> dict[str, Any]:
     return d
 
 
+def _parse_token_int(value: Any) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    return n
+
+
+def _step_token_total(step: Any) -> int | None:
+    if not isinstance(step, dict):
+        return None
+    usage = step.get("llm_response", {}).get("usage")
+    if not isinstance(usage, dict):
+        usage = step.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    for key in ("total_tokens", "total", "tokens", "token_count", "total_token"):
+        n = _parse_token_int(usage.get(key))
+        if n is not None:
+            return n
+    input_n = _parse_token_int(
+        usage.get("input_tokens", usage.get("prompt_tokens", usage.get("input")))
+    )
+    output_n = _parse_token_int(
+        usage.get(
+            "output_tokens",
+            usage.get("completion_tokens", usage.get("output")),
+        )
+    )
+    if input_n is None and output_n is None:
+        return None
+    return (input_n or 0) + (output_n or 0)
+
+
+def _step_model_name(step: Any) -> str:
+    if not isinstance(step, dict):
+        return ""
+    for key in ("model", "model_name", "llm_model"):
+        v = step.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    lr = step.get("llm_response")
+    if isinstance(lr, dict):
+        v = lr.get("model")
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _summarize_job_steps_usage(payload: dict[str, Any]) -> tuple[list[str], int | None]:
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        return ([], None)
+    models: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    has_any_token = False
+    for step in steps:
+        model = _step_model_name(step)
+        if model and model not in seen:
+            seen.add(model)
+            models.append(model)
+        delta = _step_token_total(step)
+        if delta is not None:
+            has_any_token = True
+            total += delta
+    return (models, total if has_any_token else None)
+
+
 class JobCreateBody(BaseModel):
     command: str = Field(..., min_length=1)
     command_kind: Literal["trae", "shell"] = Field(
@@ -207,6 +280,10 @@ class JobCreateBody(BaseModel):
         default=None,
         max_length=256,
         description="任务开始前在工作区内执行 git checkout。",
+    )
+    env: dict[str, str] | None = Field(
+        default=None,
+        description="可选：为该任务执行进程注入额外环境变量。",
     )
 
 
@@ -254,6 +331,13 @@ class LayerGitPushBody(BaseModel):
     """在工作区内执行 ``git push``；可指定推送目标分支。"""
 
     target_branch: str | None = Field(default=None, max_length=256)
+
+
+class GitIdentityBody(BaseModel):
+    """容器级当前 Git 身份（用于后续 commit/push）。"""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    email: str = Field(..., min_length=3, max_length=320)
 
 
 def _command_for_layer_id(layer_id: str) -> str | None:
@@ -442,6 +526,7 @@ async def create_job(_: AuthDep, body: JobCreateBody) -> dict[str, Any]:
             repo_layer_id=body.repo_layer_id.strip() if body.repo_layer_id else None,
             git_branch=body.git_branch.strip() if body.git_branch else None,
             command_kind=body.command_kind,
+            command_env=body.env,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -665,6 +750,18 @@ async def api_layer_git_push(
     return await push_layer_worktree(layer_id, target_branch=target_branch)
 
 
+@app.get("/api/git/identity")
+async def api_git_identity_get(_: AuthDep) -> dict[str, Any]:
+    identity = get_runtime_git_identity()
+    return {"status": "ok", "name": identity["name"], "email": identity["email"]}
+
+
+@app.post("/api/git/identity")
+async def api_git_identity_set(_: AuthDep, body: GitIdentityBody) -> dict[str, Any]:
+    identity = set_runtime_git_identity(body.name, body.email)
+    return {"status": "ok", "name": identity["name"], "email": identity["email"]}
+
+
 @app.get("/api/layers/{layer_id}/diff/parent/files")
 async def api_layer_diff_parent_files(_: AuthDep, layer_id: str) -> dict[str, Any]:
     """子层相对已解析父层的变动路径列表（``diff -rq -x .git`` 解析摘要）。"""
@@ -836,6 +933,34 @@ async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
             layers.insert(0, layers.pop(idx))
 
     jobs_api = [_job_to_api_dict(j) for j in jobs]
+    jobs_api_by_id: dict[str, dict[str, Any]] = {
+        str(x.get("id")): x for x in jobs_api if x.get("id")
+    }
+    latest_job_by_layer: dict[str, JobRecord] = {}
+    latest_job_rank: dict[str, tuple[str, int]] = {}
+    for idx, rec in enumerate(jobs):
+        lid = str(rec.layer_id or "").strip()
+        if not lid or rec.command_kind == "clone":
+            continue
+        cur_rank = (str(rec.created_at or ""), idx)
+        prev_rank = latest_job_rank.get(lid)
+        if prev_rank is None or cur_rank >= prev_rank:
+            latest_job_rank[lid] = cur_rank
+            latest_job_by_layer[lid] = rec
+    for rec in latest_job_by_layer.values():
+        try:
+            payload = load_agent_steps_for_job(rec.layer_path, rec.id)
+        except ValueError:
+            continue
+        models, total_tokens = _summarize_job_steps_usage(payload)
+        row = jobs_api_by_id.get(rec.id)
+        if not row:
+            continue
+        if models:
+            row["llm_models"] = models
+            row["llm_model"] = models[0]
+        if total_tokens is not None:
+            row["llm_total_tokens"] = total_tokens
     return {
         "layers": layers,
         "jobs": jobs_api,

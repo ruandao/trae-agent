@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import yaml
 
@@ -176,7 +176,11 @@ class TraeAgentConfig(AgentConfig):
         *,
         max_steps: int | None = None,
     ):
-        resolved_value = resolve_config_value(cli_value=max_steps, config_value=self.max_steps)
+        resolved_value = resolve_config_value(
+            cli_value=max_steps,
+            config_value=self.max_steps,
+            env_var="TRAE_MAX_STEPS",
+        )
         if resolved_value:
             self.max_steps = int(resolved_value)
 
@@ -232,8 +236,14 @@ class Config:
         model_providers = yaml_config.get("model_providers", None)
         if model_providers is not None and len(model_providers.keys()) > 0:
             config_model_providers: dict[str, ModelProvider] = {}
+            provider_field_names = {f.name for f in fields(ModelProvider)}
             for model_provider_name, model_provider_config in model_providers.items():
-                config_model_providers[model_provider_name] = ModelProvider(**model_provider_config)
+                filtered_model_provider_config = {
+                    k: v for k, v in model_provider_config.items() if k in provider_field_names
+                }
+                config_model_providers[model_provider_name] = ModelProvider(
+                    **filtered_model_provider_config
+                )
             config.model_providers = config_model_providers
         else:
             raise ConfigError("No model providers provided")
@@ -285,7 +295,10 @@ class Config:
                 match agent_name:
                     case "trae_agent":
                         agent_config_resolved = dict(agent_config)
-                        if "tools" in agent_config_resolved and "tools_blacklist" in agent_config_resolved:
+                        if (
+                            "tools" in agent_config_resolved
+                            and "tools_blacklist" in agent_config_resolved
+                        ):
                             raise ConfigError(
                                 "Specify only one of 'tools' or 'tools_blacklist' in trae_agent config."
                             )

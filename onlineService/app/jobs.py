@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -172,6 +172,40 @@ async def _iter_stdout_text(stream: asyncio.StreamReader) -> AsyncIterator[str]:
             yield text
 
 
+def _is_trae_noise_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    return (
+        s.startswith("Changed working directory to:")
+        or s == "Initialising MCP tools..."
+        or s.startswith("Trajectory saved to:")
+    )
+
+
+def _filter_trae_output_chunk(text: str, carry: str = "") -> tuple[str, str]:
+    """Filter noisy fixed trae-cli lines and keep chunk boundaries safe."""
+    merged = f"{carry}{text}" if carry else text
+    if not merged:
+        return "", ""
+    lines = merged.splitlines(keepends=True)
+    next_carry = ""
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        next_carry = lines.pop()
+    kept: list[str] = []
+    for line in lines:
+        if _is_trae_noise_line(line.rstrip("\r\n")):
+            continue
+        kept.append(line)
+    return "".join(kept), next_carry
+
+
+def _finalize_trae_output_carry(carry: str) -> str:
+    if not carry:
+        return ""
+    return "" if _is_trae_noise_line(carry.rstrip("\r\n")) else carry
+
+
 def _job_subprocess_columns() -> str:
     raw = (os.environ.get("TRAE_JOB_COLUMNS") or "").strip().lower()
     if not raw or raw in ("0", "unlimited", "none", "max", "inf"):
@@ -184,7 +218,23 @@ def _job_subprocess_columns() -> str:
     return str(_DEFAULT_JOB_WIDE_COLUMNS)
 
 
-def _job_subprocess_env(*, trae_json_log_dir: str | None = None) -> dict[str, str]:
+def _normalize_job_env(extra_env: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(extra_env, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in extra_env.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        out[key] = str(v)
+    return out
+
+
+def _job_subprocess_env(
+    *,
+    trae_json_log_dir: str | None = None,
+    extra_env: dict[str, Any] | None = None,
+) -> dict[str, str]:
     base = {**os.environ, "PYTHONUNBUFFERED": "1"}
     base["COLUMNS"] = _job_subprocess_columns()
     if not base.get("PYTHONPATH"):
@@ -192,6 +242,7 @@ def _job_subprocess_env(*, trae_json_log_dir: str | None = None) -> dict[str, st
         base["PYTHONPATH"] = str(repo_root())
     if trae_json_log_dir:
         base["TRAE_AGENT_JSON_OUTPUT_DIR"] = trae_json_log_dir
+    base.update(_normalize_job_env(extra_env))
     return base
 
 
@@ -247,6 +298,7 @@ class JobRecord:
     repo_layer_id: str | None = None  # 无父任务时从该层复制工作区
     git_head_at_run_start: str | None = None  # 本次 trae-cli 启动前 HEAD（用于检测是否已有新提交）
     command_kind: CommandKind = "trae"  # shell：原样 bash -lc，不经 trae-cli
+    command_env: dict[str, str] | None = None  # 该任务执行时附加注入的环境变量
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -382,6 +434,12 @@ class JobStore:
                 return j
         return None
 
+    def _runner_done_callback(self, job_id: str) -> Callable[[asyncio.Task[None]], None]:
+        def _callback(_task: asyncio.Task[None]) -> None:
+            self._runner_tasks.pop(job_id, None)
+
+        return _callback
+
     def layer_queue_depth(self, layer_id: str) -> int:
         return len(self._layer_queues.get(layer_id, []))
 
@@ -401,6 +459,7 @@ class JobStore:
             for row in data.get("jobs", []):
                 row = {**row}
                 row.setdefault("command_kind", "trae")
+                row.setdefault("command_env", None)
                 if row.get("command_kind") not in ("trae", "shell", "clone"):
                     row["command_kind"] = "trae"
                 rec = JobRecord(**row)
@@ -453,6 +512,7 @@ class JobStore:
         repo_layer_id: str | None = None,
         git_branch: str | None = None,
         command_kind: CommandKind = "trae",
+        command_env: dict[str, Any] | None = None,
     ) -> JobRecord:
         from datetime import datetime
 
@@ -516,6 +576,7 @@ class JobStore:
                 git_branch=git_branch,
                 repo_layer_id=repo_layer_id if not parent_job_id else None,
                 command_kind=command_kind,
+                command_env=_normalize_job_env(command_env) or None,
             )
             async with self._lock:
                 self._jobs[jid] = rec
@@ -523,7 +584,7 @@ class JobStore:
             await hub.publish(sse_job_event("job_created", rec, rec.id))
             task = asyncio.create_task(self._run_job(jid))
             self._runner_tasks[jid] = task
-            task.add_done_callback(lambda _t, job_id=jid: self._runner_tasks.pop(job_id, None))
+            task.add_done_callback(self._runner_done_callback(jid))
             return rec
 
     async def register_clone_layer_job(
@@ -670,7 +731,6 @@ class JobStore:
         trae_json_root: str | None = None
         if rec.command_kind == "trae":
             trae_json_root = str((Path(work).resolve() / ".trae_agent_json" / job_id))
-            rec.output += f"[trae_agent JSON log] {trae_json_root}\n"
             _append_job_event_line(rec, "meta", message="trae_agent_json_dir", path=trae_json_root)
         await self._save()
         await hub.publish(sse_job_event("job_started", rec, job_id))
@@ -681,7 +741,10 @@ class JobStore:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(work_dir),
-                env=_job_subprocess_env(trae_json_log_dir=trae_json_root),
+                env=_job_subprocess_env(
+                    trae_json_log_dir=trae_json_root,
+                    extra_env=rec.command_env,
+                ),
                 start_new_session=True,
             )
         except Exception as e:
@@ -702,11 +765,22 @@ class JobStore:
 
         self._running[job_id] = proc
         assert proc.stdout is not None
+        trae_stdout_carry = ""
         try:
             async for text in _iter_stdout_text(proc.stdout):
+                if rec.command_kind == "trae":
+                    text, trae_stdout_carry = _filter_trae_output_chunk(text, trae_stdout_carry)
+                    if not text:
+                        continue
                 rec.output += text
                 _append_job_event_line(rec, "chunk", message=text)
                 await hub.publish(sse_job_event("job_output", rec, job_id))
+            if rec.command_kind == "trae":
+                tail = _finalize_trae_output_carry(trae_stdout_carry)
+                if tail:
+                    rec.output += tail
+                    _append_job_event_line(rec, "chunk", message=tail)
+                    await hub.publish(sse_job_event("job_output", rec, job_id))
             code = await proc.wait()
             rec.exit_code = code
             if job_id in self._running:
@@ -930,7 +1004,7 @@ class JobStore:
 
             task = asyncio.create_task(self._run_job(job_id))
             self._runner_tasks[job_id] = task
-            task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
+            task.add_done_callback(self._runner_done_callback(job_id))
             return rec
 
     async def continue_job(self, job_id: str) -> JobRecord:
@@ -959,7 +1033,7 @@ class JobStore:
                 self._run_job(job_id, run_command="继续", preserve_output=True)
             )
             self._runner_tasks[job_id] = task
-            task.add_done_callback(lambda _t, jid=job_id: self._runner_tasks.pop(jid, None))
+            task.add_done_callback(self._runner_done_callback(job_id))
             return rec
 
     async def reset_all(self) -> dict[str, Any]:
