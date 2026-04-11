@@ -75,6 +75,30 @@ def job_events_job_dir(job_id: str) -> Path:
     return d
 
 
+def runtime_job_logs_root(*, ensure: bool = True) -> Path:
+    """任务运行日志根目录（``state_root()/runtime/job_logs``）。"""
+    d = runtime_dir() / "job_logs"
+    if ensure:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def job_agent_json_root(job_id: str, *, ensure: bool = True) -> Path:
+    """SimpleCLIConsole 结构化步骤输出目录。"""
+    d = runtime_job_logs_root(ensure=ensure) / "trae_agent_json" / str(job_id)
+    if ensure:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def job_trajectory_dir(job_id: str, *, ensure: bool = True) -> Path:
+    """Trajectory JSON 输出目录。"""
+    d = runtime_job_logs_root(ensure=ensure) / "trajectories" / str(job_id)
+    if ensure:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def online_project_root() -> Path:
     """仓库根下对外展示的联合视图路径（默认 ``<REPO_ROOT>/onlineProject``）。"""
     return Path(os.environ.get("ONLINE_PROJECT_ROOT", repo_root() / "onlineProject"))

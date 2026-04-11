@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -17,9 +18,11 @@ from fastapi import HTTPException
 from trae_agent.utils.auto_commit_message import load_latest_trajectory_data
 
 from .git_clone import _validate_branch
-from .layer_merge import layer_merged_root_for_api
+from .layer_merge import layer_merged_root_for_api, lower_paths_full_tip
 from .layer_meta import is_overlay_v1_layer
 from .layers import layer_path
+from .overlay_diff import materialize_merged_chain
+from .paths import runtime_dir
 
 
 def layer_git_workspace_root(layer_id: str) -> Path:
@@ -27,6 +30,25 @@ def layer_git_workspace_root(layer_id: str) -> Path:
     if is_overlay_v1_layer(layer_id):
         return layer_merged_root_for_api(layer_id)
     return layer_path(layer_id)
+
+
+@contextlib.contextmanager
+def _layer_compare_workspace_root(layer_id: str):
+    """对比场景下的稳定工作区根。
+
+    Overlay 层使用本次请求独占的物化快照，避免共享 materialized 目录在并发重建时被删改。
+    """
+    if not is_overlay_v1_layer(layer_id):
+        yield layer_path(layer_id).resolve()
+        return
+    cmp_root = runtime_dir() / "materialized_compare"
+    cmp_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f"{layer_id}_", dir=str(cmp_root)))
+    try:
+        materialize_merged_chain(lower_paths_full_tip(layer_id), tmp)
+        yield tmp.resolve()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
@@ -634,33 +656,35 @@ def list_layer_changes_vs_parent(parent_layer_id: str, layer_id: str) -> dict[st
     if parent_layer_id == layer_id:
         raise HTTPException(status_code=400, detail="invalid parent/child pair")
 
-    parent_root = layer_git_workspace_root(parent_layer_id).resolve()
-    child_root = layer_git_workspace_root(layer_id).resolve()
-    if not parent_root.is_dir():
-        raise HTTPException(status_code=404, detail="parent layer not found")
-    if not child_root.is_dir():
-        raise HTTPException(status_code=404, detail="layer not found")
+    with (
+        _layer_compare_workspace_root(parent_layer_id) as parent_root,
+        _layer_compare_workspace_root(layer_id) as child_root,
+    ):
+        if not parent_root.is_dir():
+            raise HTTPException(status_code=404, detail="parent layer not found")
+        if not child_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
 
-    try:
-        proc = subprocess.run(
-            ["diff", "-rq", "-x", ".git", str(parent_root), str(child_root)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
-        )
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(status_code=504, detail=f"diff timed out: {e}") from e
+        try:
+            proc = subprocess.run(
+                ["diff", "-rq", "-x", ".git", str(parent_root), str(child_root)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
+            )
+        except subprocess.TimeoutExpired as e:
+            raise HTTPException(status_code=504, detail=f"diff timed out: {e}") from e
 
-    if proc.returncode not in (0, 1):
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise HTTPException(
-            status_code=400,
-            detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
-        )
+        if proc.returncode not in (0, 1):
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise HTTPException(
+                status_code=400,
+                detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
+            )
 
-    out = proc.stdout or ""
-    items = _parse_diff_rq_output(out, parent_root, child_root)
+        out = proc.stdout or ""
+        items = _parse_diff_rq_output(out, parent_root, child_root)
     truncated_list = False
     if len(items) > _MAX_CHANGE_LIST_LINES:
         items = items[:_MAX_CHANGE_LIST_LINES]
@@ -692,32 +716,34 @@ def diff_layer_one_path_vs_parent(
     rel = _validate_safe_rel_posix(norm)
     rel_s = rel.as_posix()
 
-    parent_root = layer_git_workspace_root(parent_layer_id).resolve()
-    child_root = layer_git_workspace_root(layer_id).resolve()
-    if not parent_root.is_dir():
-        raise HTTPException(status_code=404, detail="parent layer not found")
-    if not child_root.is_dir():
-        raise HTTPException(status_code=404, detail="layer not found")
+    with (
+        _layer_compare_workspace_root(parent_layer_id) as parent_root,
+        _layer_compare_workspace_root(layer_id) as child_root,
+    ):
+        if not parent_root.is_dir():
+            raise HTTPException(status_code=404, detail="parent layer not found")
+        if not child_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
 
-    p_path = parent_root / Path(*rel.parts)
-    c_path = child_root / Path(*rel.parts)
-    try:
-        p_res = p_path.resolve()
-        c_res = c_path.resolve()
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
-    if not p_res.is_relative_to(parent_root) or not c_res.is_relative_to(child_root):
-        raise HTTPException(status_code=400, detail="path escapes layer root")
+        p_path = parent_root / Path(*rel.parts)
+        c_path = child_root / Path(*rel.parts)
+        try:
+            p_res = p_path.resolve()
+            c_res = c_path.resolve()
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
+        if not p_res.is_relative_to(parent_root) or not c_res.is_relative_to(child_root):
+            raise HTTPException(status_code=400, detail="path escapes layer root")
 
-    p_exists = p_res.exists()
-    c_exists = c_res.exists()
-    if not p_exists and not c_exists:
-        raise HTTPException(status_code=404, detail="path not found in parent or child layer")
+        p_exists = p_res.exists()
+        c_exists = c_res.exists()
+        if not p_exists and not c_exists:
+            raise HTTPException(status_code=404, detail="path not found in parent or child layer")
 
-    p_is_dir = p_exists and p_res.is_dir()
-    c_is_dir = c_exists and c_res.is_dir()
-    p_is_file = p_exists and p_res.is_file()
-    c_is_file = c_exists and c_res.is_file()
+        p_is_dir = p_exists and p_res.is_dir()
+        c_is_dir = c_exists and c_res.is_dir()
+        p_is_file = p_exists and p_res.is_file()
+        c_is_file = c_exists and c_res.is_file()
 
     def run_diff(argv: list[str]) -> tuple[str, int]:
         proc = subprocess.run(
@@ -781,35 +807,37 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
     if parent_layer_id == layer_id:
         raise HTTPException(status_code=400, detail="invalid parent/child pair")
 
-    parent_root = layer_git_workspace_root(parent_layer_id).resolve()
-    child_root = layer_git_workspace_root(layer_id).resolve()
-    if not parent_root.is_dir():
-        raise HTTPException(status_code=404, detail="parent layer not found")
-    if not child_root.is_dir():
-        raise HTTPException(status_code=404, detail="layer not found")
+    with (
+        _layer_compare_workspace_root(parent_layer_id) as parent_root,
+        _layer_compare_workspace_root(layer_id) as child_root,
+    ):
+        if not parent_root.is_dir():
+            raise HTTPException(status_code=404, detail="parent layer not found")
+        if not child_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
 
-    try:
-        proc = subprocess.run(
-            ["diff", "-ruN", "-x", ".git", str(parent_root), str(child_root)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
-        )
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(status_code=504, detail=f"diff timed out: {e}") from e
+        try:
+            proc = subprocess.run(
+                ["diff", "-ruN", "-x", ".git", str(parent_root), str(child_root)],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env={**os.environ, "LANG": os.environ.get("LANG", "C.UTF-8")},
+            )
+        except subprocess.TimeoutExpired as e:
+            raise HTTPException(status_code=504, detail=f"diff timed out: {e}") from e
 
-    # diff 返回 1 表示有差异，0 表示相同，2 为错误
-    if proc.returncode not in (0, 1):
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise HTTPException(
-            status_code=400,
-            detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
-        )
+        # diff 返回 1 表示有差异，0 表示相同，2 为错误
+        if proc.returncode not in (0, 1):
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise HTTPException(
+                status_code=400,
+                detail=f"diff failed (code {proc.returncode}): {err or 'unknown'}",
+            )
 
-    out = proc.stdout or ""
-    if proc.stderr:
-        out = (out + "\n" + proc.stderr).strip()
+        out = proc.stdout or ""
+        if proc.stderr:
+            out = (out + "\n" + proc.stderr).strip()
 
     truncated = False
     if len(out) > _MAX_PARENT_DIFF_CHARS:

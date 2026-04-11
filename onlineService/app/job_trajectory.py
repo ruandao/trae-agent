@@ -1,4 +1,4 @@
-"""Read agent_steps from job-scoped JSON under ``.trae_agent_json/{job_id}`` or layer ``.trajectories``."""
+"""Read agent steps from runtime job logs or legacy layer-local artifacts."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .paths import layers_root
+from .paths import job_agent_json_root, job_trajectory_dir, layers_root
 
 _STEP_DIR_RE = re.compile(r"^step_(\d+)$")
 
@@ -32,6 +32,18 @@ def _latest_trajectory_file(layer_dir: Path) -> Path | None:
     if not files:
         return None
     return max(files, key=lambda f: f.stat().st_mtime)
+
+
+def _latest_runtime_trajectory_file(job_id: str) -> Path | None:
+    if not _safe_job_id_segment(job_id):
+        return None
+    traj_dir = job_trajectory_dir(job_id, ensure=False)
+    if not traj_dir.is_dir():
+        return None
+    candidates = [f for f in traj_dir.glob("*.json") if f.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: f.stat().st_mtime)
 
 
 def _max_cell_chars() -> int | None:
@@ -160,6 +172,35 @@ def _load_agent_steps_from_trajectory_dir(layer_dir: Path) -> dict[str, Any]:
     }
 
 
+def _load_agent_steps_from_runtime_trajectory(job_id: str) -> dict[str, Any] | None:
+    traj_file = _latest_runtime_trajectory_file(job_id)
+    if traj_file is None:
+        return None
+    try:
+        data = json.loads(traj_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    steps_raw = data.get("agent_steps")
+    if not isinstance(steps_raw, list):
+        steps_raw = []
+    steps_out = deepcopy(steps_raw)
+    max_cell = _max_cell_chars()
+    for s in steps_out:
+        if isinstance(s, dict):
+            _ensure_step_llm_content(s)
+            if max_cell is not None:
+                _truncate_step(s, max_cell)
+    return {
+        "trajectory_file": str(traj_file),
+        "task": data.get("task"),
+        "steps": steps_out,
+        "note": None,
+    }
+
+
 def _steps_from_tae_agent_job_root(root: Path) -> dict[str, Any] | None:
     """Parse step JSON under ``root`` = ``.../.trae_agent_json/{job_id}``."""
     if not root.is_dir():
@@ -228,7 +269,10 @@ def _steps_from_tae_agent_job_root(root: Path) -> dict[str, Any] | None:
 def _try_load_steps_from_trae_agent_json(layer_dir: Path, job_id: str) -> dict[str, Any] | None:
     """Load steps from ``SimpleCLIConsole`` output.
 
-    Non-overlay 任务写在 ``{layer}/.trae_agent_json/{job_id}/``。
+    新版在线服务默认写在 ``runtime/job_logs/trae_agent_json/{job_id}/``；
+    为兼容历史数据，仍会回退扫描层目录内旧路径。
+
+    Non-overlay 旧任务写在 ``{layer}/.trae_agent_json/{job_id}/``。
     Overlay 任务运行时写在 ``merged/.trae_agent_json/``，结束后随 upper 落盘到
     ``diff/.trae_agent_json/``；``JobRecord.layer_path`` 仅为层根目录，须在各候选
     路径中解析并择步数最多的一份。
@@ -242,6 +286,7 @@ def _try_load_steps_from_trae_agent_json(layer_dir: Path, job_id: str) -> dict[s
         Path("merged") / ".trae_agent_json" / job_id,
         Path("upper") / ".trae_agent_json" / job_id,
     )
+    runtime_root = job_agent_json_root(job_id, ensure=False)
 
     best: dict[str, Any] | None = None
     best_n = -1
@@ -249,6 +294,12 @@ def _try_load_steps_from_trae_agent_json(layer_dir: Path, job_id: str) -> dict[s
         payload = _steps_from_tae_agent_job_root(layer_dir / rel)
         if payload is None:
             continue
+        n = len(payload.get("steps") or [])
+        if n > best_n:
+            best_n = n
+            best = payload
+    payload = _steps_from_tae_agent_job_root(runtime_root)
+    if payload is not None:
         n = len(payload.get("steps") or [])
         if n > best_n:
             best_n = n
@@ -264,9 +315,12 @@ def load_agent_steps_for_layer(layer_path: str) -> dict[str, Any]:
 
 
 def load_agent_steps_for_job(layer_path: str, job_id: str) -> dict[str, Any]:
-    """Prefer per-job ``.trae_agent_json/{job_id}``; fall back to layer ``.trajectories``."""
+    """优先读取 runtime job logs；再回退层目录遗留产物。"""
     layer_dir = _layer_dir_must_be_allowed(layer_path)
     from_json = _try_load_steps_from_trae_agent_json(layer_dir, job_id)
     if from_json is not None:
         return from_json
+    runtime_traj = _load_agent_steps_from_runtime_trajectory(job_id)
+    if runtime_traj is not None:
+        return runtime_traj
     return _load_agent_steps_from_trajectory_dir(layer_dir)

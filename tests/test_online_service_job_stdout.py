@@ -13,10 +13,12 @@ if str(_SERVICE) not in sys.path:
     sys.path.insert(0, str(_SERVICE))
 
 from app.jobs import (  # noqa: E402
+    _build_trae_run_cmd,
     _filter_trae_output_chunk,
     _finalize_trae_output_carry,
     _iter_stdout_text,
     _job_subprocess_env,
+    _resolve_model_cli_args_from_command_env,
 )
 
 
@@ -104,3 +106,30 @@ def test_filter_trae_output_chunk_handles_split_lines() -> None:
 def test_finalize_trae_output_carry_drops_noise_tail() -> None:
     assert _finalize_trae_output_carry("Initialising MCP tools...") == ""
     assert _finalize_trae_output_carry("useful tail") == "useful tail"
+
+
+def test_resolve_model_cli_args_from_command_env() -> None:
+    provider, model = _resolve_model_cli_args_from_command_env(
+        {"TRAE_MODEL_PROVIDER": "openai", "TRAE_MODEL": "gpt-4o-mini"}
+    )
+    assert provider == "openai"
+    assert model == "gpt-4o-mini"
+
+
+def test_build_trae_run_cmd_appends_model_and_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.jobs.venv_activate_path", lambda: Path("/mock/bin/activate"))
+    monkeypatch.setattr("app.jobs._venv_python_path", lambda: Path("/mock/bin/python"))
+    monkeypatch.setattr(
+        "app.jobs._is_executable_file",
+        lambda p: str(p) == "/mock/bin/python",
+    )
+    cmd = _build_trae_run_cmd(
+        Path("/tmp/trae_config.yaml"),
+        "/tmp/workspace",
+        "hello",
+        trajectory_file="/tmp/job/trajectory.json",
+        model="gpt-4.1",
+        provider="openai",
+    )
+    assert "--provider=openai" in cmd
+    assert "--model=gpt-4.1" in cmd

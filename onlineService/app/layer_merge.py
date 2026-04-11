@@ -85,7 +85,19 @@ def lower_paths_full_tip(layer_id: str) -> list[Path]:
         # 兼容旧层（无 layer_meta.json）：直接把该层自身作为完整视图来源。
         p = storage_path_for_layer(layer_id)
         return [p] if p.exists() else []
-    return [storage_path_for_layer(lid) for lid in chain]
+    out = [storage_path_for_layer(lid) for lid in chain]
+
+    # 兼容「父层为旧格式（无 meta）+ 子层为 overlay job」混合链：
+    # chain 仅含 tip（child）时，完整视图需显式补入 parent 存储层。
+    tip_meta = read_layer_meta(layer_id)
+    if tip_meta and tip_meta.kind == "job" and tip_meta.parent_layer_id:
+        parent_id = tip_meta.parent_layer_id
+        parent_in_chain = parent_id in set(chain)
+        if not parent_in_chain and read_layer_meta(parent_id) is None:
+            parent_storage = storage_path_for_layer(parent_id)
+            if parent_storage.exists():
+                out = [parent_storage, *out]
+    return out
 
 
 def layer_merged_root_for_api(layer_id: str) -> Path:

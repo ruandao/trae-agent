@@ -41,8 +41,10 @@ from .online_project_view import clear_online_project_tip, set_online_project_ti
 from .paths import (
     commands_log_path,
     config_file_path,
+    job_agent_json_root,
     job_events_dir,
     job_events_job_dir,
+    job_trajectory_dir,
     jobs_state_path,
     layers_root,
     repo_root,
@@ -260,7 +262,15 @@ def _build_shell_cmd(script: str) -> list[str]:
     return ["bash", "-lc", script]
 
 
-def _build_trae_run_cmd(cfg: Path, work: str, cmd_text: str) -> list[str]:
+def _build_trae_run_cmd(
+    cfg: Path,
+    work: str,
+    cmd_text: str,
+    *,
+    trajectory_file: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+) -> list[str]:
     activate = venv_activate_path()
     trae_bin = activate.parent / "trae-cli"
     py = _venv_python_path()
@@ -274,13 +284,31 @@ def _build_trae_run_cmd(cfg: Path, work: str, cmd_text: str) -> list[str]:
         base = [str(trae_bin)]
     else:
         base = [sys.executable, "-m", "trae_agent.cli"]
-    return [
+    cmd = [
         *base,
         "run",
         cmd_text,
         f"--config-file={str(cfg)}",
         f"--working-dir={work}",
     ]
+    if provider:
+        cmd.append(f"--provider={provider}")
+    if model:
+        cmd.append(f"--model={model}")
+    if trajectory_file:
+        cmd.append(f"--trajectory-file={trajectory_file}")
+    return cmd
+
+
+def _resolve_model_cli_args_from_command_env(
+    command_env: dict[str, str] | None,
+) -> tuple[str | None, str | None]:
+    """将任务级环境变量映射为 trae-cli 参数，避免回落到配置默认模型。"""
+    if not isinstance(command_env, dict):
+        return None, None
+    provider = str(command_env.get("TRAE_MODEL_PROVIDER") or "").strip() or None
+    model = str(command_env.get("TRAE_MODEL") or "").strip() or None
+    return provider, model
 
 
 @dataclass
@@ -693,10 +721,32 @@ class JobStore:
                 return
 
         work = str(work_dir)
+        trae_json_root: str | None = None
+        trajectory_file: str | None = None
+        if rec.command_kind == "trae":
+            trae_json_root = str(job_agent_json_root(job_id))
+            trajectory_file = str(job_trajectory_dir(job_id) / "trajectory.json")
+            _append_job_event_line(rec, "meta", message="trae_agent_json_dir", path=trae_json_root)
+            _append_job_event_line(rec, "meta", message="trajectory_file", path=trajectory_file)
         if rec.command_kind == "shell":
             cmd = _build_shell_cmd(cmd_text)
         else:
-            cmd = _build_trae_run_cmd(cfg, work, cmd_text)
+            model_provider, model_name = _resolve_model_cli_args_from_command_env(rec.command_env)
+            _append_job_event_line(
+                rec,
+                "meta",
+                message="effective_model_selection",
+                provider=model_provider,
+                model=model_name,
+            )
+            cmd = _build_trae_run_cmd(
+                cfg,
+                work,
+                cmd_text,
+                trajectory_file=trajectory_file,
+                model=model_name,
+                provider=model_provider,
+            )
 
         if rec.git_branch and not preserve_output:
             co_out, co_code = await git_checkout(work_dir, rec.git_branch)
@@ -728,10 +778,6 @@ class JobStore:
             rec.output += "\n\n继续执行（指令：继续）\n"
         elif not (rec.git_branch and rec.output.strip()):
             rec.output = ""
-        trae_json_root: str | None = None
-        if rec.command_kind == "trae":
-            trae_json_root = str((Path(work).resolve() / ".trae_agent_json" / job_id))
-            _append_job_event_line(rec, "meta", message="trae_agent_json_dir", path=trae_json_root)
         await self._save()
         await hub.publish(sse_job_event("job_started", rec, job_id))
 

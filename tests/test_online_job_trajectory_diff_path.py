@@ -90,3 +90,128 @@ def test_backfills_llm_response_content_from_delivery_summary(monkeypatch, tmp_p
     out = load_agent_steps_for_job(str(layer.resolve()), job_id)
     got = out["steps"][0]["llm_response"]["content"]
     assert got == "ReadFile README.md"
+
+
+def test_load_agent_steps_from_runtime_job_logs(monkeypatch, tmp_path: Path) -> None:
+    layers = tmp_path / "layers"
+    state_root = tmp_path / "onlineProject_state"
+    layers.mkdir(parents=True, exist_ok=True)
+    state_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("ONLINE_PROJECT_LAYERS", str(layers))
+    monkeypatch.setenv("ONLINE_PROJECT_STATE_ROOT", str(state_root))
+
+    layer = layers / "20260104_000000_abcd12"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "44444444-4444-4444-4444-444444444444"
+    step_dir = state_root / "runtime" / "job_logs" / "trae_agent_json" / job_id / "step_000001"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    (step_dir / "agent_step_full.json").write_text(
+        json.dumps({"type": "agent_step_full", "step_number": 1, "state": "completed"}),
+        encoding="utf-8",
+    )
+
+    from onlineService.app.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    assert len(out["steps"]) == 1
+    assert out["steps"][0].get("step_number") == 1
+    assert "runtime/job_logs/trae_agent_json" in (out.get("trajectory_file") or "")
+
+
+def test_layer_changes_not_affected_by_runtime_job_logs(monkeypatch, tmp_path: Path) -> None:
+    layers = tmp_path / "layers"
+    state_root = tmp_path / "onlineProject_state"
+    layers.mkdir(parents=True, exist_ok=True)
+    state_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("ONLINE_PROJECT_LAYERS", str(layers))
+    monkeypatch.setenv("ONLINE_PROJECT_STATE_ROOT", str(state_root))
+
+    parent = "20260105_000000_abcd12"
+    child = "20260105_000001_abcd12"
+    parent_dir = layers / parent
+    child_dir = layers / child
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    child_dir.mkdir(parents=True, exist_ok=True)
+    (parent_dir / "README.md").write_text("same\n", encoding="utf-8")
+    (child_dir / "README.md").write_text("same\n", encoding="utf-8")
+
+    runtime_log = (
+        state_root
+        / "runtime"
+        / "job_logs"
+        / "trae_agent_json"
+        / "j1"
+        / "step_000001"
+        / "agent_step_full.json"
+    )
+    runtime_log.parent.mkdir(parents=True, exist_ok=True)
+    runtime_log.write_text(json.dumps({"step_number": 1}), encoding="utf-8")
+
+    from onlineService.app.layer_git import list_layer_changes_vs_parent
+
+    out = list_layer_changes_vs_parent(parent, child)
+    assert out["same"] is True
+    assert out["changes"] == []
+
+
+def test_mixed_legacy_parent_overlay_child_keeps_parent_files(monkeypatch, tmp_path: Path) -> None:
+    layers = tmp_path / "layers"
+    layers.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("ONLINE_PROJECT_LAYERS", str(layers))
+
+    parent = "20260106_000000_abcd12"
+    child = "20260106_000001_bcde23"
+    parent_dir = layers / parent
+    child_dir = layers / child
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    child_dir.mkdir(parents=True, exist_ok=True)
+
+    # legacy parent: 无 layer_meta，直接以层根作为完整视图
+    (parent_dir / "somanyad" / "index.js").parent.mkdir(parents=True, exist_ok=True)
+    (parent_dir / "somanyad" / "index.js").write_text("console.log('x')\n", encoding="utf-8")
+    (parent_dir / "somanyad-emailD" / "README").parent.mkdir(parents=True, exist_ok=True)
+    (parent_dir / "somanyad-emailD" / "README").write_text("legacy\n", encoding="utf-8")
+
+    # overlay child: 仅 diff 中有新增 hello.js
+    diff_dir = child_dir / "diff"
+    diff_dir.mkdir(parents=True, exist_ok=True)
+    (diff_dir / "hello.js").write_text("console.log('Hello World');\n", encoding="utf-8")
+
+    from onlineService.app.layer_git import list_layer_changes_vs_parent
+    from onlineService.app.layer_meta import write_layer_meta
+
+    write_layer_meta(child, kind="job", parent_layer_id=parent)
+    out = list_layer_changes_vs_parent(parent, child)
+
+    assert out["same"] is False
+    changes = out["changes"] or []
+    assert changes == [{"path": "hello.js", "kind": "added"}]
+
+
+def test_overlay_diff_compare_uses_isolated_snapshot(monkeypatch, tmp_path: Path) -> None:
+    layers = tmp_path / "layers"
+    layers.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("ONLINE_PROJECT_LAYERS", str(layers))
+
+    parent = "20260107_000000_abcd12"
+    child = "20260107_000001_bcde23"
+    parent_dir = layers / parent
+    child_dir = layers / child
+    (parent_dir / "base").mkdir(parents=True, exist_ok=True)
+    (child_dir / "diff").mkdir(parents=True, exist_ok=True)
+    (parent_dir / "base" / "README.md").write_text("parent\n", encoding="utf-8")
+    (child_dir / "diff" / "hello.js").write_text("console.log('Hello');\n", encoding="utf-8")
+
+    from onlineService.app.layer_git import list_layer_changes_vs_parent
+    from onlineService.app.layer_meta import write_layer_meta
+
+    write_layer_meta(parent, kind="clone", parent_layer_id=None)
+    write_layer_meta(child, kind="job", parent_layer_id=parent)
+
+    # 若对比逻辑退回共享 workspace_root，此 monkeypatch 会触发异常。
+    def _boom(_lid: str):
+        raise RuntimeError("should not be called for overlay compare")
+
+    monkeypatch.setattr("onlineService.app.layer_git.layer_git_workspace_root", _boom)
+    out = list_layer_changes_vs_parent(parent, child)
+    assert out["changes"] == [{"path": "hello.js", "kind": "added"}]

@@ -30,6 +30,7 @@ from .git_clone import (
 from .hub import hub
 from .job_trajectory import load_agent_steps_for_job
 from .jobs import JobRecord, job_layer_git_destructive_locked, store
+from .layer_changes_saas_push import run_layer_changes_saas_push_loop
 from .layer_fs import (
     any_layer_has_git_repo,
     infer_layer_parent_from_workspace,
@@ -100,9 +101,13 @@ async def _lifespan(_app: FastAPI):
                 bs_lid,
             )
     _layer_graph_task: asyncio.Task | None = None
+    _layer_changes_task: asyncio.Task | None = None
     if _layer_graph_snapshot_builder is not None:
         _layer_graph_task = asyncio.create_task(
             run_layer_graph_saas_push_loop(_layer_graph_snapshot_builder)
+        )
+        _layer_changes_task = asyncio.create_task(
+            run_layer_changes_saas_push_loop(_layer_graph_snapshot_builder)
         )
     try:
         yield
@@ -111,6 +116,10 @@ async def _lifespan(_app: FastAPI):
             _layer_graph_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _layer_graph_task
+        if _layer_changes_task is not None:
+            _layer_changes_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _layer_changes_task
 
 
 app = FastAPI(title="Trae Online Service", version="1.0.0", lifespan=_lifespan)
