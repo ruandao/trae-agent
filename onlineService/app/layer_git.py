@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import HTTPException
 
@@ -856,7 +857,77 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
     }
 
 
-async def push_layer_worktree(layer_id: str, target_branch: str | None = None) -> dict[str, Any]:
+_GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_github_auth(github_auth: list[dict[str, str]] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not github_auth:
+        return out
+    for item in github_auth:
+        if not isinstance(item, dict):
+            continue
+        repo = str(item.get("repo") or "").strip().lower()
+        token = str(item.get("token") or "").strip()
+        if repo and token:
+            out[repo] = token
+    return out
+
+
+def _remote_origin_url(root: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
+
+
+def _parse_github_repo_slug(remote_url: str) -> str | None:
+    raw = str(remote_url or "").strip()
+    if not raw:
+        return None
+    m = _GITHUB_REMOTE_RE.match(raw)
+    if not m:
+        return None
+    owner = str(m.group("owner") or "").strip()
+    repo = str(m.group("repo") or "").strip()
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}".lower()
+
+
+def _build_github_push_url(repo_slug: str, token: str) -> str:
+    owner, repo = repo_slug.split("/", 1)
+    token_q = quote(token, safe="")
+    return f"https://x-access-token:{token_q}@github.com/{owner}/{repo}.git"
+
+
+def _redact_tokens(text: str, secrets: list[str]) -> str:
+    out = str(text or "")
+    for token in secrets:
+        if token:
+            out = out.replace(token, "***")
+    return out
+
+
+async def push_layer_worktree(
+    layer_id: str,
+    target_branch: str | None = None,
+    github_auth: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """将当前层下所有 git 仓库推送到上游；可指定 ``target_branch``。"""
     _ensure_layer_id(layer_id)
     base_root = layer_git_workspace_root(layer_id)
@@ -870,14 +941,26 @@ async def push_layer_worktree(layer_id: str, target_branch: str | None = None) -
     if branch and any(ch.isspace() for ch in branch):
         raise HTTPException(status_code=400, detail="invalid target_branch")
 
+    github_auth_map = _normalize_github_auth(github_auth)
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     results: list[dict[str, Any]] = []
     outputs: list[str] = []
     for root in roots:
         repo_label = _repo_label_for_message(root, base_root)
+        remote_origin = _remote_origin_url(root)
+        github_repo = _parse_github_repo_slug(remote_origin)
+        push_remote = "origin"
+        redaction_secrets: list[str] = []
+        if github_repo:
+            token = github_auth_map.get(github_repo)
+            if token:
+                push_remote = _build_github_push_url(github_repo, token)
+                redaction_secrets.append(token)
         cmd = ["git", "push"]
         if branch:
-            cmd.extend(["origin", f"HEAD:{branch}"])
+            cmd.extend([push_remote, f"HEAD:{branch}"])
+        elif push_remote != "origin":
+            cmd.append(push_remote)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(root),
@@ -888,7 +971,7 @@ async def push_layer_worktree(layer_id: str, target_branch: str | None = None) -
         assert proc.stdout is not None
         out_b = await proc.stdout.read()
         code = await proc.wait()
-        out = out_b.decode(errors="replace").strip()
+        out = _redact_tokens(out_b.decode(errors="replace").strip(), redaction_secrets)
         if code != 0:
             raise HTTPException(
                 status_code=400,

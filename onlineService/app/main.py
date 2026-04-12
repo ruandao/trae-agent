@@ -340,6 +340,10 @@ class LayerGitPushBody(BaseModel):
     """在工作区内执行 ``git push``；可指定推送目标分支。"""
 
     target_branch: str | None = Field(default=None, max_length=256)
+    github_auth: list[dict[str, str]] | None = Field(
+        default=None,
+        description="可选：按 owner/repo 下发 GitHub OAuth token（仅用于无交互 push）。",
+    )
 
 
 class GitIdentityBody(BaseModel):
@@ -754,9 +758,16 @@ async def api_layer_git_push(
 ) -> dict[str, Any]:
     """将当前分支推送到已配置的上游远程。"""
     target_branch = None
+    github_auth: list[dict[str, str]] | None = None
     if body is not None and body.target_branch is not None:
         target_branch = body.target_branch.strip() or None
-    return await push_layer_worktree(layer_id, target_branch=target_branch)
+    if body is not None and isinstance(body.github_auth, list):
+        github_auth = body.github_auth
+    return await push_layer_worktree(
+        layer_id,
+        target_branch=target_branch,
+        github_auth=github_auth,
+    )
 
 
 @app.get("/api/git/identity")

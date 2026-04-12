@@ -2226,10 +2226,7 @@
       if (layerOnlyId) {
         selectLayerFromGraph(layerOnlyId);
         void loadLayerParentDiff(layerOnlyId);
-        const onLayer = (lastJobs || []).filter((j) => j.layer_id === layerOnlyId);
-        onLayer.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
-        const repId = onLayer.length ? onLayer[onLayer.length - 1].id : null;
-        updateLayerRelationToolbar(repId);
+        updateLayerRelationToolbar(nid);
         return;
       }
       selectTaskFromMind(nid);
@@ -2513,23 +2510,42 @@
       }
       if (String(selectedMindNodeId).indexOf('cycle_') === 0) return;
 
-      const job = lastJobs.find((j) => j.id === selectedMindNodeId);
-      if (!job) return;
-      const layer = layers && layers.find((l) => l.layer_id === job.layer_id);
+      const layerOnlyId = parseLayerTreeNodeId(selectedMindNodeId);
+      const isLayerNode = !!layerOnlyId;
+      const layerId = layerOnlyId || '';
+      const layerJobs = isLayerNode
+        ? (lastJobs || [])
+            .filter((j) => j.layer_id === layerId)
+            .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+        : [];
+      const representativeJob =
+        layerJobs.length > 0 ? layerJobs[layerJobs.length - 1] : null;
+      const job = isLayerNode
+        ? representativeJob
+        : lastJobs.find((j) => j.id === selectedMindNodeId) || null;
+      const layer = layers &&
+        layers.find((l) => l.layer_id === (isLayerNode ? layerId : (job ? job.layer_id : '')));
       if (!layer) return;
 
-      const mindRunning = isJobStatusActive(job.status);
+      const mindRunning = job ? isJobStatusActive(job.status) : false;
 
       const label = document.createElement('span');
       label.className = 'meta';
       label.style.marginRight = '0.35rem';
-      label.textContent = '选中任务：' + job.id + ' · 层 ' + job.layer_id;
+      if (isLayerNode) {
+        label.textContent =
+          '选中可写层：' +
+          layer.layer_id +
+          (job ? ' · 代表任务 ' + job.id : ' · （该层暂无任务）');
+      } else {
+        label.textContent = '选中任务：' + job.id + ' · 层 ' + job.layer_id;
+      }
       bar.appendChild(label);
 
       const stEl = document.createElement('span');
       stEl.className = 'meta';
       stEl.style.marginRight = '0.5rem';
-      stEl.textContent = '状态：' + (job.status || '—');
+      stEl.textContent = '状态：' + (job ? (job.status || '—') : '无任务');
       bar.appendChild(stEl);
 
       const delBtn = document.createElement('button');
@@ -2647,7 +2663,7 @@
           'margin-top:0.45rem;width:100%;display:flex;flex-wrap:wrap;gap:0.35rem;align-items:flex-end;';
         const cLab = document.createElement('span');
         cLab.className = 'meta';
-        cLab.textContent = '基于该任务叠建新指令层：';
+        cLab.textContent = job ? '基于该任务叠建新指令层：' : '基于该可写层新建任务：';
         cWrap.appendChild(cLab);
         const cta = document.createElement('textarea');
         cta.rows = 2;
@@ -2678,8 +2694,8 @@
               const body = {
                 command: cmd,
                 command_kind: cKind.value,
-                parent_job_id: job.id,
-                repo_layer_id: null,
+                parent_job_id: job ? job.id : null,
+                repo_layer_id: job ? null : layer.layer_id,
                 git_branch: null,
               };
               const r = await api('/api/jobs', {
@@ -2716,7 +2732,11 @@
       }
 
       const dirty = layer.git_worktree_dirty;
-      const showSubmitted = effectiveClean ? effectiveClean(job) : false;
+      const showSubmitted = isLayerNode
+        ? dirty === false
+        : job
+          ? (effectiveClean ? effectiveClean(job) : false)
+          : dirty === false;
 
       if (dirty === null) {
         const na = document.createElement('span');
@@ -2736,65 +2756,69 @@
           ? '下层已有可写层提交完毕（工作区干净），本层在图中一并视为已提交'
           : '工作区干净，当前无未提交变更';
         bar.appendChild(ok);
-      } else {
-        const commitBtn = document.createElement('button');
-        commitBtn.type = 'button';
-        commitBtn.className = 'secondary tree-layer-commit';
-        commitBtn.textContent = '提交';
-        commitBtn.title = '自动生成提交说明：任务指令 + 暂存区 diff（git add -A && git commit，不 push）';
-        commitBtn.onclick = debounceClick(() => {
-          void runAsyncButton(
-            commitBtn,
-            async () => {
-              const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/commit', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: null }),
-              });
-              const rawText = await r.text();
-              let j = null;
-              try {
-                j = JSON.parse(rawText);
-              } catch (_) {}
-              if (!r.ok) {
-                let msg = rawText;
-                if (j && j.detail !== undefined) {
-                  msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
-                }
-                alert('提交失败：' + msg);
-                return;
-              }
-              if (j && j.status === 'noop') {
-                alert(j.detail || '工作区无变更，未创建提交');
-              } else if (j && j.status === 'ok') {
-                const cm = j.commit_message || '';
-                const preview = cm.length > 900 ? cm.slice(0, 900) + '\n…（说明过长，完整内容见 git log）' : cm;
-                alert('已提交。\n\n' + preview);
-              } else {
-                alert('已完成：' + rawText);
-              }
-              await loadJobs();
-              const sel = document.getElementById('layerSelect');
-              await loadLayers(sel && sel.value ? sel.value : null);
-            },
-            { busyText: '提交中…' },
-          );
-        }, BTN_DEBOUNCE_MS);
-        bar.appendChild(commitBtn);
       }
+      const commitBtn = document.createElement('button');
+      commitBtn.type = 'button';
+      commitBtn.className = 'secondary tree-layer-commit';
+      commitBtn.textContent = '提交';
+      commitBtn.title = showSubmitted
+        ? '当前工作区已干净；点击可再次执行提交检查（无变更时返回 noop）'
+        : '自动生成提交说明：任务指令 + 暂存区 diff（git add -A && git commit，不 push）';
+      commitBtn.onclick = debounceClick(() => {
+        void runAsyncButton(
+          commitBtn,
+          async () => {
+            const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/commit', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: null }),
+            });
+            const rawText = await r.text();
+            let j = null;
+            try {
+              j = JSON.parse(rawText);
+            } catch (_) {}
+            if (!r.ok) {
+              let msg = rawText;
+              if (j && j.detail !== undefined) {
+                msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+              }
+              alert('提交失败：' + msg);
+              return;
+            }
+            if (j && j.status === 'noop') {
+              alert(j.detail || '工作区无变更，未创建提交');
+            } else if (j && j.status === 'ok') {
+              const cm = j.commit_message || '';
+              const preview = cm.length > 900 ? cm.slice(0, 900) + '\n…（说明过长，完整内容见 git log）' : cm;
+              alert('已提交。\n\n' + preview);
+            } else {
+              alert('已完成：' + rawText);
+            }
+            await loadJobs();
+            const sel = document.getElementById('layerSelect');
+            await loadLayers(sel && sel.value ? sel.value : null);
+          },
+          { busyText: '提交中…' },
+        );
+      }, BTN_DEBOUNCE_MS);
+      bar.appendChild(commitBtn);
 
       const gr = layer.git_remote;
-      if (gr && gr.is_git && typeof gr.ahead === 'number' && gr.ahead > 0 && !gr.no_upstream) {
+      if (gr && gr.is_git && !gr.no_upstream) {
         const pushBtn = document.createElement('button');
         pushBtn.type = 'button';
         pushBtn.className = 'tree-layer-push';
         pushBtn.textContent = '推送';
+        const aheadN = typeof gr.ahead === 'number' ? gr.ahead : null;
         pushBtn.title =
-          'git push：将本地领先上游的 ' +
-          gr.ahead +
-          ' 个提交推送到远程（' +
-          (gr.upstream || 'upstream') +
-          '）';
+          aheadN !== null
+            ? 'git push：当前领先上游 ' +
+              aheadN +
+              ' 个提交（' +
+              (gr.upstream || 'upstream') +
+              '）'
+            : 'git push：推送当前分支到远程（' + (gr.upstream || 'upstream') + '）';
         pushBtn.onclick = debounceClick(() => {
           void runAsyncButton(
             pushBtn,
