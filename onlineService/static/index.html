@@ -590,6 +590,7 @@
     }
 
     let lastJobs = [];
+    const layerCommitExecLogs = new Map();
     function isJobStatusActive(status) {
       return status === 'pending' || status === 'running';
     }
@@ -1210,12 +1211,32 @@
       }
     }
 
-    function refreshAllJobSteps() {
-      const list = lastJobs || [];
-      for (let i = 0; i < list.length; i++) {
-        const j = list[i];
-        if (j && j.id) loadJobStepsIntoCard(j.id);
+    /**
+     * 同域 HTTP/1.1 并发连接约 6；任务多时若对 /steps 全量并行 fetch，多余请求会排队显示为 pending。
+     * 有界并发加载步骤，避免刷新首屏占满连接池。
+     */
+    async function runWithConcurrency(items, limit, fn) {
+      const n = items.length;
+      if (!n) return;
+      const cap = Math.max(1, Math.min(limit, n));
+      let next = 0;
+      async function worker() {
+        while (true) {
+          const i = next++;
+          if (i >= n) break;
+          await fn(items[i], i);
+        }
       }
+      await Promise.all(Array.from({ length: cap }, () => worker()));
+    }
+
+    const JOB_STEPS_FETCH_CONCURRENCY = 3;
+
+    async function refreshAllJobSteps() {
+      const ids = (lastJobs || []).map((j) => j && j.id).filter(Boolean);
+      await runWithConcurrency(ids, JOB_STEPS_FETCH_CONCURRENCY, (id) =>
+        loadJobStepsIntoCard(id),
+      );
     }
 
     /** 延后连接 SSE：避免与首屏 fetch 并发长连接，使 wait_until=networkidle 等探测可结束（否则刷新会“永远加载”）。 */
@@ -1953,7 +1974,7 @@
       await refreshMindGraphFromApi();
       box.innerHTML = jobs.map((j) => jobCardMarkup(j)).join('');
       wireJobCardButtons(box);
-      refreshAllJobSteps();
+      await refreshAllJobSteps();
       fillWritableChangesLayerSelect(pickWritableChangesDefaultLayerId(jobs));
       void loadWritableChangesList();
       await applyTaskGate();
@@ -2490,6 +2511,61 @@
       return nodes;
     }
 
+    function setLayerCommitExecLog(layerId, text) {
+      const lid = String(layerId || '').trim();
+      if (!lid) return;
+      const ts = new Date().toLocaleString();
+      const body = String(text || '').trim();
+      layerCommitExecLogs.set(lid, body ? '[' + ts + ']\n' + body : '[' + ts + '] （无输出）');
+    }
+
+    /** 在可选的双层 rAF 后根据 id 重新取节点，避免 loadLayers 重建工具条后仍指向旧 DOM。 */
+    function touchLayerCommitLogPanel(layerId, opts) {
+      const lid = String(layerId || '').trim();
+      if (!lid) return;
+      const run = () => {
+        const execPre = document.getElementById('layerCommitExecLogPre');
+        const latestPre = document.getElementById('layerCommitLatestLogPre');
+        if (!execPre || !latestPre) return;
+        void fillLayerCommitLogPanel(lid, execPre, latestPre);
+      };
+      if (opts && opts.afterDomStabilize) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(run);
+        });
+        return;
+      }
+      run();
+    }
+
+    async function fillLayerCommitLogPanel(layerId, execPre, latestPre) {
+      if (!execPre || !latestPre) return;
+      const lid = String(layerId || '').trim();
+      if (!lid) return;
+      execPre.textContent = layerCommitExecLogs.get(lid) || '（当前会话暂无提交执行日志）';
+      latestPre.textContent = '加载中…';
+      try {
+        const r = await api('/api/layers/' + encodeURIComponent(lid) + '/git/commit/latest-log');
+        const raw = await r.text();
+        let j = null;
+        try {
+          j = JSON.parse(raw);
+        } catch (_) {}
+        if (!r.ok) {
+          latestPre.textContent =
+            '获取最后提交日志失败：' +
+            (j && j.detail
+              ? (typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail))
+              : raw);
+          return;
+        }
+        const out = j && typeof j.output === 'string' ? j.output.trim() : '';
+        latestPre.textContent = out || '（当前仓库暂无提交记录）';
+      } catch (e) {
+        latestPre.textContent = '获取最后提交日志失败：' + String(e && e.message ? e.message : e);
+      }
+    }
+
     function updateLayerRelationToolbar(selectedMindNodeId) {
       const bar = document.getElementById('layerRelationActions');
       if (!bar) return;
@@ -2783,21 +2859,36 @@
               if (j && j.detail !== undefined) {
                 msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
               }
+              setLayerCommitExecLog(layer.layer_id, '提交失败\n' + msg);
+              touchLayerCommitLogPanel(layer.layer_id);
               alert('提交失败：' + msg);
               return;
             }
             if (j && j.status === 'noop') {
+              setLayerCommitExecLog(
+                layer.layer_id,
+                '提交执行完成（noop）\n' + String(j.detail || '工作区无变更，未创建提交'),
+              );
               alert(j.detail || '工作区无变更，未创建提交');
             } else if (j && j.status === 'ok') {
+              setLayerCommitExecLog(
+                layer.layer_id,
+                '提交执行成功\n' +
+                  String(j.output || '') +
+                  '\n\n提交说明：\n' +
+                  String(j.commit_message || ''),
+              );
               const cm = j.commit_message || '';
               const preview = cm.length > 900 ? cm.slice(0, 900) + '\n…（说明过长，完整内容见 git log）' : cm;
               alert('已提交。\n\n' + preview);
             } else {
+              setLayerCommitExecLog(layer.layer_id, '提交执行返回\n' + rawText);
               alert('已完成：' + rawText);
             }
             await loadJobs();
             const sel = document.getElementById('layerSelect');
             await loadLayers(sel && sel.value ? sel.value : null);
+            touchLayerCommitLogPanel(layer.layer_id, { afterDomStabilize: true });
           },
           { busyText: '提交中…' },
         );
@@ -2854,6 +2945,33 @@
         }, BTN_DEBOUNCE_MS);
         bar.appendChild(pushBtn);
       }
+
+      const logsWrap = document.createElement('div');
+      logsWrap.style.cssText = 'margin-top:0.55rem;width:100%;';
+      const execTitle = document.createElement('div');
+      execTitle.className = 'meta';
+      execTitle.textContent = '提交执行日志（本次会话）';
+      logsWrap.appendChild(execTitle);
+      const execPre = document.createElement('pre');
+      execPre.id = 'layerCommitExecLogPre';
+      execPre.className = 'out';
+      execPre.style.cssText = 'max-height:140px;margin-top:0.25rem;';
+      execPre.textContent = '（当前会话暂无提交执行日志）';
+      logsWrap.appendChild(execPre);
+
+      const latestTitle = document.createElement('div');
+      latestTitle.className = 'meta';
+      latestTitle.style.marginTop = '0.45rem';
+      latestTitle.textContent = '最后一次提交日志';
+      logsWrap.appendChild(latestTitle);
+      const latestPre = document.createElement('pre');
+      latestPre.id = 'layerCommitLatestLogPre';
+      latestPre.className = 'out';
+      latestPre.style.cssText = 'max-height:220px;margin-top:0.25rem;';
+      latestPre.textContent = '加载中…';
+      logsWrap.appendChild(latestPre);
+      bar.appendChild(logsWrap);
+      void fillLayerCommitLogPanel(layer.layer_id, execPre, latestPre);
     }
 
     function renderLayerRelationTree(layers) {

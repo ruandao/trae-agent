@@ -19,10 +19,19 @@ from fastapi import HTTPException
 from trae_agent.utils.auto_commit_message import load_latest_trajectory_data
 
 from .git_clone import _validate_branch
-from .layer_merge import layer_merged_root_for_api, lower_paths_full_tip
-from .layer_meta import is_overlay_v1_layer
+from .layer_merge import (
+    layer_merged_root_for_api,
+    layer_merged_root_for_api_locked,
+    lower_paths_full_tip,
+    lower_paths_parent_stack,
+)
+from .layer_meta import is_overlay_v1_layer, read_layer_meta
 from .layers import layer_path
-from .overlay_diff import materialize_merged_chain
+from .overlay_diff import (
+    compute_diff_between_trees,
+    materialize_merged_chain,
+    prune_empty_dirs_under,
+)
 from .paths import runtime_dir
 
 
@@ -31,6 +40,16 @@ def layer_git_workspace_root(layer_id: str) -> Path:
     if is_overlay_v1_layer(layer_id):
         return layer_merged_root_for_api(layer_id)
     return layer_path(layer_id)
+
+
+@contextlib.contextmanager
+def _layer_git_workspace_root_stable(layer_id: str):
+    """返回本次操作稳定的 git 工作区根（Overlay 场景持锁避免并发重物化）。"""
+    if not is_overlay_v1_layer(layer_id):
+        yield layer_path(layer_id)
+        return
+    with layer_merged_root_for_api_locked(layer_id) as root:
+        yield root
 
 
 @contextlib.contextmanager
@@ -48,6 +67,28 @@ def _layer_compare_workspace_root(layer_id: str):
     try:
         materialize_merged_chain(lower_paths_full_tip(layer_id), tmp)
         yield tmp.resolve()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _persist_overlay_layer_diff_after_commit(layer_id: str, workspace_root: Path) -> None:
+    """将 overlay 提交后的 merged 工作区回写为该层 diff，避免后续重物化丢失提交。"""
+    meta = read_layer_meta(layer_id)
+    if not meta or meta.kind != "job" or not meta.parent_layer_id:
+        return
+    parent_lowers = lower_paths_parent_stack(meta.parent_layer_id)
+    if not parent_lowers:
+        return
+    cmp_root = runtime_dir() / "materialized_commit_parent"
+    cmp_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f"{layer_id}_", dir=str(cmp_root)))
+    try:
+        materialize_merged_chain(parent_lowers, tmp)
+        diff_root = layer_path(layer_id) / "diff"
+        if diff_root.exists():
+            shutil.rmtree(diff_root, ignore_errors=True)
+        compute_diff_between_trees(tmp, workspace_root, diff_root)
+        prune_empty_dirs_under(diff_root)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -94,9 +135,8 @@ def _dir_has_git_metadata(p: Path) -> bool:
         return False
 
 
-def _discover_git_workspace_roots(layer_id: str) -> list[Path]:
-    """定位该层下所有 git 工作区根（层根/base/子目录仓库）。"""
-    root = layer_git_workspace_root(layer_id)
+def _discover_git_workspace_roots_under(root: Path, *, layer_id: str = "") -> list[Path]:
+    """定位 root 下所有 git 工作区根（层根/base/子目录仓库）。"""
     if not root.is_dir():
         return []
 
@@ -143,13 +183,19 @@ def _discover_git_workspace_roots(layer_id: str) -> list[Path]:
             if _dir_has_git_metadata(child):
                 add_repo(child)
 
-    if len(repos) > 1:
+    if len(repos) > 1 and layer_id:
         log.info(
             "multiple git repos detected under layer %s, count=%s",
             layer_id,
             len(repos),
         )
     return repos
+
+
+def _discover_git_workspace_roots(layer_id: str) -> list[Path]:
+    """定位该层下所有 git 工作区根（层根/base/子目录仓库）。"""
+    with _layer_git_workspace_root_stable(layer_id) as root:
+        return _discover_git_workspace_roots_under(root, layer_id=layer_id)
 
 
 def _resolve_git_workspace_root(layer_id: str) -> Path | None:
@@ -163,62 +209,64 @@ def git_worktree_dirty(layer_id: str) -> bool | None:
     """``True``：存在未暂存或未提交变更；``False``：工作区干净；``None``：非 git 或检测失败。"""
     if not layer_id or not _LAYER_ID_RE.match(layer_id):
         return None
-    roots = _discover_git_workspace_roots(layer_id)
-    if not roots:
-        return None
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    any_clean = False
-    for root in roots:
-        try:
-            r = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(root),
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=env,
-            )
-            if r.returncode != 0:
+    with _layer_git_workspace_root_stable(layer_id) as stable_root:
+        roots = _discover_git_workspace_roots_under(stable_root, layer_id=layer_id)
+        if not roots:
+            return None
+        any_clean = False
+        for root in roots:
+            try:
+                r = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env=env,
+                )
+                if r.returncode != 0:
+                    continue
+                any_clean = True
+                if (r.stdout or "").strip():
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
                 continue
-            any_clean = True
-            if (r.stdout or "").strip():
-                return True
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-    if any_clean:
-        return False
+        if any_clean:
+            return False
     return None
 
 
 async def list_branches(layer_id: str) -> dict:
     """Return local + remote branch short names and current branch if any."""
     _ensure_layer_id(layer_id)
-    base_root = layer_git_workspace_root(layer_id)
-    if not base_root.is_dir():
-        raise HTTPException(status_code=404, detail="layer not found")
-    root = _resolve_git_workspace_root(layer_id)
-    if root is None:
-        return {"branches": [], "current": None, "is_git": False}
+    with _layer_git_workspace_root_stable(layer_id) as base_root:
+        if not base_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
+        roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
+        if not roots:
+            return {"branches": [], "current": None, "is_git": False}
+        root = roots[0]
 
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "for-each-ref",
-        "--sort=refname",
-        "--format=%(refname:short)",
-        "refs/heads",
-        "refs/remotes",
-        cwd=str(root),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
-    out_b, err_b = await proc.communicate()
-    if proc.returncode != 0:
-        err = err_b.decode(errors="replace").strip()
-        raise HTTPException(
-            status_code=400,
-            detail=f"git for-each-ref failed: {err or proc.returncode}",
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+            cwd=str(root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
+        out_b, err_b = await proc.communicate()
+        if proc.returncode != 0:
+            err = err_b.decode(errors="replace").strip()
+            raise HTTPException(
+                status_code=400,
+                detail=f"git for-each-ref failed: {err or proc.returncode}",
+            )
 
     raw = out_b.decode(errors="replace").splitlines()
     seen: set[str] = set()
@@ -360,219 +408,230 @@ async def commit_layer_worktree(
     * ``message`` 为空：根据 ``command_hint``、最新轨迹 JSON（若存在）与暂存区统计自动生成说明。
     """
     _ensure_layer_id(layer_id)
-    base_root = layer_git_workspace_root(layer_id)
-    if not base_root.is_dir():
-        raise HTTPException(status_code=404, detail="layer not found")
-    roots = _discover_git_workspace_roots(layer_id)
-    if not roots:
-        raise HTTPException(status_code=400, detail="layer has no git repo")
+    with _layer_git_workspace_root_stable(layer_id) as base_root:
+        if not base_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
+        roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
+        if not roots:
+            raise HTTPException(status_code=400, detail="layer has no git repo")
 
-    explicit = (message or "").strip()
+        explicit = (message or "").strip()
 
-    runtime_identity = get_runtime_git_identity()
-    author_name = (
-        runtime_identity.get("name")
-        or os.environ.get("TRAE_GIT_COMMITTER_NAME")
-        or "trae-online-service"
-    ).strip() or "trae-online-service"
-    author_email = (
-        runtime_identity.get("email")
-        or os.environ.get("TRAE_GIT_COMMITTER_EMAIL")
-        or "trae-online@local"
-    ).strip() or "trae-online@local"
+        runtime_identity = get_runtime_git_identity()
+        author_name = (
+            runtime_identity.get("name")
+            or os.environ.get("TRAE_GIT_COMMITTER_NAME")
+            or "trae-online-service"
+        ).strip() or "trae-online-service"
+        author_email = (
+            runtime_identity.get("email")
+            or os.environ.get("TRAE_GIT_COMMITTER_EMAIL")
+            or "trae-online@local"
+        ).strip() or "trae-online@local"
 
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 
-    cenv = {
-        **env,
-        "GIT_AUTHOR_NAME": author_name,
-        "GIT_AUTHOR_EMAIL": author_email,
-        "GIT_COMMITTER_NAME": author_name,
-        "GIT_COMMITTER_EMAIL": author_email,
-    }
-    trajectory = load_latest_trajectory_data(base_root)
-    traj_task = ""
-    if trajectory:
-        raw_task = trajectory.get("task")
-        if isinstance(raw_task, str):
-            traj_task = raw_task.strip()
-    overall_goal = (
-        _strip_explicit_commit_message(explicit)
-        if explicit
-        else (str(command_hint or "").strip() or traj_task or "完成当前任务目标")
-    )
-
-    results: list[dict[str, Any]] = []
-    all_outputs: list[str] = []
-    for root in roots:
-        proc_add = await asyncio.create_subprocess_exec(
-            "git",
-            "add",
-            "-A",
-            cwd=str(root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
-        out_add_b, _ = await proc_add.communicate()
-        out_add = out_add_b.decode(errors="replace")
-        if proc_add.returncode != 0:
-            raise HTTPException(status_code=400, detail=f"git add failed:\n{out_add.strip()}")
-
-        names_out, code_n = await _git_diff_cached_text(root, env, "--name-only", "-z")
-        if code_n != 0:
-            raise HTTPException(
-                status_code=400, detail=f"git diff --cached failed:\n{names_out.strip()}"
-            )
-        files = [p for p in names_out.split("\0") if p.strip()]
-        if not files:
-            continue
-
-        stat_text, code_s = await _git_diff_cached_text(root, env, "--stat")
-        if code_s != 0:
-            raise HTTPException(
-                status_code=400, detail=f"git diff --cached --stat failed:\n{stat_text.strip()}"
-            )
-        shortstat, code_ss = await _git_diff_cached_text(root, env, "--shortstat")
-        if code_ss != 0:
-            shortstat = ""
-
-        repo_label = _repo_label_for_message(root, base_root)
-        msg = _format_multi_repo_commit_message(
-            overall_goal=overall_goal,
-            repo_label=repo_label,
-            shortstat=shortstat,
-            files=files,
+        cenv = {
+            **env,
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+        trajectory = load_latest_trajectory_data(base_root)
+        traj_task = ""
+        if trajectory:
+            raw_task = trajectory.get("task")
+            if isinstance(raw_task, str):
+                traj_task = raw_task.strip()
+        overall_goal = (
+            _strip_explicit_commit_message(explicit)
+            if explicit
+            else (str(command_hint or "").strip() or traj_task or "完成当前任务目标")
         )
 
-        fd, path = tempfile.mkstemp(prefix="gitmsg-", suffix=".txt")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(msg)
-            proc_commit = await asyncio.create_subprocess_exec(
+        results: list[dict[str, Any]] = []
+        all_outputs: list[str] = []
+        for root in roots:
+            proc_add = await asyncio.create_subprocess_exec(
                 "git",
-                "commit",
-                "-F",
-                path,
+                "add",
+                "-A",
                 cwd=str(root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env=cenv,
+                env=env,
             )
-            out_commit_b, _ = await proc_commit.communicate()
-            out_commit = out_commit_b.decode(errors="replace")
-            code = proc_commit.returncode or 0
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+            out_add_b, _ = await proc_add.communicate()
+            out_add = out_add_b.decode(errors="replace")
+            if proc_add.returncode != 0:
+                raise HTTPException(status_code=400, detail=f"git add failed:\n{out_add.strip()}")
 
-        low = out_commit.lower()
-        if code != 0:
-            if "nothing to commit" in low or "nothing added to commit" in low:
+            names_out, code_n = await _git_diff_cached_text(root, env, "--name-only", "-z")
+            if code_n != 0:
+                raise HTTPException(
+                    status_code=400, detail=f"git diff --cached failed:\n{names_out.strip()}"
+                )
+            files = [p for p in names_out.split("\0") if p.strip()]
+            if not files:
                 continue
-            raise HTTPException(status_code=400, detail=f"git commit failed:\n{out_commit.strip()}")
-        all_outputs.append(out_commit.strip())
-        results.append(
-            {
-                "repo": repo_label,
-                "files": files,
-                "shortstat": (shortstat or "").strip(),
-                "commit_message": msg,
-                "output": out_commit.strip(),
-            }
-        )
 
-    if not results:
+            stat_text, code_s = await _git_diff_cached_text(root, env, "--stat")
+            if code_s != 0:
+                raise HTTPException(
+                    status_code=400, detail=f"git diff --cached --stat failed:\n{stat_text.strip()}"
+                )
+            shortstat, code_ss = await _git_diff_cached_text(root, env, "--shortstat")
+            if code_ss != 0:
+                shortstat = ""
+
+            repo_label = _repo_label_for_message(root, base_root)
+            msg = _format_multi_repo_commit_message(
+                overall_goal=overall_goal,
+                repo_label=repo_label,
+                shortstat=shortstat,
+                files=files,
+            )
+
+            fd, path = tempfile.mkstemp(prefix="gitmsg-", suffix=".txt")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(msg)
+                proc_commit = await asyncio.create_subprocess_exec(
+                    "git",
+                    "commit",
+                    "-F",
+                    path,
+                    cwd=str(root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=cenv,
+                )
+                out_commit_b, _ = await proc_commit.communicate()
+                out_commit = out_commit_b.decode(errors="replace")
+                code = proc_commit.returncode or 0
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+
+            low = out_commit.lower()
+            if code != 0:
+                if "nothing to commit" in low or "nothing added to commit" in low:
+                    continue
+                raise HTTPException(
+                    status_code=400, detail=f"git commit failed:\n{out_commit.strip()}"
+                )
+            all_outputs.append(out_commit.strip())
+            results.append(
+                {
+                    "repo": repo_label,
+                    "files": files,
+                    "shortstat": (shortstat or "").strip(),
+                    "commit_message": msg,
+                    "output": out_commit.strip(),
+                }
+            )
+
+        if not results:
+            return {
+                "layer_id": layer_id,
+                "status": "noop",
+                "commit_message": None,
+                "detail": "所有仓库均无变更，未创建提交",
+                "output": "",
+                "commit_results": [],
+            }
+
+        if is_overlay_v1_layer(layer_id):
+            try:
+                _persist_overlay_layer_diff_after_commit(layer_id, base_root)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=500, detail=f"persist overlay diff failed: {e}"
+                ) from e
+
         return {
             "layer_id": layer_id,
-            "status": "noop",
-            "commit_message": None,
-            "detail": "所有仓库均无变更，未创建提交",
-            "output": "",
-            "commit_results": [],
+            "status": "ok",
+            "commit_message": overall_goal,
+            "output": "\n\n".join(x for x in all_outputs if x),
+            "commit_results": results,
         }
-
-    return {
-        "layer_id": layer_id,
-        "status": "ok",
-        "commit_message": overall_goal,
-        "output": "\n\n".join(x for x in all_outputs if x),
-        "commit_results": results,
-    }
 
 
 def git_ahead_of_upstream(layer_id: str) -> dict[str, Any]:
     """当前层所有 git 仓库相对上游的领先提交信息。"""
     _ensure_layer_id(layer_id)
-    roots = _discover_git_workspace_roots(layer_id)
-    if not roots:
-        return {
-            "is_git": False,
-            "ahead": None,
-            "branch": None,
-            "upstream": None,
-            "no_upstream": None,
-            "repos": [],
-        }
+    with _layer_git_workspace_root_stable(layer_id) as base_root:
+        roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
+        if not roots:
+            return {
+                "is_git": False,
+                "ahead": None,
+                "branch": None,
+                "upstream": None,
+                "no_upstream": None,
+                "repos": [],
+            }
 
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    repos: list[dict[str, Any]] = []
-    for root in roots:
-        repo_label = _repo_label_for_message(root, layer_git_workspace_root(layer_id))
-        r_head = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-        )
-        branch = r_head.stdout.strip() if r_head.returncode == 0 else None
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        repos: list[dict[str, Any]] = []
+        for root in roots:
+            repo_label = _repo_label_for_message(root, base_root)
+            r_head = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            branch = r_head.stdout.strip() if r_head.returncode == 0 else None
 
-        r_u = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "@{u}"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-        )
-        if r_u.returncode != 0:
+            r_u = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "@{u}"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            if r_u.returncode != 0:
+                repos.append(
+                    {
+                        "repo": repo_label,
+                        "branch": branch,
+                        "upstream": None,
+                        "ahead": None,
+                        "no_upstream": True,
+                    }
+                )
+                continue
+
+            upstream = r_u.stdout.strip()
+            r_cnt = subprocess.run(
+                ["git", "rev-list", "--count", f"{upstream}..HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+            )
+            ahead: int | None = None
+            if r_cnt.returncode == 0:
+                try:
+                    ahead = int((r_cnt.stdout or "").strip())
+                except ValueError:
+                    ahead = None
             repos.append(
                 {
                     "repo": repo_label,
                     "branch": branch,
-                    "upstream": None,
-                    "ahead": None,
-                    "no_upstream": True,
+                    "upstream": upstream,
+                    "ahead": ahead,
+                    "no_upstream": False,
                 }
             )
-            continue
-
-        upstream = r_u.stdout.strip()
-        r_cnt = subprocess.run(
-            ["git", "rev-list", "--count", f"{upstream}..HEAD"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-        ahead: int | None = None
-        if r_cnt.returncode == 0:
-            try:
-                ahead = int((r_cnt.stdout or "").strip())
-            except ValueError:
-                ahead = None
-        repos.append(
-            {
-                "repo": repo_label,
-                "branch": branch,
-                "upstream": upstream,
-                "ahead": ahead,
-                "no_upstream": False,
-            }
-        )
 
     ahead_values = [int(x["ahead"]) for x in repos if isinstance(x.get("ahead"), int)]
     ahead = max(ahead_values) if ahead_values else None
@@ -930,65 +989,112 @@ async def push_layer_worktree(
 ) -> dict[str, Any]:
     """将当前层下所有 git 仓库推送到上游；可指定 ``target_branch``。"""
     _ensure_layer_id(layer_id)
-    base_root = layer_git_workspace_root(layer_id)
-    if not base_root.is_dir():
-        raise HTTPException(status_code=404, detail="layer not found")
-    roots = _discover_git_workspace_roots(layer_id)
-    if not roots:
-        raise HTTPException(status_code=400, detail="layer has no git repo")
+    with _layer_git_workspace_root_stable(layer_id) as base_root:
+        if not base_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
+        roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
+        if not roots:
+            raise HTTPException(status_code=400, detail="layer has no git repo")
 
-    branch = str(target_branch or "").strip()
-    if branch and any(ch.isspace() for ch in branch):
-        raise HTTPException(status_code=400, detail="invalid target_branch")
+        branch = str(target_branch or "").strip()
+        if branch and any(ch.isspace() for ch in branch):
+            raise HTTPException(status_code=400, detail="invalid target_branch")
 
-    github_auth_map = _normalize_github_auth(github_auth)
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    results: list[dict[str, Any]] = []
-    outputs: list[str] = []
-    for root in roots:
-        repo_label = _repo_label_for_message(root, base_root)
-        remote_origin = _remote_origin_url(root)
-        github_repo = _parse_github_repo_slug(remote_origin)
-        push_remote = "origin"
-        redaction_secrets: list[str] = []
-        if github_repo:
-            token = github_auth_map.get(github_repo)
-            if token:
-                push_remote = _build_github_push_url(github_repo, token)
-                redaction_secrets.append(token)
-        cmd = ["git", "push"]
-        if branch:
-            cmd.extend([push_remote, f"HEAD:{branch}"])
-        elif push_remote != "origin":
-            cmd.append(push_remote)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
-        assert proc.stdout is not None
-        out_b = await proc.stdout.read()
-        code = await proc.wait()
-        out = _redact_tokens(out_b.decode(errors="replace").strip(), redaction_secrets)
-        if code != 0:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "git push failed",
-                    "repo": repo_label,
-                    "exit_code": code,
-                    "output": out,
-                },
+        github_auth_map = _normalize_github_auth(github_auth)
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        results: list[dict[str, Any]] = []
+        outputs: list[str] = []
+        for root in roots:
+            repo_label = _repo_label_for_message(root, base_root)
+            remote_origin = _remote_origin_url(root)
+            github_repo = _parse_github_repo_slug(remote_origin)
+            push_remote = "origin"
+            redaction_secrets: list[str] = []
+            if github_repo:
+                token = github_auth_map.get(github_repo)
+                if token:
+                    push_remote = _build_github_push_url(github_repo, token)
+                    redaction_secrets.append(token)
+            cmd = ["git", "push"]
+            if branch:
+                cmd.extend([push_remote, f"HEAD:{branch}"])
+            elif push_remote != "origin":
+                cmd.append(push_remote)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
-        outputs.append(out)
-        results.append({"repo": repo_label, "output": out})
+            assert proc.stdout is not None
+            out_b = await proc.stdout.read()
+            code = await proc.wait()
+            out = _redact_tokens(out_b.decode(errors="replace").strip(), redaction_secrets)
+            if code != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "git push failed",
+                        "repo": repo_label,
+                        "exit_code": code,
+                        "output": out,
+                    },
+                )
+            outputs.append(out)
+            results.append({"repo": repo_label, "output": out})
 
-    return {
-        "layer_id": layer_id,
-        "status": "ok",
-        "target_branch": branch or None,
-        "output": "\n\n".join(x for x in outputs if x),
-        "push_results": results,
-    }
+        return {
+            "layer_id": layer_id,
+            "status": "ok",
+            "target_branch": branch or None,
+            "output": "\n\n".join(x for x in outputs if x),
+            "push_results": results,
+        }
+
+
+async def latest_commit_log(layer_id: str) -> dict[str, Any]:
+    """返回该层每个仓库最近一次提交日志（``git log -1 --stat``）。"""
+    _ensure_layer_id(layer_id)
+    with _layer_git_workspace_root_stable(layer_id) as base_root:
+        if not base_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
+        roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
+        if not roots:
+            raise HTTPException(status_code=400, detail="layer has no git repo")
+
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        results: list[dict[str, Any]] = []
+        outputs: list[str] = []
+        for root in roots:
+            repo_label = _repo_label_for_message(root, base_root)
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "log",
+                "-1",
+                "--decorate",
+                "--stat",
+                cwd=str(root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            out_b, _ = await proc.communicate()
+            out = out_b.decode(errors="replace").strip()
+            code = proc.returncode or 0
+            has_commit = True
+            if code != 0:
+                has_commit = False
+                # 空仓库场景：保留可读提示，不抛错
+                if not out:
+                    out = "当前仓库暂无提交记录"
+            results.append({"repo": repo_label, "has_commit": has_commit, "output": out})
+            if out:
+                outputs.append(f"[{repo_label}]\n{out}")
+
+        return {
+            "layer_id": layer_id,
+            "status": "ok",
+            "logs": results,
+            "output": "\n\n".join(outputs),
+        }

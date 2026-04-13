@@ -564,9 +564,8 @@ class JobStore:
         if git_branch and not parent_job_id and not repo_layer_id:
             raise ValueError("git_branch requires parent_job_id or repo_layer_id")
 
-        async with self._creation_lock:
-            stack_parent: str | None = None
-
+        # 等待层空闲时不得持有 _creation_lock，否则 reset_all 等无法取得锁，重置请求会一直挂起。
+        while True:
             async with self._lock:
                 if parent_job_id:
                     parent_rec = self._jobs.get(parent_job_id)
@@ -584,36 +583,54 @@ class JobStore:
             if stack_parent:
                 await self._wait_until_layer_idle(stack_parent)
 
-            layer_id = new_layer_id()
-            if parent_job_id or repo_layer_id:
-                if stack_parent is None:
-                    raise ValueError("内部错误：未解析父层 layer_id")
-                lp = create_job_layer(layer_id, stack_parent)
-            else:
-                lp = create_root_layer(layer_id)
+            async with self._creation_lock:
+                async with self._lock:
+                    if parent_job_id:
+                        parent_rec = self._jobs.get(parent_job_id)
+                        if not parent_rec:
+                            raise ValueError(f"parent_job_id not found: {parent_job_id}")
+                        stack_parent = str(parent_rec.layer_id)
+                    elif repo_layer_id:
+                        src = layer_path(repo_layer_id)
+                        if not src.is_dir():
+                            raise ValueError(f"repo_layer_id not found: {repo_layer_id}")
+                        stack_parent = str(repo_layer_id)
+                    else:
+                        stack_parent = None
 
-            jid = str(uuid4())
-            rec = JobRecord(
-                id=jid,
-                layer_id=layer_id,
-                layer_path=str(lp),
-                command=command,
-                parent_job_id=parent_job_id,
-                status="pending",
-                created_at=datetime.now().isoformat(timespec="seconds"),
-                git_branch=git_branch,
-                repo_layer_id=repo_layer_id if not parent_job_id else None,
-                command_kind=command_kind,
-                command_env=_normalize_job_env(command_env) or None,
-            )
-            async with self._lock:
-                self._jobs[jid] = rec
-            await self._save()
-            await hub.publish(sse_job_event("job_created", rec, rec.id))
-            task = asyncio.create_task(self._run_job(jid))
-            self._runner_tasks[jid] = task
-            task.add_done_callback(self._runner_done_callback(jid))
-            return rec
+                    if stack_parent and self._active_job_for_layer(stack_parent):
+                        continue
+
+                layer_id = new_layer_id()
+                if parent_job_id or repo_layer_id:
+                    if stack_parent is None:
+                        raise ValueError("内部错误：未解析父层 layer_id")
+                    lp = create_job_layer(layer_id, stack_parent)
+                else:
+                    lp = create_root_layer(layer_id)
+
+                jid = str(uuid4())
+                rec = JobRecord(
+                    id=jid,
+                    layer_id=layer_id,
+                    layer_path=str(lp),
+                    command=command,
+                    parent_job_id=parent_job_id,
+                    status="pending",
+                    created_at=datetime.now().isoformat(timespec="seconds"),
+                    git_branch=git_branch,
+                    repo_layer_id=repo_layer_id if not parent_job_id else None,
+                    command_kind=command_kind,
+                    command_env=_normalize_job_env(command_env) or None,
+                )
+                async with self._lock:
+                    self._jobs[jid] = rec
+                await self._save()
+                await hub.publish(sse_job_event("job_created", rec, rec.id))
+                task = asyncio.create_task(self._run_job(jid))
+                self._runner_tasks[jid] = task
+                task.add_done_callback(self._runner_done_callback(jid))
+                return rec
 
     async def register_clone_layer_job(
         self,

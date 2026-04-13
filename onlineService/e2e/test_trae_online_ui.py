@@ -22,6 +22,7 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -72,6 +73,55 @@ def test_refresh_allows_networkidle_despite_sse(page: Page) -> None:
     page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
     page.reload(wait_until="domcontentloaded", timeout=25_000)
     page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+
+
+@pytest.mark.skip_reset
+def test_refresh_job_steps_fetches_are_bounded(page: Page) -> None:
+    """多任务时不应同时对 /api/jobs/<id>/steps 无界并行，否则同域连接池打满、DevTools 长期 pending。"""
+    step_re = re.compile(r"/api/jobs/[^/?]+/steps(?:\?|$)")
+    st: dict[str, int] = {"in_flight": 0, "max": 0}
+
+    def _on_request(request) -> None:
+        if request.method != "GET" or not step_re.search(request.url):
+            return
+        st["in_flight"] += 1
+        st["max"] = max(st["max"], st["in_flight"])
+
+    def _on_done(request) -> None:
+        if request.method != "GET" or not step_re.search(request.url):
+            return
+        st["in_flight"] = max(0, st["in_flight"] - 1)
+
+    page.on("request", _on_request)
+    page.on("requestfinished", _on_done)
+    page.on("requestfailed", _on_done)
+
+    def _is_get_jobs_index(r) -> bool:
+        return r.request.method == "GET" and urlparse(r.url).path.rstrip("/") == "/api/jobs"
+
+    with page.expect_response(_is_get_jobs_index, timeout=20_000):
+        page.goto(_ui_url(), wait_until="domcontentloaded", timeout=25_000)
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    for _ in range(150):
+        page.wait_for_timeout(100)
+        if st["in_flight"] == 0:
+            page.wait_for_timeout(300)
+            if st["in_flight"] == 0:
+                break
+
+    with page.expect_response(_is_get_jobs_index, timeout=20_000):
+        page.reload(wait_until="domcontentloaded", timeout=25_000)
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    for _ in range(150):
+        page.wait_for_timeout(100)
+        if st["in_flight"] == 0:
+            page.wait_for_timeout(300)
+            if st["in_flight"] == 0:
+                break
+
+    if st["max"] == 0:
+        pytest.skip("当前无任务或无 /steps 请求，跳过并发上界断言")
+    assert st["max"] <= 5, f"同一时刻 GET /steps 峰值 {st['max']}，预期有界并发（≤5）"
 
 
 def _inject_job_style_probe(page: Page, pre_text: str, data_id: str) -> None:
@@ -432,6 +482,7 @@ def test_overlay_job_steps_on_disk_appear_in_task_card(page: Page) -> None:
         pytest.skip(
             f"jobs_state 中无 job id {sample_job_id}（可设 TRAE_E2E_FIXTURE_JOB_ID 或先跑过 overlay 任务）"
         )
+    assert target is not None  # narrow for mypy（pytest.skip 在部分 stub 下非 NoReturn）
     layer_path = Path(str(target.get("layer_path") or ""))
     diff_agent_root = layer_path / "diff" / ".trae_agent_json" / sample_job_id
     if not diff_agent_root.is_dir():

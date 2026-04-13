@@ -46,6 +46,7 @@ from .layer_git import (
     get_runtime_git_identity,
     git_ahead_of_upstream,
     git_worktree_dirty,
+    latest_commit_log,
     list_layer_changes_vs_parent,
     push_layer_worktree,
     set_runtime_git_identity,
@@ -68,6 +69,9 @@ log = logging.getLogger(__name__)
 
 # 在文件末尾赋值为 build_layer_graph_snapshot_for_saas，供 lifespan 启动层级推送循环
 _layer_graph_snapshot_builder = None
+
+# GET /api/layers 快照会为多个 job 并发读磁盘；限制并发以免占满默认线程池、拖住其它 API
+_JOB_STEPS_DISK_SEM = asyncio.Semaphore(12)
 
 
 def _strict_bootstrap_enabled() -> bool:
@@ -562,17 +566,8 @@ async def get_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     return _job_to_api_dict(rec)
 
 
-@app.get("/api/jobs/{job_id}/events")
-async def get_job_events(
-    _: AuthDep,
-    job_id: str,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=200, ge=1, le=2000),
-) -> dict[str, Any]:
-    """按行偏移读取任务结构化 JSONL 事件。"""
-    rec = store.get(job_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="Job not found")
+def _read_job_events_payload(job_id: str, offset: int, limit: int) -> dict[str, Any]:
+    """同步读磁盘；须由 asyncio.to_thread 调用以免阻塞事件循环。"""
     p = job_events_file(job_id)
     d = job_events_dir() / str(job_id)
     events: list[dict[str, Any]] = []
@@ -588,7 +583,6 @@ async def get_job_events(
             except (OSError, json.JSONDecodeError):
                 continue
     elif p.is_file():
-        # 兼容旧版 JSONL
         try:
             lines = p.read_text(encoding="utf-8").splitlines()
         except OSError as e:
@@ -615,6 +609,20 @@ async def get_job_events(
     }
 
 
+@app.get("/api/jobs/{job_id}/events")
+async def get_job_events(
+    _: AuthDep,
+    job_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """按行偏移读取任务结构化 JSONL 事件。"""
+    rec = store.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return await asyncio.to_thread(_read_job_events_payload, job_id, offset, limit)
+
+
 @app.get("/api/jobs/{job_id}/steps")
 async def job_agent_steps(_: AuthDep, job_id: str) -> dict[str, Any]:
     """优先从该 job 的 ``.trae_agent_json/{job_id}`` 读取步骤；否则回退到层目录最新 ``.trajectories``。"""
@@ -622,7 +630,7 @@ async def job_agent_steps(_: AuthDep, job_id: str) -> dict[str, Any]:
     if not rec:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        payload = load_agent_steps_for_job(rec.layer_path, job_id)
+        payload = await asyncio.to_thread(load_agent_steps_for_job, rec.layer_path, job_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"job_id": job_id, "layer_id": rec.layer_id, **payload}
@@ -770,6 +778,12 @@ async def api_layer_git_push(
     )
 
 
+@app.get("/api/layers/{layer_id}/git/commit/latest-log")
+async def api_layer_git_latest_commit_log(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """返回该层最近一次提交日志（每仓库 ``git log -1 --stat``）。"""
+    return await latest_commit_log(layer_id)
+
+
 @app.get("/api/git/identity")
 async def api_git_identity_get(_: AuthDep) -> dict[str, Any]:
     identity = get_runtime_git_identity()
@@ -823,9 +837,11 @@ async def api_layer_diff_parent_file(
 @app.get("/api/layers/{layer_id}/diff/parent")
 async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
     """当前可写层工作区目录与已解析父层目录的差异（``diff -ruN -x .git``）。"""
-    layers = list_layers()
+    layers, jobs = await asyncio.gather(
+        asyncio.to_thread(list_layers),
+        asyncio.to_thread(store.list_jobs),
+    )
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
-    jobs = store.list_jobs()
     parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
     if not parent:
         return {
@@ -842,7 +858,8 @@ async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
 @app.get("/api/requirements/task-gate")
 async def api_task_gate(_: AuthDep) -> dict[str, Any]:
     """新建任务前是否已满足「至少成功克隆过一次」（存在含 ``.git`` 的可写层）。"""
-    return {"clone_done": any_layer_has_git_repo()}
+    ok = await asyncio.to_thread(any_layer_has_git_repo)
+    return {"clone_done": ok}
 
 
 @app.post("/api/project/view")
@@ -967,20 +984,32 @@ async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
         if prev_rank is None or cur_rank >= prev_rank:
             latest_job_rank[lid] = cur_rank
             latest_job_by_layer[lid] = rec
-    for rec in latest_job_by_layer.values():
-        try:
-            payload = load_agent_steps_for_job(rec.layer_path, rec.id)
-        except ValueError:
-            continue
-        models, total_tokens = _summarize_job_steps_usage(payload)
-        row = jobs_api_by_id.get(rec.id)
-        if not row:
-            continue
-        if models:
-            row["llm_models"] = models
-            row["llm_model"] = models[0]
-        if total_tokens is not None:
-            row["llm_total_tokens"] = total_tokens
+
+    async def _steps_payload_for_snapshot(rec: JobRecord) -> tuple[str, dict[str, Any] | None]:
+        async with _JOB_STEPS_DISK_SEM:
+            try:
+                return rec.id, await asyncio.to_thread(
+                    load_agent_steps_for_job, rec.layer_path, rec.id
+                )
+            except ValueError:
+                return rec.id, None
+
+    if latest_job_by_layer:
+        step_rows = await asyncio.gather(
+            *[_steps_payload_for_snapshot(rec) for rec in latest_job_by_layer.values()]
+        )
+        for jid, payload in step_rows:
+            if payload is None:
+                continue
+            models, total_tokens = _summarize_job_steps_usage(payload)
+            row = jobs_api_by_id.get(jid)
+            if not row:
+                continue
+            if models:
+                row["llm_models"] = models
+                row["llm_model"] = models[0]
+            if total_tokens is not None:
+                row["llm_total_tokens"] = total_tokens
     return {
         "layers": layers,
         "jobs": jobs_api,
@@ -1028,7 +1057,7 @@ async def api_list_layer_files(
     ),
     max_files: int = Query(default=2000, ge=1, le=5000),
 ) -> dict[str, Any]:
-    return list_layer_files(layer_id=layer_id, prefix=prefix, max_files=max_files)
+    return await asyncio.to_thread(list_layer_files, layer_id, prefix, max_files)
 
 
 @app.get("/api/layers/{layer_id}/files/{file_rel_posix:path}")
@@ -1039,9 +1068,10 @@ async def api_read_layer_file(
     max_bytes: int | None = Query(default=None, ge=1, le=50_000_000),
     max_text_chars: int | None = Query(default=None, ge=1, le=5_000_000),
 ) -> dict[str, Any]:
-    return read_layer_file(
-        layer_id=layer_id,
-        file_rel_posix=file_rel_posix,
+    return await asyncio.to_thread(
+        read_layer_file,
+        layer_id,
+        file_rel_posix,
         max_bytes=max_bytes,
         max_text_chars=max_text_chars,
     )
@@ -1058,7 +1088,8 @@ async def api_list_layer_children(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=2000),
 ) -> dict[str, Any]:
-    return list_layer_children(
+    return await asyncio.to_thread(
+        list_layer_children,
         layer_id=layer_id,
         dir_rel_posix=dir,
         prefix=prefix,

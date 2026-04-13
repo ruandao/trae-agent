@@ -152,7 +152,7 @@ async def _drain_git_stdout(
 
 
 def _looks_like_transient_fetch_error(output: str) -> bool:
-    """HTTPS / LibreSSL 下偶发 SSL_ERROR_SYSCALL、握手被掐断等，与网络瞬断类似，应重试。"""
+    """HTTPS / LibreSSL / GnuTLS 下偶发 SSL_ERROR_SYSCALL、握手或 recv 被掐断等，与网络瞬断类似，应重试。"""
     needles = (
         "RPC failed",
         "curl 18",
@@ -169,6 +169,10 @@ def _looks_like_transient_fetch_error(output: str) -> bool:
         "OpenSSL SSL_connect",
         "SSL routines:",
         "gnutls_handshake",
+        # Debian 系 git 链到 libcurl+GnuTLS 时常见，与 -110 等非正常终止多为瞬时
+        "GnuTLS recv error",
+        "gnutls recv error",
+        "The TLS connection was non-properly terminated",
         "Could not resolve host",
     )
     return any(n in output for n in needles)
@@ -542,6 +546,8 @@ async def clone_into_new_layer(
             if ipv4_curl_cfg is not None:
                 with contextlib.suppress(OSError):
                     ipv4_curl_cfg.unlink(missing_ok=True)
+
+    raise RuntimeError("clone_into_new_layer: retry loop exited without return")
 
 
 def _safe_rmtree(path: Path) -> None:

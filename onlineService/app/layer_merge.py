@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from .layer_meta import layer_chain_root_to_tip, read_layer_meta
@@ -102,11 +103,19 @@ def lower_paths_full_tip(layer_id: str) -> list[Path]:
 
 def layer_merged_root_for_api(layer_id: str) -> Path:
     """物化合并视图供 API / git / 文件浏览。"""
+    with layer_merged_root_for_api_locked(layer_id) as root:
+        return root
+
+
+@contextmanager
+def layer_merged_root_for_api_locked(layer_id: str):
+    """在持有 layer 级物化锁期间返回稳定 merged 目录。"""
     chain = lower_paths_full_tip(layer_id)
     dest = runtime_dir() / "materialized" / layer_id
-    with _materialize_lock_for_layer(layer_id):
+    lock = _materialize_lock_for_layer(layer_id)
+    with lock:
         materialize_merged_chain(chain, dest)
-    return dest
+        yield dest
 
 
 def prepare_job_run(layer_id: str, *, reuse_upper: bool = False) -> Path:
