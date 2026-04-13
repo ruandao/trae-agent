@@ -39,6 +39,7 @@ from .layers import (
 )
 from .online_project_view import clear_online_project_tip, set_online_project_tip
 from .paths import (
+    clear_runtime_ephemeral_task_dirs,
     commands_log_path,
     config_file_path,
     job_agent_json_root,
@@ -1144,6 +1145,7 @@ class JobStore:
                     shutil.rmtree(job_events_dir(), ignore_errors=True)
 
             await asyncio.to_thread(_unlink_commands_log)
+            ephemeral_stat = await asyncio.to_thread(clear_runtime_ephemeral_task_dirs)
             await asyncio.to_thread(clear_online_project_tip)
 
             await hub.publish({"type": "jobs_reset", "title": "任务与可写层已重置"})
@@ -1152,6 +1154,7 @@ class JobStore:
                 "running_interrupted": len(running_items),
                 "runner_tasks_cancelled": len(runner_items),
                 "layers_removed": layers_stat.get("removed", 0),
+                **ephemeral_stat,
             }
 
     def _child_job_ids(self, job_id: str) -> list[str]:

@@ -2256,36 +2256,8 @@
       updateLayerRelationToolbar(nid);
     }
 
-    function buildJobGraphMaps(jobs, layerById) {
-      const byId = new Map(jobs.map((j) => [j.id, j]));
-      const childMap = new Map();
-      for (const j of jobs) {
-        const p = j.parent_job_id;
-        if (p && byId.has(p)) {
-          if (!childMap.has(p)) childMap.set(p, []);
-          childMap.get(p).push(j);
-        }
-      }
-      for (const arr of childMap.values()) {
-        arr.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
-      }
-      function effectiveClean(job) {
-        const L = layerById.get(job.layer_id);
-        if (!L) return false;
-        if (L.git_worktree_dirty === false) return true;
-        if (L.git_worktree_dirty === null) return false;
-        const kids = childMap.get(job.id) || [];
-        for (const k of kids) {
-          if (effectiveClean(k)) return true;
-        }
-        return false;
-      }
-      return { byId, childMap, effectiveClean };
-    }
-
     /** zTree：按可写层 parent_layer_id 组织；任务挂在对应 layer_id 下（同级正序），不再按 parent_job_id 嵌套。 */
-    function buildZTreeNodesFromLayers(layers, jobs, maps, layerById) {
-      const { effectiveClean } = maps;
+    function buildZTreeNodesFromLayers(layers, jobs, layerById) {
       const ZROOT = 0;
       const layerChildMap = new Map();
       for (const l of layers) {
@@ -2346,9 +2318,8 @@
         const bits = [st];
         const L = layerById.get(job.layer_id);
         const dirty = L ? L.git_worktree_dirty : null;
-        const showSubmitted = effectiveClean(job);
         if (dirty === null) bits.push('无 git');
-        else if (showSubmitted) bits.push('✓');
+        else if (dirty === false) bits.push('✓');
         else bits.push('未提交');
         if (typeof layer.queue_depth === 'number' && layer.queue_depth > 0) {
           bits.push('队列 ' + layer.queue_depth);
@@ -2378,9 +2349,8 @@
         const bits = [st];
         const L = layerById.get(job.layer_id);
         const dirty = L ? L.git_worktree_dirty : null;
-        const showSubmitted = effectiveClean(job);
         if (dirty === null) bits.push('无 git');
-        else if (showSubmitted) bits.push('✓');
+        else if (dirty === false) bits.push('✓');
         else bits.push('未提交');
         const sub = [];
         if (job.created_at) sub.push(job.created_at);
@@ -2398,11 +2368,10 @@
       function ztStyleForJob(job) {
         const L = layerById.get(job.layer_id);
         const dirty = L ? L.git_worktree_dirty : null;
-        const showSubmitted = effectiveClean(job);
         const active = job.status === 'pending' || job.status === 'running';
         if (active) return 'active';
         if (dirty === null) return 'no_git';
-        if (dirty === false || showSubmitted) return 'clean';
+        if (dirty === false) return 'clean';
         return 'dirty';
       }
 
@@ -2571,8 +2540,6 @@
       if (!bar) return;
       bar.replaceChildren();
       const layers = window.__layersForMind;
-      const maps = window.__layerGraphMaps;
-      const effectiveClean = maps && maps.effectiveClean;
 
       if (!selectedMindNodeId || selectedMindNodeId === LAYER_GRAPH_ROOT_ID) {
         const hint = document.createElement('span');
@@ -2808,11 +2775,9 @@
       }
 
       const dirty = layer.git_worktree_dirty;
-      const showSubmitted = isLayerNode
-        ? dirty === false
-        : job
-          ? (effectiveClean ? effectiveClean(job) : false)
-          : dirty === false;
+      // 仅看当前可写层聚合 git 状态（多仓克隆任一有变更则 dirty===true）。不用 effectiveClean：
+      // 否则子任务在子层已提交时会把父共享层误判为已提交，导致「提交」像不可用/已 noop。
+      const showSubmitted = dirty === false;
 
       if (dirty === null) {
         const na = document.createElement('span');
@@ -2827,10 +2792,7 @@
         const ok = document.createElement('span');
         ok.className = 'tree-layer-commit-done';
         ok.textContent = '✓';
-        const propagated = showSubmitted && dirty !== false && dirty !== null;
-        ok.title = propagated
-          ? '下层已有可写层提交完毕（工作区干净），本层在图中一并视为已提交'
-          : '工作区干净，当前无未提交变更';
+        ok.title = '工作区干净，当前无未提交变更';
         bar.appendChild(ok);
       }
       const commitBtn = document.createElement('button');
@@ -3026,15 +2988,13 @@
       const jobs = lastJobs || [];
       const layerById = new Map(layerList.map((l) => [l.layer_id, l]));
 
-      const maps = buildJobGraphMaps(jobs, layerById);
-      window.__layerGraphMaps = maps;
       const rootLayerRows = layerList.filter((l) => {
         const p = l.parent_layer_id;
         return !p || !layerById.has(p);
       });
       sortZTreeLayerSiblings(rootLayerRows);
 
-      const zNodes = buildZTreeNodesFromLayers(layerList, jobs, maps, layerById);
+      const zNodes = buildZTreeNodesFromLayers(layerList, jobs, layerById);
 
       const graphEl = document.createElement('ul');
       graphEl.id = 'ztree_layer_graph';

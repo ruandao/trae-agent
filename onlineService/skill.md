@@ -87,7 +87,7 @@
 | `POST` | `/api/jobs/{job_id}/redo` | 删除该任务当前可写层目录，按创建时的来源重新建层并**重新执行同一指令**。运行中/待开始会先尝试中断或取消 runner。 |
 | `POST` | `/api/jobs/{job_id}/continue` | 仅当状态为 `interrupted`：保留可写层，以「继续」再次运行 `trae-cli`。 |
 | `DELETE` | `/api/jobs/{job_id}` | 从任务列表移除并删除该任务可写层目录；若存在子任务则 400。若 `git_destructive_locked` 为真则 400。 |
-| `POST` | `/api/jobs/reset` | 中断并清空所有任务，删除 `jobs_state` 中记录，并清理可写层目录（仅匹配层命名规则的子目录）、删除 `commands.json`。返回统计如 `jobs_cleared`、`layers_removed` 等。 |
+| `POST` | `/api/jobs/reset` | 中断并清空所有任务，删除 `jobs_state` 中记录，并清理可写层目录（仅匹配层命名规则的子目录）、删除 `commands.json` 与 `job_events/`；顺带删除 `runtime/job_logs`、`runtime/materialized*` 等可再生缓存。返回如 `jobs_cleared`、`layers_removed`、`runtime_ephemeral_removed`（目录名列表）等。 |
 
 任务状态取值：`pending`、`running`、`completed`、`failed`、`interrupted`。任务记录中含 `layer_id`、`layer_path`、`command`、`parent_job_id`、`repo_layer_id`、`git_branch`、`output`、`exit_code`、`created_at` 等字段。
 
@@ -102,13 +102,23 @@
 | `GET` | `/api/layers/{layer_id}/diff/parent` | **父层与当前层目录树全文 diff**（`diff -ruN -x .git`）。父层 ID 由 `.git` 符号链接或任务记录解析，与 `GET /api/layers` 返回的 `parent_layer_id` 一致；若无父层则响应体含 `detail` 说明，`diff` 为空。返回 `same`、`diff`、`truncated` 等。 |
 | `GET` | `/api/layers/{layer_id}/diff/parent/files` | **相对父层的变动路径列表**。由 `diff -rq -x .git` 解析为 JSON：`changes` 为 `{ path, kind }` 数组，`kind` 为 `modified` \| `added` \| `removed`。无父层时同上，返回 `changes: []` 与 `detail`。条数过多时 `truncated: true`。 |
 | `GET` | `/api/layers/{layer_id}/diff/parent/file` | **单路径相对父层的 unified diff**。查询参数 **`path`**（必填）：层内相对 POSIX 路径，规则同读取单文件接口。文件使用 `diff -uN`；目录使用 `diff -ruN -x .git`。无父层时 **400**。响应含 `path_kind`（`file` \| `dir`）、`diff`、`truncated` 等。 |
+| `DELETE` | `/api/layers/{layer_id}` | 删除该可写层（含子层时自底向上）；运行中任务会先中断。 |
+| `POST` | `/api/layers/{layer_id}/queue` | JSON：`command`、`command_kind`（`trae` \| `shell`），向该层待执行队列追加一条。 |
+| `GET` | `/api/repos/clone-log/{layer_id}` | 返回克隆过程文本日志（内存缓冲，克隆结束后可能清空）。 |
+| `GET` | `/api/repos/bootstrap-clone-log` | 容器引导阶段批量克隆的日志；无进行中的引导时 `layer_id` 可能为 `null`。 |
+| `POST` | `/api/project/view` | JSON：`layer_id`。将仓库根下 `onlineProject` 符号链接指向该层 tip（物化或层目录）。 |
+| `GET` | `/api/project/active` | 解析当前 `onlineProject` 指向与 `active_tip_layer_id` 等。 |
 
-## 层内 Git（不 push）
+## 层内 Git
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/api/layers/{layer_id}/git/branches` | 列出该层内仓库分支（需存在 `.git`）。 |
-| `POST` | `/api/layers/{layer_id}/git/commit` | JSON：`message`（可选，空则服务端可据任务指令与 diff 生成）。对当前工作区 `git add -A` 并 `git commit`（仅本地，不推送）。 |
+| `POST` | `/api/layers/{layer_id}/git/commit` | JSON：`message`（可选，空则服务端可据任务指令与 diff 生成）。对当前工作区 `git add -A` 并 `git commit`（仅本地，不 push）。 |
+| `POST` | `/api/layers/{layer_id}/git/push` | 将当前分支 `git push` 到已配置上游；可选 JSON：`target_branch`、`github_auth`。 |
+| `GET` | `/api/layers/{layer_id}/git/commit/latest-log` | 该层各 git 根目录最近一次 `git log -1 --stat` 聚合文本。 |
+| `GET` | `/api/git/identity` | 当前进程内用于 `git commit` 的 `user.name` / `user.email` 运行时配置（可能为空）。 |
+| `POST` | `/api/git/identity` | JSON：`name`、`email`，设置上述运行时身份。 |
 
 ## 实时事件（SSE）
 
@@ -128,7 +138,44 @@
 
 ## Web 控制台
 
-- `GET /ui/{access_token}` — 路径中的令牌须与 `ACCESS_TOKEN` 一致，否则 401。页面内调用上述 API，并建立 SSE 连接。页面含 **可写层变动浏览**：按任务层调用 `GET /api/layers/{layer_id}/diff/parent/files` 列出相对父层的路径变动，再对所选路径调用 `GET /api/layers/{layer_id}/diff/parent/file?path=...` 查看 diff。
+- **入口**：`GET /ui/{access_token}` — 路径中的令牌须与环境变量 `ACCESS_TOKEN` 一致，否则 **401**。本地执行 `onlineService/run_local.sh` 时默认 `ACCESS_TOKEN=dev-local-token`，故开发页为 **`http://localhost:8765/ui/dev-local-token`**（或 `127.0.0.1`）。
+- 页面为单页 `static/index.html`：通过全局 `ACCESS_TOKEN` 调用下方接口，并用 **`GET /api/events/stream?access_token=…`** 建立 `EventSource`（浏览器无法为 SSE 自定义 Header，令牌只能走查询参数）。
+- **可写层变动**：`GET /api/layers/{layer_id}/diff/parent/files` 列出相对父层路径，再 `GET /api/layers/{layer_id}/diff/parent/file?path=…` 查看单路径 unified diff。
+
+### 该页实际调用的 HTTP 接口（与 `dev-local-token` 控制台一致）
+
+| 方法 | 路径 | 用途摘要 |
+|------|------|----------|
+| `GET` | `/api/events/stream` | SSE：`?access_token=` 必填。 |
+| `POST` | `/api/config` | `multipart/form-data`，字段 `file`，上传 `service_config.yaml`。 |
+| `GET` | `/api/config` | 拉取当前 YAML 到编辑区。 |
+| `POST` | `/api/project/view` | JSON：`{"layer_id":"…"}`，切换「层 / 任务」选择时更新 `onlineProject` 指向。 |
+| `GET` | `/api/requirements/task-gate` | 是否允许新建任务（`clone_done`）。 |
+| `POST` | `/api/repos/clone` | 克隆到新建可写层。 |
+| `GET` | `/api/repos/clone-log/{layer_id}` | 克隆日志轮询。 |
+| `GET` | `/api/repos/bootstrap-clone-log` | 启动引导批量克隆日志。 |
+| `GET` | `/api/jobs` | 任务列表与卡片。 |
+| `GET` | `/api/jobs/{job_id}` | 单条任务刷新。 |
+| `GET` | `/api/jobs/{job_id}/steps` | 步骤手风琴数据。 |
+| `GET` | `/api/jobs/{job_id}/parent` | 「查询父任务」调试区。 |
+| `POST` | `/api/jobs` | 创建任务（含 zTree 操作栏「创建并执行」）。 |
+| `POST` | `/api/jobs/{job_id}/interrupt` | 中断。 |
+| `POST` | `/api/jobs/{job_id}/redo` | 重新执行。 |
+| `POST` | `/api/jobs/{job_id}/continue` | 继续（仅 `interrupted`）。 |
+| `DELETE` | `/api/jobs/{job_id}` | 删除任务。 |
+| `POST` | `/api/jobs/reset` | 「重置（中断并清空）」。 |
+| `GET` | `/api/layers` | 下拉与 zTree 层图；含 `git_worktree_dirty`、`git_remote` 等。 |
+| `DELETE` | `/api/layers/{layer_id}` | zTree 操作栏「删除该层」。 |
+| `POST` | `/api/layers/{layer_id}/queue` | 运行中任务时「加入队列」。 |
+| `GET` | `/api/layers/{layer_id}/diff/parent/files` | 可写层变动列表 / 心智图父层差异。 |
+| `GET` | `/api/layers/{layer_id}/diff/parent/file` | 查询参数 **`path`**（必填）：单路径 diff。 |
+| `GET` | `/api/layers/{layer_id}/git/commit/latest-log` | 提交日志面板「最后一次提交」。 |
+| `POST` | `/api/layers/{layer_id}/git/commit` | JSON：`message`（可选）；「提交」按钮。 |
+| `POST` | `/api/layers/{layer_id}/git/push` | 「推送」按钮（无 body 亦可）。 |
+| `GET` | `/api/layers/{layer_id}/children` | 查询参数：`dir`、`prefix`、`offset`、`limit`；层内文件树分页。 |
+| `GET` | `/api/layers/{layer_id}/files/{file_rel_posix}` | 查询参数：`max_bytes`、`max_text_chars`；读取选中文件内容。 |
+
+未在 `index.html` 中直连的接口（如 `GET /api/layers/{layer_id}/files` 仅前缀列表、`GET /api/jobs/{job_id}/events`、`GET /api/layers/{layer_id}/git/branches` 等）仍可在 **OpenAPI**（`/docs`、`/openapi.json`）中查阅，供脚本或其它客户端使用。
 
 ## 层命名
 
@@ -144,7 +191,7 @@ cd onlineService
 ../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765
 ```
 
-浏览器打开：`http://127.0.0.1:8765/ui/your-secret`
+浏览器打开：`http://127.0.0.1:8765/ui/your-secret`（默认本地令牌时：`http://localhost:8765/ui/dev-local-token`）
 本 Skill 文档：`http://127.0.0.1:8765/skill.md`
 
 ## Docker 与多架构镜像

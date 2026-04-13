@@ -1,6 +1,7 @@
 """Resolved filesystem paths for the service."""
 
 import os
+import shutil
 from pathlib import Path
 
 _SERVICE_ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +52,34 @@ def config_file_path() -> Path:
 
 def jobs_state_path() -> Path:
     return runtime_dir() / "jobs_state.json"
+
+
+def clear_runtime_ephemeral_task_dirs() -> dict[str, list[str]]:
+    """删除 ``runtime/`` 下与任务相关的可再生目录（物化缓存、轨迹日志等）。
+
+    供 ``POST /api/jobs/reset`` 使用；**不**删除 ``jobs_state.json``、``service_config.yaml``、
+    ``state_root()/logs``、``reqLogs`` 等。
+    """
+    rt = runtime_dir()
+    names = (
+        "job_logs",
+        "materialized",
+        "materialized_compare",
+        "materialized_commit_parent",
+    )
+    removed: list[str] = []
+    for name in names:
+        p = rt / name
+        try:
+            if p.is_symlink() or p.is_file():
+                p.unlink(missing_ok=True)
+                removed.append(name)
+            elif p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+                removed.append(name)
+        except OSError:
+            continue
+    return {"runtime_ephemeral_removed": removed}
 
 
 def commands_log_path() -> Path:
