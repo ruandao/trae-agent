@@ -165,6 +165,22 @@ def _redact_error_detail_snippet(text: str, max_len: int = 2048) -> str:
         return text
 
 
+def _response_body_snippet_for_log(parsed: Any, max_len: int = 2048) -> str:
+    """成功响应写入 reqLogs 时的脱敏摘要（与 error detail 同量级，避免单行过大）。"""
+    s = json.dumps(_redact_for_log(parsed), ensure_ascii=False)
+    if len(s) > max_len:
+        return s[:max_len] + "…"
+    return s
+
+
+def _flush_outbound_log_handlers() -> None:
+    for h in _outbound_req_logger.handlers:
+        flush = getattr(h, "flush", None)
+        if callable(flush):
+            with contextlib.suppress(OSError, ValueError):
+                flush()
+
+
 def _ensure_outbound_req_log_handler() -> None:
     log_path = (req_logs_dir() / "outbound.log").resolve()
     logger = _outbound_req_logger
@@ -198,6 +214,7 @@ def _log_outbound_post(
     status: int | None,
     error_kind: str | None,
     error_detail: str | None = None,
+    response_detail: str | None = None,
 ) -> None:
     _ensure_outbound_req_log_handler()
     body_s = json.dumps(_redact_for_log(body), ensure_ascii=False)
@@ -214,9 +231,12 @@ def _log_outbound_post(
     if error_kind:
         parts.append(f"error={error_kind}")
     parts.append(f"body={body_s}")
+    if response_detail:
+        parts.append(f"response={response_detail}")
     if error_detail:
         parts.append(f"detail={error_detail}")
     _outbound_req_logger.info(" | ".join(parts))
+    _flush_outbound_log_handlers()
 
 
 def _post_json(
@@ -236,9 +256,36 @@ def _post_json(
     t0 = time.perf_counter()
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+            raw_bytes = resp.read()
             status = getattr(resp, "status", None)
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            _log_outbound_post(
+                step=step,
+                url=url,
+                body=body,
+                elapsed_ms=elapsed_ms,
+                status=status,
+                error_kind="decode",
+                error_detail=str(e),
+            )
+            raise RuntimeError(f"[{step}] 响应体不是合法 UTF-8: {url}") from e
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        try:
+            parsed: Any = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            _log_outbound_post(
+                step=step,
+                url=url,
+                body=body,
+                elapsed_ms=elapsed_ms,
+                status=status,
+                error_kind="json",
+                error_detail=_redact_error_detail_snippet(raw),
+            )
+            raise RuntimeError(f"[{step}] 响应不是合法 JSON {url}: {raw[:500]!r}") from e
         _log_outbound_post(
             step=step,
             url=url,
@@ -246,6 +293,7 @@ def _post_json(
             elapsed_ms=elapsed_ms,
             status=status,
             error_kind=None,
+            response_detail=_response_body_snippet_for_log(parsed),
         )
     except TimeoutError as e:
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -283,7 +331,7 @@ def _post_json(
             error_detail=str(e),
         )
         raise RuntimeError(f"[{step}] 请求失败 {url}: {e}") from e
-    return json.loads(raw) if raw else {}
+    return parsed if raw else {}
 
 
 def _bootstrap_git_clone_timeout_sec() -> int | None:

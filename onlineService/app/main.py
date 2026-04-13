@@ -44,6 +44,7 @@ from .layer_git import (
     diff_layer_one_path_vs_parent,
     diff_layer_worktree_vs_parent,
     get_runtime_git_identity,
+    git_ahead_at_path,
     git_ahead_of_upstream,
     git_worktree_dirty,
     latest_commit_log,
@@ -62,6 +63,7 @@ from .paths import (
     job_events_file,
     layers_root,
     logs_dir,
+    repo_root,
     service_root,
 )
 
@@ -390,6 +392,16 @@ async def skill_markdown() -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="skill.md missing")
     return FileResponse(path, media_type="text/markdown; charset=utf-8")
+
+
+@app.get("/api/dev/service-repo-git-push", include_in_schema=False)
+async def service_repo_git_push(_: AuthDep) -> dict[str, Any]:
+    """``REPO_ROOT`` 宿主仓库相对上游分支未 push 的提交数（供 Web 控制台展示）。"""
+
+    def _run() -> dict[str, Any]:
+        return git_ahead_at_path(repo_root())
+
+    return await asyncio.to_thread(_run)
 
 
 @app.get("/ui/{access_token}", include_in_schema=False)

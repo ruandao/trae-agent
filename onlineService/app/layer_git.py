@@ -646,6 +646,77 @@ def git_ahead_of_upstream(layer_id: str) -> dict[str, Any]:
     }
 
 
+def git_ahead_at_path(cwd: Path) -> dict[str, Any]:
+    """统计 ``cwd`` 若为 git 工作区时，``HEAD`` 相对已配置上游多出的提交数（未 push 的本地提交）。"""
+    root = cwd.resolve()
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    r_in = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if r_in.returncode != 0 or (r_in.stdout or "").strip() != "true":
+        return {
+            "is_git": False,
+            "ahead": None,
+            "branch": None,
+            "upstream": None,
+            "no_upstream": None,
+            "path": str(root),
+        }
+
+    r_head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    branch = r_head.stdout.strip() if r_head.returncode == 0 else None
+
+    r_u = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "@{u}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    if r_u.returncode != 0:
+        return {
+            "is_git": True,
+            "ahead": None,
+            "branch": branch,
+            "upstream": None,
+            "no_upstream": True,
+            "path": str(root),
+        }
+
+    upstream = r_u.stdout.strip()
+    r_cnt = subprocess.run(
+        ["git", "-C", str(root), "rev-list", "--count", f"{upstream}..HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    ahead: int | None = None
+    if r_cnt.returncode == 0:
+        try:
+            ahead = int((r_cnt.stdout or "").strip())
+        except ValueError:
+            ahead = None
+    return {
+        "is_git": True,
+        "ahead": ahead,
+        "branch": branch,
+        "upstream": upstream,
+        "no_upstream": False,
+        "path": str(root),
+    }
+
+
 _MAX_PARENT_DIFF_CHARS = 400_000
 _MAX_CHANGE_LIST_LINES = 2500
 _MAX_SINGLE_PATH_DIFF_CHARS = 350_000

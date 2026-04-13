@@ -140,12 +140,14 @@
 
 - **入口**：`GET /ui/{access_token}` — 路径中的令牌须与环境变量 `ACCESS_TOKEN` 一致，否则 **401**。本地执行 `onlineService/run_local.sh` 时默认 `ACCESS_TOKEN=dev-local-token`，故开发页为 **`http://localhost:8765/ui/dev-local-token`**（或 `127.0.0.1`）。
 - 页面为单页 `static/index.html`：通过全局 `ACCESS_TOKEN` 调用下方接口，并用 **`GET /api/events/stream?access_token=…`** 建立 `EventSource`（浏览器无法为 SSE 自定义 Header，令牌只能走查询参数）。
+- **页眉**：展示 **`REPO_ROOT`**（默认仓库根，与 `onlineService` 并列）宿主 Git 仓库当前分支相对**已配置上游**的未推送提交数；实现为页面加载时请求 `GET /api/dev/service-repo-git-push`。若目录不是 Git 工作区、或当前分支未设置 upstream（无 tracking），则显示说明性文案而非数字。统计方式与层内逻辑一致：`git rev-list --count @{upstream}..HEAD`。
 - **可写层变动**：`GET /api/layers/{layer_id}/diff/parent/files` 列出相对父层路径，再 `GET /api/layers/{layer_id}/diff/parent/file?path=…` 查看单路径 unified diff。
 
 ### 该页实际调用的 HTTP 接口（与 `dev-local-token` 控制台一致）
 
 | 方法 | 路径 | 用途摘要 |
 |------|------|----------|
+| `GET` | `/api/dev/service-repo-git-push` | 页眉：`REPO_ROOT` 宿主仓库未推送提交数（相对上游）；响应含 `is_git`、`ahead`、`branch`、`upstream`、`no_upstream`、`path`。 |
 | `GET` | `/api/events/stream` | SSE：`?access_token=` 必填。 |
 | `POST` | `/api/config` | `multipart/form-data`，字段 `file`，上传 `service_config.yaml`。 |
 | `GET` | `/api/config` | 拉取当前 YAML 到编辑区。 |

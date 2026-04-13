@@ -358,6 +358,7 @@
   <header>
     <h1>Trae Online Service</h1>
     <p class="meta" style="margin:0.35rem 0 0">控制台 · 路径中的 AccessToken 已校验</p>
+    <p class="meta" id="hostRepoPushLine" style="margin:0.35rem 0 0">服务宿主仓库（REPO_ROOT）未推送提交：加载中…</p>
   </header>
   <main>
     <section>
@@ -767,6 +768,50 @@
         },
       });
     };
+
+    async function refreshHostRepoPushLine() {
+      const el = document.getElementById('hostRepoPushLine');
+      if (!el) return;
+      try {
+        const r = await api('/api/dev/service-repo-git-push');
+        if (!r.ok) {
+          el.textContent =
+            '服务宿主仓库（REPO_ROOT）未推送提交：请求失败（HTTP ' + r.status + '）。';
+          return;
+        }
+        const j = await r.json();
+        const p = j.path != null ? String(j.path) : '';
+        if (!j.is_git) {
+          el.textContent =
+            '服务宿主目录' +
+            (p ? ' ' + p + ' ' : ' ') +
+            '不是 Git 工作区；无未推送提交统计。';
+          return;
+        }
+        if (j.no_upstream) {
+          el.textContent =
+            '服务宿主仓库' +
+            (p ? ' ' + p : '') +
+            '：当前分支「' +
+            (j.branch != null ? String(j.branch) : '?') +
+            '」未配置上游（tracking branch），无法统计相对远端的未推送提交数。';
+          return;
+        }
+        const n = typeof j.ahead === 'number' ? j.ahead : null;
+        const br = j.branch != null ? String(j.branch) : '?';
+        const up = j.upstream != null ? String(j.upstream) : '?';
+        el.textContent =
+          '服务宿主仓库（REPO_ROOT）当前分支「' +
+          br +
+          '」相对上游「' +
+          up +
+          '」未推送提交数：' +
+          (n !== null ? String(n) : '未知') +
+          '。';
+      } catch (_) {
+        el.textContent = '服务宿主仓库（REPO_ROOT）未推送提交：读取失败。';
+      }
+    }
 
     /** 按钮防连点：两次有效点击至少间隔 ms（前缘限流，与异步中的 busy 门闩配合）。 */
     const BTN_DEBOUNCE_MS = 300;
@@ -3458,6 +3503,7 @@
     // 须立即恢复克隆表单：若等到 loadLayers 完成再写入，/api/layers 慢或失败时 URL 会一直为空。
     applyPersistedCloneUi(__persistedClone);
     wireCloneFormInputPersist();
+    void refreshHostRepoPushLine();
     void (async () => {
       try {
         await applyTaskGate();
