@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -15,7 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .layers import create_clone_layer, new_layer_id
+from .layer_meta import write_layer_meta
+from .layers import create_clone_layer, layer_path, new_layer_id
 from .paths import layers_root
 
 PublishFn = Callable[[dict[str, Any]], Awaitable[None]]
@@ -274,6 +276,85 @@ def _clone_subprocess_env() -> dict[str, str]:
     return e
 
 
+def _git_core_ssh_command_args(
+    resolved_identity_path: str,
+    *,
+    user_known_hosts_file_dev_null: bool = False,
+) -> list[str]:
+    """返回 ``['-c', 'core.sshCommand=…']``，与 ``git clone -c core.sshCommand=…`` 用法一致。
+
+    ``resolved_identity_path`` 应为已解析的绝对路径；``-i`` 值经 ``shlex.quote`` 转义。
+    """
+    qi = shlex.quote(resolved_identity_path)
+    inner = f"ssh -i {qi} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    if user_known_hosts_file_dev_null:
+        inner += " -o UserKnownHostsFile=/dev/null"
+    return ["-c", f"core.sshCommand={inner}"]
+
+
+def _validate_ssh_identity_file(raw: str | None) -> str | None:
+    """解析克隆用 SSH 私钥路径（须为本机可读常规文件）。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or "\n" in s or "\0" in s or len(s) > 4096:
+        raise ValueError("invalid ssh_identity_file")
+    p = Path(s).expanduser()
+    try:
+        p = p.resolve()
+    except OSError as e:
+        raise ValueError(f"ssh_identity_file not resolvable: {e}") from e
+    if not p.is_file():
+        raise ValueError(f"ssh_identity_file not found: {p}")
+    return str(p)
+
+
+def _write_ephemeral_ssh_keyfile(private_key: str) -> str:
+    """将临时 SSH 私钥写入临时文件，返回路径；调用方负责删除。"""
+    fd, path = tempfile.mkstemp(prefix="git_clone_ssh_", suffix=".key", text=True)
+    try:
+        key_content = private_key.strip()
+        if not key_content.endswith("\n"):
+            key_content += "\n"
+        os.write(fd, key_content.encode("utf-8"))
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return path
+
+
+def _git_clone_remote_for_ssh_pem(canonical_url: str) -> str:
+    """当使用 SSH 私钥克隆时，将常见 ``https://`` 远程转为 ``git@host:path.git``。
+
+    ``git -c core.sshCommand=…`` 仅对基于 SSH 的传输生效；若仍用 ``https://`` 克隆 GitHub/GitLab 等，
+    私有仓库会触发 ``could not read Username for 'https://github.com'``。
+    """
+    from urllib.parse import urlsplit
+
+    u = (canonical_url or "").strip()
+    if not u:
+        return u
+    low = u.lower()
+    if low.startswith("git@") or low.startswith("ssh://"):
+        return u
+    if not low.startswith("https://"):
+        return u
+    parts = urlsplit(u)
+    host = (parts.hostname or "").lower()
+    if host == "www.github.com":
+        host = "github.com"
+    path = (parts.path or "").strip().rstrip("/")
+    if not host or not path:
+        return u
+    path_body = path.lstrip("/")
+    if not path_body or ".." in path_body:
+        return u
+    if not path_body.endswith(".git"):
+        path_body = f"{path_body}.git"
+    return f"git@{host}:{path_body}"
+
+
 def _make_ipv4_curl_config_file() -> Path | None:
     """返回含 ``ipv4`` 的 curl 配置文件路径，供 ``git -c http.curlConfig=…`` 使用；调用方负责删除。"""
     flag = os.environ.get("GIT_HTTP_IPV4", "").strip().lower()
@@ -309,6 +390,21 @@ def _validate_url(url: str) -> str:
     raise ValueError("unsupported url; use https, http, git, ssh, or git@host:path")
 
 
+def _convert_http_to_git_url(url: str) -> str:
+    """将 HTTP/HTTPS URL 转换为 Git 协议 URL。
+
+    例如：
+    - https://github.com/user/repo.git -> git://github.com/user/repo.git
+    - http://github.com/user/repo.git -> git://github.com/user/repo.git
+    """
+    u = url.strip()
+    if u.startswith("https://"):
+        return "git://" + u[8:]
+    if u.startswith("http://"):
+        return "git://" + u[7:]
+    return u
+
+
 def _validate_branch(branch: str | None) -> str | None:
     if branch is None:
         return None
@@ -337,12 +433,21 @@ async def clone_into_new_layer(
     depth: int | None = None,
     timeout_sec: int | None = None,
     publish: PublishFn | None = None,
+    ssh_identity_file: str | None = None,
+    ephemeral_ssh_private_key: str | None = None,
+    parent_layer_id: str | None = None,
 ) -> tuple[str, Path, str, int]:
     """Create a new layer and run ``git clone`` into it.
 
     If ``publish`` is set, appends to an in-memory log and emits lightweight
     ``{"type": "repo_clone_delta", "layer_id", "title"}`` for UI polling.
     Also emits lightweight ``repo_clone_started`` / ``repo_clone_retry`` / ``repo_clone_delta`` when applicable.
+
+    If ``parent_layer_id`` is set, the clone layer will be created as a child of the specified parent layer.
+
+    If ``ephemeral_ssh_private_key`` is provided, it will be written to a temporary file
+    and used for SSH authentication. The file will be deleted after the clone completes.
+    If the URL is HTTPS and a private key is provided, the URL will be converted to SSH format.
 
     Returns ``(layer_id, resolved_layer_path, combined_output, exit_code)``.
     On non-zero exit, the layer directory is removed if it exists under ``layers_root``.
@@ -353,8 +458,18 @@ async def clone_into_new_layer(
     u = _validate_url(url)
     br = _validate_branch(branch)
     dep = _validate_depth(depth)
+    ssh_path = _validate_ssh_identity_file(ssh_identity_file)
     tout = timeout_sec if timeout_sec is not None else _DEFAULT_TIMEOUT
     max_attempts = _max_clone_attempts()
+
+    ephemeral_key_path: str | None = None
+    pk = str(ephemeral_ssh_private_key or "").strip()
+    if pk and not ssh_path:
+        ephemeral_key_path = await asyncio.to_thread(_write_ephemeral_ssh_keyfile, pk)
+        ssh_path = ephemeral_key_path
+        if u.lower().startswith("https://"):
+            u = _git_clone_remote_for_ssh_pem(u)
+    u = _convert_http_to_git_url(u)
 
     root = layers_root().resolve()
     cfg = _git_config_prefix()
@@ -376,6 +491,8 @@ async def clone_into_new_layer(
             cmd: list[str] = list(cfg)
             if ipv4_curl_cfg is not None:
                 cmd.extend(["-c", f"http.curlConfig={ipv4_curl_cfg}"])
+            if ssh_path:
+                cmd.extend(_git_core_ssh_command_args(ssh_path))
             cmd.extend(["clone", "--progress"])
             if dep is not None:
                 cmd.extend(["--depth", str(dep)])
@@ -527,6 +644,10 @@ async def clone_into_new_layer(
                         layer_id,
                         f"\n[校验] 拉取验证通过 HEAD={head_sha[:12]}\n",
                     )
+                if parent_layer_id:
+                    parent_lp = layer_path(parent_layer_id)
+                    if parent_lp.is_dir():
+                        write_layer_meta(layer_id, kind="clone", parent_layer_id=parent_layer_id)
                 return layer_id, lp, out, code
 
             _safe_rmtree_if_under(lp, root)
@@ -546,6 +667,9 @@ async def clone_into_new_layer(
             if ipv4_curl_cfg is not None:
                 with contextlib.suppress(OSError):
                     ipv4_curl_cfg.unlink(missing_ok=True)
+            if ephemeral_key_path:
+                with contextlib.suppress(OSError):
+                    Path(ephemeral_key_path).unlink(missing_ok=True)
 
     raise RuntimeError("clone_into_new_layer: retry loop exited without return")
 

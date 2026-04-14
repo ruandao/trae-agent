@@ -86,9 +86,13 @@ async def push_layer_graph_snapshot_if_changed(
         log.warning("layer-graph-push 上报 SaaS 失败: %s", e)
 
 
-async def run_layer_graph_saas_push_loop(build_snapshot: Any) -> None:
+async def run_layer_graph_saas_push_loop(
+    build_snapshot: Any,
+    last_sent: list | None = None,
+) -> None:
     """后台任务：默认每 4s 尝试推送一次（内容变化才 POST）。"""
-    last_sent: list = []
+    if last_sent is None:
+        last_sent = []
     interval = 4.0
     raw = (os.environ.get("LAYER_GRAPH_SAAS_PUSH_INTERVAL_SEC") or "").strip()
     if raw:

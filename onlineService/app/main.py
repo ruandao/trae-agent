@@ -7,6 +7,7 @@ import json
 import logging
 import logging.handlers
 import os
+import shutil
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -20,7 +21,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.staticfiles import StaticFiles
 
-from . import task_api_bootstrap
+from . import git_clone, task_api_bootstrap
 from .auth import AuthDep
 from .git_clone import (
     clear_clone_layer_log,
@@ -44,10 +45,8 @@ from .layer_git import (
     diff_layer_one_path_vs_parent,
     diff_layer_worktree_vs_parent,
     get_runtime_git_identity,
-    git_ahead_at_path,
     git_ahead_of_upstream,
     git_worktree_dirty,
-    latest_commit_log,
     list_layer_changes_vs_parent,
     push_layer_worktree,
     set_runtime_git_identity,
@@ -55,7 +54,11 @@ from .layer_git import (
 from .layer_git import (
     list_branches as list_layer_git_branches,
 )
-from .layer_graph_saas_push import run_layer_graph_saas_push_loop
+from .layer_graph_saas_push import (
+    push_layer_graph_snapshot_if_changed,
+    run_layer_graph_saas_push_loop,
+)
+from .layers import create_empty_layer, new_layer_id
 from .online_project_view import get_online_project_active_info, set_online_project_tip
 from .paths import (
     config_file_path,
@@ -63,17 +66,26 @@ from .paths import (
     job_events_file,
     layers_root,
     logs_dir,
-    repo_root,
     service_root,
 )
+from .request_trace import TRACE_ID_HEADER, trace_id_for_incoming_request, trace_id_var
 
 log = logging.getLogger(__name__)
 
-# 在文件末尾赋值为 build_layer_graph_snapshot_for_saas，供 lifespan 启动层级推送循环
 _layer_graph_snapshot_builder = None
+_layer_graph_push_last_sent: list = []
+_startup_empty_layer_id: str | None = None
 
-# GET /api/layers 快照会为多个 job 并发读磁盘；限制并发以免占满默认线程池、拖住其它 API
-_JOB_STEPS_DISK_SEM = asyncio.Semaphore(12)
+
+def _trigger_layer_graph_push_now() -> None:
+    if _layer_graph_snapshot_builder is None:
+        return
+    asyncio.create_task(
+        push_layer_graph_snapshot_if_changed(
+            build_snapshot=_layer_graph_snapshot_builder,
+            last_sent=_layer_graph_push_last_sent,
+        )
+    )
 
 
 def _strict_bootstrap_enabled() -> bool:
@@ -84,6 +96,7 @@ def _strict_bootstrap_enabled() -> bool:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    global _startup_empty_layer_id
     try:
         await asyncio.to_thread(task_api_bootstrap.bootstrap_container_config)
     except Exception:
@@ -93,6 +106,15 @@ async def _lifespan(_app: FastAPI):
             "startup bootstrap failed; continue without refreshed token/config "
             "(set TASK_API_BOOTSTRAP_STRICT_STARTUP=1 to fail-fast)"
         )
+
+    empty_layer_id = new_layer_id()
+    try:
+        await asyncio.to_thread(create_empty_layer, empty_layer_id)
+        _startup_empty_layer_id = empty_layer_id
+        log.info("startup: 创建空层级节点 layer_id=%s", empty_layer_id)
+    except Exception:
+        log.exception("startup: 创建空层级节点失败")
+
     bs_lid = task_api_bootstrap.bootstrap_clone_layer_id
     if bs_lid:
         try:
@@ -110,7 +132,9 @@ async def _lifespan(_app: FastAPI):
     _layer_changes_task: asyncio.Task | None = None
     if _layer_graph_snapshot_builder is not None:
         _layer_graph_task = asyncio.create_task(
-            run_layer_graph_saas_push_loop(_layer_graph_snapshot_builder)
+            run_layer_graph_saas_push_loop(
+                _layer_graph_snapshot_builder, _layer_graph_push_last_sent
+            )
         )
         _layer_changes_task = asyncio.create_task(
             run_layer_changes_saas_push_loop(_layer_graph_snapshot_builder)
@@ -199,7 +223,23 @@ class _RequestAccessLogMiddleware(BaseHTTPMiddleware):
 
 
 _ensure_request_access_file_handler()
+
+
+class _TraceIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        tid = trace_id_for_incoming_request(request)
+        tok = trace_id_var.set(tid)
+        try:
+            response = await call_next(request)
+            response.headers[TRACE_ID_HEADER] = tid
+            return response
+        finally:
+            trace_id_var.reset(tok)
+
+
+# 后注册者在外层；TraceId 须先于访问日志执行，故先加访问日志、再加 TraceId。
 app.add_middleware(_RequestAccessLogMiddleware)
+app.add_middleware(_TraceIdMiddleware)
 
 
 def _job_to_api_dict(rec: JobRecord) -> dict[str, Any]:
@@ -317,6 +357,29 @@ class CloneRepoBody(BaseModel):
     url: str = Field(..., min_length=1, max_length=4096)
     branch: str | None = None
     depth: int | None = Field(default=None, ge=1, le=10_000)
+    ssh_identity_file: str | None = Field(
+        default=None,
+        max_length=4096,
+        description="可选：本机 SSH 私钥路径；克隆 ``git@`` / ``ssh://`` 时通过 "
+        "``git -c core.sshCommand='ssh -i <path> …'`` 指定密钥（路径解析为绝对路径后传入）。",
+    )
+    ephemeral_ssh_private_key: str | None = Field(
+        default=None,
+        max_length=65536,
+        description="可选：单次请求临时 SSH 私钥（PEM）；仅写入临时文件并在克隆结束后删除。"
+        "用于 ``git@`` / ``ssh://`` 克隆；若 URL 为 HTTPS 且提供私钥，服务端会改用 SSH 形式远程。",
+    )
+    parent_layer_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选：父层 layer_id，用于将克隆层挂载到指定父层下。",
+    )
+
+
+class RepoRecloneBody(BaseModel):
+    """重新克隆仓库：删除容器内旧克隆目录并重新克隆。"""
+
+    repo_url: str = Field(..., min_length=1, max_length=4096)
 
 
 class ProjectViewBody(BaseModel):
@@ -346,10 +409,12 @@ class LayerGitPushBody(BaseModel):
     """在工作区内执行 ``git push``；可指定推送目标分支。"""
 
     target_branch: str | None = Field(default=None, max_length=256)
-    github_auth: list[dict[str, str]] | None = Field(
+    ephemeral_ssh_private_key: str | None = Field(
         default=None,
-        description="可选：按 owner/repo 下发 GitHub OAuth token（仅用于无交互 push）。",
+        max_length=65536,
+        description="单次请求临时 SSH 私钥（PEM）；仅写入临时文件并在 push 结束后删除。",
     )
+    ephemeral_git_remote_username: str | None = Field(default=None, max_length=255)
 
 
 class GitIdentityBody(BaseModel):
@@ -364,6 +429,51 @@ def _command_for_layer_id(layer_id: str) -> str | None:
         if j.layer_id == layer_id:
             return j.command
     return None
+
+
+def _http_detail_for_exec_log(detail: Any) -> str:
+    if detail is None:
+        return ""
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, ensure_ascii=False)
+    except TypeError:
+        return str(detail)
+
+
+async def _notify_layer_git_exec_log(
+    layer_id: str,
+    op: Literal["commit", "push"],
+    *,
+    result: dict[str, Any] | None = None,
+    http_exc: HTTPException | None = None,
+) -> None:
+    """Git 提交/推送结果同步到任务云执行日志（与容器克隆进度同一上报通道）。"""
+    parts: list[str] = []
+    if http_exc is not None:
+        d = _http_detail_for_exec_log(http_exc.detail).strip()
+        if len(d) > 3200:
+            d = d[:3200] + "…"
+        parts.append(f"可写层 {layer_id}：Git {op} 失败")
+        if d:
+            parts.append(d)
+    elif result is not None:
+        st = str(result.get("status") or "").strip() or "?"
+        summary = str(result.get("summary") or "").strip()
+        head = f"可写层 {layer_id}：Git {op} 完成（{st}）"
+        if summary:
+            head += f" — {summary}"
+        parts.append(head)
+        out = str(result.get("output") or "").strip()
+        if out:
+            if len(out) > 2400:
+                out = out[:2400] + "…"
+            parts.append(out)
+    msg = "\n".join(parts).strip()
+    if not msg:
+        return
+    await task_api_bootstrap.notify_container_execution_log(msg)
 
 
 def _valid_layer_id_param(layer_id: str) -> str:
@@ -392,16 +502,6 @@ async def skill_markdown() -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="skill.md missing")
     return FileResponse(path, media_type="text/markdown; charset=utf-8")
-
-
-@app.get("/api/dev/service-repo-git-push", include_in_schema=False)
-async def service_repo_git_push(_: AuthDep) -> dict[str, Any]:
-    """``REPO_ROOT`` 宿主仓库相对上游分支未 push 的提交数（供 Web 控制台展示）。"""
-
-    def _run() -> dict[str, Any]:
-        return git_ahead_at_path(repo_root())
-
-    return await asyncio.to_thread(_run)
 
 
 @app.get("/ui/{access_token}", include_in_schema=False)
@@ -468,6 +568,9 @@ async def clone_repo(_: AuthDep, body: CloneRepoBody) -> dict[str, Any]:
             branch=body.branch,
             depth=body.depth,
             publish=_publish,
+            ssh_identity_file=body.ssh_identity_file,
+            ephemeral_ssh_private_key=body.ephemeral_ssh_private_key,
+            parent_layer_id=body.parent_layer_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -546,6 +649,174 @@ async def api_bootstrap_clone_log(_: AuthDep) -> dict[str, Any]:
     return {"layer_id": lid, "text": text}
 
 
+@app.post("/api/repos/reclone")
+async def repo_reclone(_: AuthDep, body: RepoRecloneBody) -> dict[str, Any]:
+    """重新克隆仓库：删除容器内旧克隆目录并重新克隆。
+
+    用于处理克隆一半失败的情况。在 bootstrap_clone_layer_id 对应的层中找到对应仓库目录，
+    删除后重新克隆。
+    """
+    from .layers import layer_path
+    from .task_api_bootstrap import (
+        _bootstrap_git_clone_timeout_sec,
+        _clone_subprocess_env,
+        _git_config_prefix,
+        _make_ipv4_curl_config_file,
+        _max_clone_attempts,
+        _repo_dir_name_from_url,
+        _sleep_before_retry,
+        bootstrap_clone_layer_id,
+    )
+
+    lid = bootstrap_clone_layer_id
+    if not lid:
+        raise HTTPException(
+            status_code=400,
+            detail="容器启动引导克隆层不存在，无法重新克隆",
+        )
+
+    layer_root = layer_path(lid)
+    if not layer_root.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"克隆层目录不存在: {lid}",
+        )
+
+    repo_url = body.repo_url.strip()
+    repo_dir_name = _repo_dir_name_from_url(repo_url)
+    repo_dir = layer_root / repo_dir_name
+
+    if not repo_dir.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"仓库目录不存在: {repo_dir_name}",
+        )
+
+    log.info("reclone: 删除旧克隆目录 %s 并重新克隆 %s", repo_dir.name, repo_url[:200])
+
+    shutil.rmtree(repo_dir, ignore_errors=True)
+
+    tout = _bootstrap_git_clone_timeout_sec()
+    max_attempts = _max_clone_attempts()
+    git_env = _clone_subprocess_env()
+
+    for attempt in range(max_attempts):
+        ipv4_curl_cfg = None
+        try:
+            ipv4_curl_cfg = _make_ipv4_curl_config_file()
+            cmd = list(_git_config_prefix())
+            if ipv4_curl_cfg is not None:
+                cmd.extend(["-c", f"http.curlConfig={ipv4_curl_cfg}"])
+            cmd.extend(["clone", "--progress", repo_url, str(repo_dir)])
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=git_env,
+            )
+            assert proc.stdout is not None
+            out_parts: list[str] = []
+            while True:
+                chunk = await proc.stdout.read(8192)
+                if not chunk:
+                    break
+                out_parts.append(chunk.decode(errors="replace"))
+
+            code = await proc.wait()
+            out = "".join(out_parts)
+
+            if code == 0:
+                try:
+                    head_sha = await asyncio.to_thread(
+                        git_clone.verify_git_clone_workspace,
+                        repo_dir,
+                        env=git_env,
+                    )
+                except RuntimeError as ver_e:
+                    out = out + f"\n[clone-verify] {ver_e}\n"
+                    if attempt < max_attempts - 1:
+                        log.warning(
+                            "reclone 校验失败将重试 (%d/%d): %s",
+                            attempt + 1,
+                            max_attempts,
+                            ver_e,
+                        )
+                        shutil.rmtree(repo_dir, ignore_errors=True)
+                        await _sleep_before_retry(attempt)
+                        continue
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": "克隆后校验失败",
+                            "repo_url": repo_url,
+                            "repo_dir": repo_dir_name,
+                            "error": str(ver_e),
+                            "output": out[-2000:] if len(out) > 2000 else out,
+                        },
+                    ) from ver_e
+                log.info(
+                    "reclone 完成: %s HEAD=%s", repo_dir.name, head_sha[:12] if head_sha else "?"
+                )
+                return {
+                    "status": "ok",
+                    "repo_url": repo_url,
+                    "repo_dir": repo_dir_name,
+                    "head_sha": head_sha,
+                    "output": out[-2000:] if len(out) > 2000 else out,
+                }
+
+            if attempt < max_attempts - 1 and git_clone._looks_like_transient_fetch_error(out):
+                log.warning(
+                    "reclone 网络错误将重试 (%d/%d): %s",
+                    attempt + 1,
+                    max_attempts,
+                    repo_url[:256],
+                )
+                shutil.rmtree(repo_dir, ignore_errors=True)
+                await _sleep_before_retry(attempt)
+                continue
+
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "git clone 失败",
+                    "repo_url": repo_url,
+                    "repo_dir": repo_dir_name,
+                    "exit_code": code,
+                    "output": out[-2000:] if len(out) > 2000 else out,
+                },
+            )
+        except TimeoutError:
+            out = "".join(out_parts) if out_parts else ""
+            if attempt < max_attempts - 1:
+                log.warning(
+                    "reclone 超时将重试 (%d/%d): %s",
+                    attempt + 1,
+                    max_attempts,
+                    repo_url[:256],
+                )
+                shutil.rmtree(repo_dir, ignore_errors=True)
+                await _sleep_before_retry(attempt)
+                continue
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "git clone 超时",
+                    "repo_url": repo_url,
+                    "repo_dir": repo_dir_name,
+                    "timeout_sec": tout,
+                    "output": out[-2000:] if len(out) > 2000 else out,
+                },
+            ) from None
+        finally:
+            if ipv4_curl_cfg is not None:
+                with suppress(OSError):
+                    ipv4_curl_cfg.unlink(missing_ok=True)
+
+    raise RuntimeError("repo_reclone: retry loop exited without return")
+
+
 @app.post("/api/jobs")
 async def create_job(_: AuthDep, body: JobCreateBody) -> dict[str, Any]:
     try:
@@ -578,8 +849,17 @@ async def get_job(_: AuthDep, job_id: str) -> dict[str, Any]:
     return _job_to_api_dict(rec)
 
 
-def _read_job_events_payload(job_id: str, offset: int, limit: int) -> dict[str, Any]:
-    """同步读磁盘；须由 asyncio.to_thread 调用以免阻塞事件循环。"""
+@app.get("/api/jobs/{job_id}/events")
+async def get_job_events(
+    _: AuthDep,
+    job_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """按行偏移读取任务结构化 JSONL 事件。"""
+    rec = store.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
     p = job_events_file(job_id)
     d = job_events_dir() / str(job_id)
     events: list[dict[str, Any]] = []
@@ -595,6 +875,7 @@ def _read_job_events_payload(job_id: str, offset: int, limit: int) -> dict[str, 
             except (OSError, json.JSONDecodeError):
                 continue
     elif p.is_file():
+        # 兼容旧版 JSONL
         try:
             lines = p.read_text(encoding="utf-8").splitlines()
         except OSError as e:
@@ -621,20 +902,6 @@ def _read_job_events_payload(job_id: str, offset: int, limit: int) -> dict[str, 
     }
 
 
-@app.get("/api/jobs/{job_id}/events")
-async def get_job_events(
-    _: AuthDep,
-    job_id: str,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=200, ge=1, le=2000),
-) -> dict[str, Any]:
-    """按行偏移读取任务结构化 JSONL 事件。"""
-    rec = store.get(job_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return await asyncio.to_thread(_read_job_events_payload, job_id, offset, limit)
-
-
 @app.get("/api/jobs/{job_id}/steps")
 async def job_agent_steps(_: AuthDep, job_id: str) -> dict[str, Any]:
     """优先从该 job 的 ``.trae_agent_json/{job_id}`` 读取步骤；否则回退到层目录最新 ``.trajectories``。"""
@@ -642,7 +909,7 @@ async def job_agent_steps(_: AuthDep, job_id: str) -> dict[str, Any]:
     if not rec:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        payload = await asyncio.to_thread(load_agent_steps_for_job, rec.layer_path, job_id)
+        payload = load_agent_steps_for_job(rec.layer_path, job_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"job_id": job_id, "layer_id": rec.layer_id, **payload}
@@ -763,11 +1030,18 @@ async def api_layer_git_commit(
     body: LayerGitCommitBody,
 ) -> dict[str, Any]:
     """将当前可写层工作区全部暂存并提交到本地仓库（不 push）。"""
-    return await commit_layer_worktree(
-        layer_id,
-        body.message,
-        command_hint=_command_for_layer_id(layer_id),
-    )
+    try:
+        result = await commit_layer_worktree(
+            layer_id,
+            body.message,
+            command_hint=_command_for_layer_id(layer_id),
+        )
+    except HTTPException as e:
+        await _notify_layer_git_exec_log(layer_id, "commit", http_exc=e)
+        raise
+    await _notify_layer_git_exec_log(layer_id, "commit", result=result)
+    _trigger_layer_graph_push_now()
+    return result
 
 
 @app.post("/api/layers/{layer_id}/git/push")
@@ -778,22 +1052,27 @@ async def api_layer_git_push(
 ) -> dict[str, Any]:
     """将当前分支推送到已配置的上游远程。"""
     target_branch = None
-    github_auth: list[dict[str, str]] | None = None
+    ephemeral_ssh_private_key = None
+    ephemeral_git_remote_username = None
     if body is not None and body.target_branch is not None:
         target_branch = body.target_branch.strip() or None
-    if body is not None and isinstance(body.github_auth, list):
-        github_auth = body.github_auth
-    return await push_layer_worktree(
-        layer_id,
-        target_branch=target_branch,
-        github_auth=github_auth,
-    )
-
-
-@app.get("/api/layers/{layer_id}/git/commit/latest-log")
-async def api_layer_git_latest_commit_log(_: AuthDep, layer_id: str) -> dict[str, Any]:
-    """返回该层最近一次提交日志（每仓库 ``git log -1 --stat``）。"""
-    return await latest_commit_log(layer_id)
+    if body is not None:
+        ephemeral_ssh_private_key = body.ephemeral_ssh_private_key
+        if body.ephemeral_git_remote_username is not None:
+            ephemeral_git_remote_username = body.ephemeral_git_remote_username.strip() or None
+    try:
+        result = await push_layer_worktree(
+            layer_id,
+            target_branch=target_branch,
+            ephemeral_ssh_private_key=ephemeral_ssh_private_key,
+            ephemeral_git_remote_username=ephemeral_git_remote_username,
+        )
+    except HTTPException as e:
+        await _notify_layer_git_exec_log(layer_id, "push", http_exc=e)
+        raise
+    await _notify_layer_git_exec_log(layer_id, "push", result=result)
+    _trigger_layer_graph_push_now()
+    return result
 
 
 @app.get("/api/git/identity")
@@ -849,11 +1128,9 @@ async def api_layer_diff_parent_file(
 @app.get("/api/layers/{layer_id}/diff/parent")
 async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
     """当前可写层工作区目录与已解析父层目录的差异（``diff -ruN -x .git``）。"""
-    layers, jobs = await asyncio.gather(
-        asyncio.to_thread(list_layers),
-        asyncio.to_thread(store.list_jobs),
-    )
+    layers = list_layers()
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
+    jobs = store.list_jobs()
     parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
     if not parent:
         return {
@@ -870,8 +1147,7 @@ async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
 @app.get("/api/requirements/task-gate")
 async def api_task_gate(_: AuthDep) -> dict[str, Any]:
     """新建任务前是否已满足「至少成功克隆过一次」（存在含 ``.git`` 的可写层）。"""
-    ok = await asyncio.to_thread(any_layer_has_git_repo)
-    return {"clone_done": ok}
+    return {"clone_done": any_layer_has_git_repo()}
 
 
 @app.post("/api/project/view")
@@ -891,6 +1167,12 @@ async def api_set_project_view(_: AuthDep, body: ProjectViewBody) -> dict[str, A
 async def api_project_active(_: AuthDep) -> dict[str, Any]:
     """当前 ``onlineProject`` 指向的 tip 层（符号链接解析）。"""
     return await asyncio.to_thread(get_online_project_active_info)
+
+
+@app.get("/api/layers/empty-root")
+async def api_get_empty_root_layer(_: AuthDep) -> dict[str, Any]:
+    """获取服务启动时创建的空层级节点 ID，用于作为克隆仓库的父层。"""
+    return {"layer_id": _startup_empty_layer_id}
 
 
 def _layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
@@ -996,32 +1278,20 @@ async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
         if prev_rank is None or cur_rank >= prev_rank:
             latest_job_rank[lid] = cur_rank
             latest_job_by_layer[lid] = rec
-
-    async def _steps_payload_for_snapshot(rec: JobRecord) -> tuple[str, dict[str, Any] | None]:
-        async with _JOB_STEPS_DISK_SEM:
-            try:
-                return rec.id, await asyncio.to_thread(
-                    load_agent_steps_for_job, rec.layer_path, rec.id
-                )
-            except ValueError:
-                return rec.id, None
-
-    if latest_job_by_layer:
-        step_rows = await asyncio.gather(
-            *[_steps_payload_for_snapshot(rec) for rec in latest_job_by_layer.values()]
-        )
-        for jid, payload in step_rows:
-            if payload is None:
-                continue
-            models, total_tokens = _summarize_job_steps_usage(payload)
-            row = jobs_api_by_id.get(jid)
-            if not row:
-                continue
-            if models:
-                row["llm_models"] = models
-                row["llm_model"] = models[0]
-            if total_tokens is not None:
-                row["llm_total_tokens"] = total_tokens
+    for rec in latest_job_by_layer.values():
+        try:
+            payload = load_agent_steps_for_job(rec.layer_path, rec.id)
+        except ValueError:
+            continue
+        models, total_tokens = _summarize_job_steps_usage(payload)
+        row = jobs_api_by_id.get(rec.id)
+        if not row:
+            continue
+        if models:
+            row["llm_models"] = models
+            row["llm_model"] = models[0]
+        if total_tokens is not None:
+            row["llm_total_tokens"] = total_tokens
     return {
         "layers": layers,
         "jobs": jobs_api,
@@ -1069,7 +1339,7 @@ async def api_list_layer_files(
     ),
     max_files: int = Query(default=2000, ge=1, le=5000),
 ) -> dict[str, Any]:
-    return await asyncio.to_thread(list_layer_files, layer_id, prefix, max_files)
+    return list_layer_files(layer_id=layer_id, prefix=prefix, max_files=max_files)
 
 
 @app.get("/api/layers/{layer_id}/files/{file_rel_posix:path}")
@@ -1080,10 +1350,9 @@ async def api_read_layer_file(
     max_bytes: int | None = Query(default=None, ge=1, le=50_000_000),
     max_text_chars: int | None = Query(default=None, ge=1, le=5_000_000),
 ) -> dict[str, Any]:
-    return await asyncio.to_thread(
-        read_layer_file,
-        layer_id,
-        file_rel_posix,
+    return read_layer_file(
+        layer_id=layer_id,
+        file_rel_posix=file_rel_posix,
         max_bytes=max_bytes,
         max_text_chars=max_text_chars,
     )
@@ -1100,8 +1369,7 @@ async def api_list_layer_children(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=2000),
 ) -> dict[str, Any]:
-    return await asyncio.to_thread(
-        list_layer_children,
+    return list_layer_children(
         layer_id=layer_id,
         dir_rel_posix=dir,
         prefix=prefix,

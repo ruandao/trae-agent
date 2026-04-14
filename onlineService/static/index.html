@@ -387,7 +387,12 @@
       <div class="row">
         <div>
           <label for="cloneUrl">仓库 URL</label>
-          <input type="text" id="cloneUrl" placeholder="https://github.com/org/repo.git 或 git@github.com:org/repo.git" />
+          <input
+            type="text"
+            id="cloneUrl"
+            data-testid="clone-url"
+            placeholder="https://github.com/org/repo.git 或 git@github.com:org/repo.git"
+          />
         </div>
         <div>
           <label for="cloneBranch">分支（可选）</label>
@@ -398,8 +403,34 @@
           <input type="number" id="cloneDepth" placeholder="例如 1" min="1" max="10000" />
         </div>
       </div>
+      <div class="row" style="margin-top: 0.35rem">
+        <div style="flex: 1; min-width: 280px">
+          <label for="cloneSshKeyPath">SSH 私钥路径（可选，服务器本机）</label>
+          <input
+            type="text"
+            id="cloneSshKeyPath"
+            data-testid="clone-ssh-key-path"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="git@ 克隆时：本机可读私钥路径"
+          />
+        </div>
+      </div>
+      <div class="row" style="margin-top: 0.35rem">
+        <div style="flex: 1; min-width: 280px">
+          <label for="cloneSshPrivateKey">SSH 私钥内容（可选，粘贴 PEM）</label>
+          <textarea
+            id="cloneSshPrivateKey"
+            data-testid="clone-ssh-private-key"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="粘贴 SSH 私钥（PEM 格式），用于 git@ 或私有 HTTPS 仓库克隆"
+            style="min-height: 80px; font-family: ui-monospace, monospace; font-size: 0.75rem;"
+          ></textarea>
+        </div>
+      </div>
       <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.25rem">
-        <button type="button" id="btnClone">克隆到新建层</button>
+        <button type="button" id="btnClone" data-testid="btn-clone">克隆到新建层</button>
         <button type="button" class="secondary" id="btnCopyCloneLog">复制日志</button>
       </div>
       <div class="err-msg" id="cloneErr"></div>
@@ -612,7 +643,7 @@
       }
     }
     const MAX_CLONE_LOG_CHARS = 480000;
-    let lastCloneForm = { url: '', branch: '', depth: '' };
+    let lastCloneForm = { url: '', branch: '', depth: '', ssh_key_path: '' };
     let currentStreamingLayerId = null;
     let clonePersistDebounce = null;
     let cloneFormDraftTimer = null;
@@ -662,17 +693,23 @@
         const u = document.getElementById('cloneUrl');
         const br = document.getElementById('cloneBranch');
         const dep = document.getElementById('cloneDepth');
+        const sk = document.getElementById('cloneSshKeyPath');
+        const skPk = document.getElementById('cloneSshPrivateKey');
         if (!u) return;
         const merged = Object.assign({}, prev || {}, {
           clone_url: u.value,
           branch: br ? br.value : '',
           depth: dep ? dep.value : '',
+          ssh_key_path: sk ? sk.value : '',
+          ssh_private_key: skPk ? skPk.value : '',
         });
         saveClonePersistState(merged);
         lastCloneForm = {
           url: u.value.trim(),
           branch: br ? br.value.trim() : '',
           depth: dep ? dep.value.trim() : '',
+          ssh_key_path: sk ? sk.value.trim() : '',
+          ssh_private_key: skPk ? skPk.value.trim() : '',
         };
       } catch (_) {}
     }
@@ -686,7 +723,7 @@
     }
 
     function wireCloneFormInputPersist() {
-      ['cloneUrl', 'cloneBranch', 'cloneDepth'].forEach((id) => {
+      ['cloneUrl', 'cloneBranch', 'cloneDepth', 'cloneSshKeyPath', 'cloneSshPrivateKey'].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('input', scheduleCloneFormFieldsPersist);
       });
@@ -696,7 +733,7 @@
     function resetCloneSectionUi() {
       stopCloneLogPoll();
       clearClonePersistState();
-      lastCloneForm = { url: '', branch: '', depth: '' };
+      lastCloneForm = { url: '', branch: '', depth: '', ssh_key_path: '', ssh_private_key: '' };
       currentStreamingLayerId = null;
       if (clonePersistDebounce) {
         clearTimeout(clonePersistDebounce);
@@ -708,6 +745,10 @@
       if (br) br.value = '';
       const dep = document.getElementById('cloneDepth');
       if (dep) dep.value = '';
+      const sk = document.getElementById('cloneSshKeyPath');
+      if (sk) sk.value = '';
+      const skPk = document.getElementById('cloneSshPrivateKey');
+      if (skPk) skPk.value = '';
       const out = document.getElementById('cloneOut');
       if (out) out.textContent = '';
       const errEl = document.getElementById('cloneErr');
@@ -725,6 +766,8 @@
         clone_url: lastCloneForm.url || extra.clone_url || '',
         branch: lastCloneForm.branch || '',
         depth: lastCloneForm.depth || '',
+        ssh_key_path: lastCloneForm.ssh_key_path || '',
+        ssh_private_key: lastCloneForm.ssh_private_key || '',
         output,
         status,
         errorMsg: extra.errorMsg || '',
@@ -738,6 +781,8 @@
           url: p.clone_url,
           branch: p.branch != null ? String(p.branch) : '',
           depth: p.depth != null ? String(p.depth) : '',
+          ssh_key_path: p.ssh_key_path != null ? String(p.ssh_key_path) : '',
+          ssh_private_key: p.ssh_private_key != null ? String(p.ssh_private_key) : '',
         };
       }
       const out = document.getElementById('cloneOut');
@@ -748,6 +793,10 @@
       if (br && p.branch != null) br.value = p.branch;
       const dep = document.getElementById('cloneDepth');
       if (dep && p.depth != null && p.depth !== '') dep.value = String(p.depth);
+      const sk = document.getElementById('cloneSshKeyPath');
+      if (sk && p.ssh_key_path != null) sk.value = String(p.ssh_key_path);
+      const skPk = document.getElementById('cloneSshPrivateKey');
+      if (skPk && p.ssh_private_key != null) skPk.value = String(p.ssh_private_key);
       const errEl = document.getElementById('cloneErr');
       if (errEl) {
         if (p.status === 'error' && p.errorMsg) errEl.textContent = p.errorMsg;
@@ -933,6 +982,7 @@
               clone_url: lastCloneForm.url,
               branch: lastCloneForm.branch,
               depth: lastCloneForm.depth,
+              ssh_key_path: lastCloneForm.ssh_key_path,
               output: o ? truncateCloneOutput(o.textContent) : '',
               status: 'running',
             });
@@ -1451,20 +1501,35 @@
       const url = document.getElementById('cloneUrl').value.trim();
       const branchRaw = document.getElementById('cloneBranch').value.trim();
       const depthRaw = document.getElementById('cloneDepth').value.trim();
-      lastCloneForm = { url, branch: branchRaw, depth: depthRaw };
-      const body = { url };
-      if (branchRaw) body.branch = branchRaw;
-      if (depthRaw) {
-        const d = parseInt(depthRaw, 10);
-        if (!isFinite(d) || d < 1) {
-          errEl.textContent = 'depth 须为正整数';
-          return;
-        }
-        body.depth = d;
-      }
+      const sshSk = document.getElementById('cloneSshKeyPath');
+      const sshRaw = sshSk ? sshSk.value.trim() : '';
+      const sshPkEl = document.getElementById('cloneSshPrivateKey');
+      const sshPkRaw = sshPkEl ? sshPkEl.value.trim() : '';
+      lastCloneForm = { url, branch: branchRaw, depth: depthRaw, ssh_key_path: sshRaw, ssh_private_key: sshPkRaw };
       void runAsyncButton(
         btn,
         async () => {
+          let emptyRootId = null;
+          try {
+            const er = await api('/api/layers/empty-root');
+            if (er.ok) {
+              const ed = await er.json();
+              emptyRootId = ed.layer_id;
+            }
+          } catch (_) {}
+          const body = { url };
+          if (branchRaw) body.branch = branchRaw;
+          if (depthRaw) {
+            const d = parseInt(depthRaw, 10);
+            if (!isFinite(d) || d < 1) {
+              errEl.textContent = 'depth 须为正整数';
+              return;
+            }
+            body.depth = d;
+          }
+          if (sshRaw) body.ssh_identity_file = sshRaw;
+          if (sshPkRaw) body.ephemeral_ssh_private_key = sshPkRaw;
+          if (emptyRootId) body.parent_layer_id = emptyRootId;
           const r = await api('/api/repos/clone', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2301,6 +2366,25 @@
       updateLayerRelationToolbar(nid);
     }
 
+    /** E2E / Playwright：选中可写层节点并刷新下方操作栏（提交/推送等）。 */
+    window.__traeE2e_selectLayerNode = function (layerId) {
+      try {
+        const lid = String(layerId || '').trim();
+        if (!lid) return false;
+        const z = window._layerZtree;
+        if (!z) return false;
+        const nid = layerNodeId(lid);
+        const n = z.getNodeByParam('id', nid, null);
+        if (!n) return false;
+        zTreeExpandAncestors(z, n);
+        z.selectNode(n, false);
+        handleLayerGraphNodeSelect(nid);
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    };
+
     /** zTree：按可写层 parent_layer_id 组织；任务挂在对应 layer_id 下（同级正序），不再按 parent_job_id 嵌套。 */
     function buildZTreeNodesFromLayers(layers, jobs, layerById) {
       const ZROOT = 0;
@@ -2758,8 +2842,10 @@
         cta.style.minWidth = '220px';
         cta.style.flex = '1';
         cta.placeholder = 'trae 或 shell 指令';
+        cta.setAttribute('data-testid', 'layer-new-job-command');
         cWrap.appendChild(cta);
         const cKind = document.createElement('select');
+        cKind.setAttribute('data-testid', 'layer-new-job-kind');
         [['trae', 'trae-cli'], ['shell', 'shell']].forEach(([v, t]) => {
           const o = document.createElement('option');
           o.value = v;
@@ -2770,6 +2856,7 @@
         const cBtn = document.createElement('button');
         cBtn.type = 'button';
         cBtn.textContent = '创建并执行';
+        cBtn.setAttribute('data-testid', 'layer-create-and-run');
         cBtn.onclick = debounceClick(() => {
           const cmd = (cta.value || '').trim();
           if (!cmd) {
@@ -2843,6 +2930,7 @@
       const commitBtn = document.createElement('button');
       commitBtn.type = 'button';
       commitBtn.className = 'secondary tree-layer-commit';
+      commitBtn.setAttribute('data-testid', 'layer-git-commit');
       commitBtn.textContent = '提交';
       commitBtn.title = showSubmitted
         ? '当前工作区已干净；点击可再次执行提交检查（无变更时返回 noop）'
@@ -2874,20 +2962,23 @@
             if (j && j.status === 'noop') {
               setLayerCommitExecLog(
                 layer.layer_id,
-                '提交执行完成（noop）\n' + String(j.detail || '工作区无变更，未创建提交'),
+                '提交执行完成（noop）\n' +
+                  String(j.summary || j.detail || '工作区无变更，未创建提交'),
               );
-              alert(j.detail || '工作区无变更，未创建提交');
+              alert(j.summary || j.detail || '工作区无变更，未创建提交');
             } else if (j && j.status === 'ok') {
               setLayerCommitExecLog(
                 layer.layer_id,
                 '提交执行成功\n' +
+                  String(j.summary ? j.summary + '\n' : '') +
                   String(j.output || '') +
                   '\n\n提交说明：\n' +
                   String(j.commit_message || ''),
               );
               const cm = j.commit_message || '';
               const preview = cm.length > 900 ? cm.slice(0, 900) + '\n…（说明过长，完整内容见 git log）' : cm;
-              alert('已提交。\n\n' + preview);
+              const head = (j.summary && String(j.summary).trim()) || '已提交。';
+              alert(head + '\n\n' + preview);
             } else {
               setLayerCommitExecLog(layer.layer_id, '提交执行返回\n' + rawText);
               alert('已完成：' + rawText);
@@ -2904,9 +2995,25 @@
 
       const gr = layer.git_remote;
       if (gr && gr.is_git && !gr.no_upstream) {
+        const pushSshKeyWrap = document.createElement('div');
+        pushSshKeyWrap.style.cssText = 'margin-top:0.35rem;width:100%;';
+        const pushSshKeyLabel = document.createElement('label');
+        pushSshKeyLabel.className = 'meta';
+        pushSshKeyLabel.style.cssText = 'display:block;margin-bottom:0.2rem;';
+        pushSshKeyLabel.textContent = 'SSH 私钥（可选，粘贴 PEM 用于推送）';
+        pushSshKeyWrap.appendChild(pushSshKeyLabel);
+        const pushSshKeyTextarea = document.createElement('textarea');
+        pushSshKeyTextarea.className = 'push-ssh-key-input';
+        pushSshKeyTextarea.setAttribute('data-testid', 'push-ssh-private-key');
+        pushSshKeyTextarea.placeholder = '粘贴 SSH 私钥（PEM 格式），用于 git push';
+        pushSshKeyTextarea.style.cssText = 'min-height:60px;width:100%;font-family:ui-monospace,monospace;font-size:0.72rem;resize:vertical;';
+        pushSshKeyWrap.appendChild(pushSshKeyTextarea);
+        bar.appendChild(pushSshKeyWrap);
+
         const pushBtn = document.createElement('button');
         pushBtn.type = 'button';
         pushBtn.className = 'tree-layer-push';
+        pushBtn.setAttribute('data-testid', 'layer-git-push');
         pushBtn.textContent = '推送';
         const aheadN = typeof gr.ahead === 'number' ? gr.ahead : null;
         pushBtn.title =
@@ -2921,8 +3028,13 @@
           void runAsyncButton(
             pushBtn,
             async () => {
+              const sshPk = pushSshKeyTextarea.value.trim();
+              const body = {};
+              if (sshPk) body.ephemeral_ssh_private_key = sshPk;
               const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/push', {
                 method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
               });
               const rawText = await r.text();
               let j = null;

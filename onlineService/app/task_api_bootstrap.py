@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import yaml
 from .git_clone import (
     _clone_subprocess_env,
     _git_config_prefix,
+    _git_core_ssh_command_args,
     _looks_like_transient_fetch_error,
     _make_ipv4_curl_config_file,
     _max_clone_attempts,
@@ -33,6 +35,7 @@ from .git_clone import (
 )
 from .layers import create_root_layer, new_layer_id
 from .paths import config_file_path, req_logs_dir
+from .request_trace import TRACE_ID_HEADER, get_trace_id_for_outbound_http
 
 log = logging.getLogger(__name__)
 _outbound_req_logger = logging.getLogger("trae_online.outbound_http")
@@ -80,6 +83,35 @@ def _rewrite_host_docker_internal_url(url: str) -> str:
     if out != u:
         log.info("已将 host.docker.internal 替换为宿主机 IP：%s -> %s", u, out)
     return out
+
+
+def _git_clone_remote_for_ssh_pem(canonical_url: str) -> str:
+    """当使用 SSH 私钥引导克隆时，将常见 ``https://`` 远程转为 ``git@host:path.git``。
+
+    ``git -c core.sshCommand=…`` 仅对基于 SSH 的传输生效；若仍用 ``https://`` 克隆 GitHub/GitLab 等，
+    私有仓库会触发 ``could not read Username for 'https://github.com'``。
+    """
+    u = (canonical_url or "").strip()
+    if not u:
+        return u
+    low = u.lower()
+    if low.startswith("git@") or low.startswith("ssh://"):
+        return u
+    if not low.startswith("https://"):
+        return u
+    parts = urlsplit(u)
+    host = (parts.hostname or "").lower()
+    if host == "www.github.com":
+        host = "github.com"
+    path = (parts.path or "").strip().rstrip("/")
+    if not host or not path:
+        return u
+    path_body = path.lstrip("/")
+    if not path_body or ".." in path_body:
+        return u
+    if not path_body.endswith(".git"):
+        path_body = f"{path_body}.git"
+    return f"git@{host}:{path_body}"
 
 
 def _task_api_prefix() -> str | None:
@@ -147,7 +179,7 @@ def _redact_for_log(obj: Any) -> Any:
             return True
         if lk.endswith("_secret"):
             return True
-        return bool(lk.endswith("_token"))
+        return lk.endswith("_token") or "private_key" in lk
 
     if isinstance(obj, dict):
         return {k: ("***" if key_sensitive(k) else _redact_for_log(v)) for k, v in obj.items()}
@@ -247,11 +279,15 @@ def _post_json(
     timeout: float = 5.0,
 ) -> dict:
     data = json.dumps(body).encode("utf-8")
+    hdr = {
+        "Content-Type": "application/json",
+        TRACE_ID_HEADER: get_trace_id_for_outbound_http(),
+    }
     req = Request(
         url,
         data=data,
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers=hdr,
     )
     t0 = time.perf_counter()
     try:
@@ -437,6 +473,27 @@ async def _post_git_clone_progress_saas(
         log.warning("git-clone-progress 上报 SaaS 失败: %s", e)
 
 
+_EXEC_LOG_VIA_CLONE_PROGRESS_MAX = 3500
+
+
+async def notify_container_execution_log(message: str, *, progress: int = 100) -> None:
+    """将文本推送到任务云，经 SSE 进入任务详情执行日志（与 ``git-clone-progress`` 克隆阶段同一通道）。
+
+    未配置 ``TaskApiEndPoint`` / ``ACCESS_TOKEN`` 时静默跳过，不影响本地 API。
+    """
+    try:
+        prefix = _task_api_prefix()
+    except Exception:
+        return
+    token = (os.environ.get("ACCESS_TOKEN") or "").strip()
+    if not prefix or not token:
+        return
+    msg = (message or "").strip()
+    if len(msg) > _EXEC_LOG_VIA_CLONE_PROGRESS_MAX:
+        msg = msg[:_EXEC_LOG_VIA_CLONE_PROGRESS_MAX] + "…"
+    await _post_git_clone_progress_saas(prefix, token, progress, msg)
+
+
 async def _maybe_report_clone_progress(
     *,
     cloud_prefix: str,
@@ -548,11 +605,26 @@ def _repo_dir_name_from_url(url: str) -> str:
     return base
 
 
+def _bootstrap_write_ssh_keyfile(private_key: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="bootstrap_git_ssh_", suffix=".key", text=True)
+    try:
+        key_content = private_key.strip()
+        if not key_content.endswith("\n"):
+            key_content += "\n"
+        os.write(fd, key_content.encode("utf-8"))
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return path
+
+
 async def _clone_repos_into_shared_layer(
     urls: list[str],
     *,
     cloud_prefix: str,
     access_token: str,
+    task_detail: dict[str, Any] | None = None,
 ) -> str:
     """多个仓库克隆到同一个新建层，不同仓库放在该层不同子目录。
 
@@ -578,7 +650,11 @@ async def _clone_repos_into_shared_layer(
         "【容器启动引导】开始克隆任务关联仓库…",
     )
     log.info("bootstrap 创建共享层 layer_id=%s path=%s", layer_id, layer_path)
-    git_env = _clone_subprocess_env()
+    cred_root: dict[str, Any] = {}
+    if isinstance(task_detail, dict):
+        raw_cred = task_detail.get("repo_clone_credentials")
+        if isinstance(raw_cred, dict):
+            cred_root = raw_cred
     for i, raw in enumerate(urls, start=1):
         u = raw.strip()
         if not u:
@@ -603,6 +679,20 @@ async def _clone_repos_into_shared_layer(
             layer_id,
             f"━━ ({i}/{n}) {u}\n→ {repo_dir.name}\n",
         )
+        cred = cred_root.get(u) if isinstance(cred_root.get(u), dict) else None
+        if cred is None:
+            alt = cred_root.get(u.rstrip("/"))
+            cred = alt if isinstance(alt, dict) else None
+        pem = (
+            str(cred.get("ephemeral_ssh_private_key", "")).strip() if isinstance(cred, dict) else ""
+        )
+        clone_remote = _git_clone_remote_for_ssh_pem(u) if pem else u
+        if pem and clone_remote != u:
+            await append_clone_layer_log(
+                layer_id,
+                "[bootstrap-clone] 已配置 SSH 私钥，HTTPS 登记地址将改用 SSH 传输克隆：\n"
+                f"    {clone_remote}\n",
+            )
         max_attempts = _max_clone_attempts()
         for attempt in range(max_attempts):
             if repo_dir.exists():
@@ -610,91 +700,107 @@ async def _clone_repos_into_shared_layer(
             ipv4_curl_cfg = None
             try:
                 ipv4_curl_cfg = _make_ipv4_curl_config_file()
-                cmd = list(_git_config_prefix())
-                if ipv4_curl_cfg is not None:
-                    cmd.extend(["-c", f"http.curlConfig={ipv4_curl_cfg}"])
-                cmd.extend(["clone", "--progress", u, str(repo_dir)])
+                ssh_keyfile: str | None = None
+                if pem:
+                    ssh_keyfile = _bootstrap_write_ssh_keyfile(pem)
+                git_env = _clone_subprocess_env()
                 try:
-                    code = await _run_git_clone_repo_streaming(
-                        cmd=cmd,
-                        env=git_env,
-                        layer_id=layer_id,
-                        timeout_sec=tout,
-                        cloud_prefix=cloud_prefix,
-                        access_token=access_token,
-                        repo_index=i,
-                        repo_total=n,
-                        repo_url=u,
-                    )
-                except TimeoutError:
-                    await append_clone_layer_log(
-                        layer_id,
-                        f"\n[bootstrap-clone 超时] url={u!r} timeout={tout}s "
-                        f"(尝试 {attempt + 1}/{max_attempts})\n",
-                    )
-                    if attempt < max_attempts - 1:
-                        await append_clone_layer_log(
-                            layer_id,
-                            f"[bootstrap-clone] 将重试 ({attempt + 2}/{max_attempts}) …\n",
+                    cmd = list(_git_config_prefix())
+                    if ipv4_curl_cfg is not None:
+                        cmd.extend(["-c", f"http.curlConfig={ipv4_curl_cfg}"])
+                    if ssh_keyfile:
+                        cmd.extend(
+                            _git_core_ssh_command_args(
+                                ssh_keyfile,
+                                user_known_hosts_file_dev_null=True,
+                            )
                         )
-                        await _sleep_before_retry(attempt)
-                        continue
-                    raise RuntimeError(
-                        f"[bootstrap-clone] git clone 超时 url={u} timeout={tout}s"
-                    ) from None
-                if code == 0:
+                    cmd.extend(["clone", "--progress", clone_remote, str(repo_dir)])
                     try:
-                        head_sha = await asyncio.to_thread(
-                            verify_git_clone_workspace,
-                            repo_dir,
+                        code = await _run_git_clone_repo_streaming(
+                            cmd=cmd,
                             env=git_env,
+                            layer_id=layer_id,
+                            timeout_sec=tout,
+                            cloud_prefix=cloud_prefix,
+                            access_token=access_token,
+                            repo_index=i,
+                            repo_total=n,
+                            repo_url=u,
                         )
-                    except RuntimeError as ver_e:
+                    except TimeoutError:
                         await append_clone_layer_log(
                             layer_id,
-                            f"\n[bootstrap-clone 校验失败] {ver_e}\n",
+                            f"\n[bootstrap-clone 超时] url={u!r} timeout={tout}s "
+                            f"(尝试 {attempt + 1}/{max_attempts})\n",
                         )
                         if attempt < max_attempts - 1:
-                            log.warning(
-                                "bootstrap-clone 校验失败将重试 (%d/%d): %s",
-                                attempt + 1,
-                                max_attempts,
-                                ver_e,
+                            await append_clone_layer_log(
+                                layer_id,
+                                f"[bootstrap-clone] 将重试 ({attempt + 2}/{max_attempts}) …\n",
                             )
-                            shutil.rmtree(repo_dir, ignore_errors=True)
                             await _sleep_before_retry(attempt)
                             continue
                         raise RuntimeError(
-                            f"[bootstrap-clone] 克隆后校验失败 url={u} "
-                            f"layer_id={layer_id} dir={repo_dir.name}: {ver_e}"
-                        ) from ver_e
-                    if head_sha:
+                            f"[bootstrap-clone] git clone 超时 url={u} timeout={tout}s"
+                        ) from None
+                    if code == 0:
+                        try:
+                            head_sha = await asyncio.to_thread(
+                                verify_git_clone_workspace,
+                                repo_dir,
+                                env=git_env,
+                            )
+                        except RuntimeError as ver_e:
+                            await append_clone_layer_log(
+                                layer_id,
+                                f"\n[bootstrap-clone 校验失败] {ver_e}\n",
+                            )
+                            if attempt < max_attempts - 1:
+                                log.warning(
+                                    "bootstrap-clone 校验失败将重试 (%d/%d): %s",
+                                    attempt + 1,
+                                    max_attempts,
+                                    ver_e,
+                                )
+                                shutil.rmtree(repo_dir, ignore_errors=True)
+                                await _sleep_before_retry(attempt)
+                                continue
+                            raise RuntimeError(
+                                f"[bootstrap-clone] 克隆后校验失败 url={u} "
+                                f"layer_id={layer_id} dir={repo_dir.name}: {ver_e}"
+                            ) from ver_e
+                        if head_sha:
+                            await append_clone_layer_log(
+                                layer_id,
+                                f"[校验] 拉取验证通过 HEAD={head_sha[:12]}\n",
+                            )
+                        break
+                    full = await get_clone_layer_log_text(layer_id)
+                    if attempt < max_attempts - 1 and _looks_like_transient_fetch_error(full):
                         await append_clone_layer_log(
                             layer_id,
-                            f"[校验] 拉取验证通过 HEAD={head_sha[:12]}\n",
+                            f"\n[bootstrap-clone] 网络/TLS 瞬时错误，"
+                            f"{attempt + 2}/{max_attempts} 次重试 …\n",
                         )
-                    break
-                full = await get_clone_layer_log_text(layer_id)
-                if attempt < max_attempts - 1 and _looks_like_transient_fetch_error(full):
-                    await append_clone_layer_log(
-                        layer_id,
-                        f"\n[bootstrap-clone] 网络/TLS 瞬时错误，"
-                        f"{attempt + 2}/{max_attempts} 次重试 …\n",
+                        log.warning(
+                            "bootstrap-clone 将重试 (%d/%d) url=%s exit=%s",
+                            attempt + 1,
+                            max_attempts,
+                            u[:256],
+                            code,
+                        )
+                        await _sleep_before_retry(attempt)
+                        continue
+                    tail = full[-2000:] if len(full) > 2000 else full
+                    raise RuntimeError(
+                        f"[bootstrap-clone] git clone 失败 exit={code} url={u} "
+                        f"layer_id={layer_id} dir={repo_dir.name} output={tail}"
                     )
-                    log.warning(
-                        "bootstrap-clone 将重试 (%d/%d) url=%s exit=%s",
-                        attempt + 1,
-                        max_attempts,
-                        u[:256],
-                        code,
-                    )
-                    await _sleep_before_retry(attempt)
-                    continue
-                tail = full[-2000:] if len(full) > 2000 else full
-                raise RuntimeError(
-                    f"[bootstrap-clone] git clone 失败 exit={code} url={u} "
-                    f"layer_id={layer_id} dir={repo_dir.name} output={tail}"
-                )
+                finally:
+                    if ssh_keyfile:
+                        with contextlib.suppress(OSError):
+                            os.unlink(ssh_keyfile)
             finally:
                 if ipv4_curl_cfg is not None:
                     with contextlib.suppress(OSError):
@@ -719,6 +825,7 @@ def _clone_projects_via_shared_layer(
     *,
     cloud_prefix: str,
     access_token: str,
+    task_detail: dict[str, Any] | None = None,
 ) -> str | None:
     if not repo_urls:
         log.info("task-detail 中未提供项目地址，跳过克隆")
@@ -728,6 +835,7 @@ def _clone_projects_via_shared_layer(
             repo_urls,
             cloud_prefix=cloud_prefix,
             access_token=access_token,
+            task_detail=task_detail,
         )
     )
 
@@ -792,6 +900,7 @@ def bootstrap_container_config() -> None:
         repo_urls,
         cloud_prefix=prefix,
         access_token=new_access,
+        task_detail=detail if isinstance(detail, dict) else None,
     )
     if bootstrap_clone_layer_id:
         try:

@@ -86,3 +86,28 @@ def test_extract_git_repo_urls_supports_task_parameters_git_repos() -> None:
         "https://github.com/example/repo-a.git",
         "https://github.com/example/repo-b.git",
     ]
+
+
+def test_git_clone_remote_for_ssh_pem_https_github() -> None:
+    from onlineService.app.task_api_bootstrap import _git_clone_remote_for_ssh_pem
+
+    assert (
+        _git_clone_remote_for_ssh_pem("https://github.com/ruandao/goPractice")
+        == "git@github.com:ruandao/goPractice.git"
+    )
+    assert (
+        _git_clone_remote_for_ssh_pem("https://github.com/ruandao/goPractice.git")
+        == "git@github.com:ruandao/goPractice.git"
+    )
+    assert (
+        _git_clone_remote_for_ssh_pem("https://www.github.com/org/repo/")
+        == "git@github.com:org/repo.git"
+    )
+
+
+def test_git_clone_remote_for_ssh_pem_passthrough() -> None:
+    from onlineService.app.task_api_bootstrap import _git_clone_remote_for_ssh_pem
+
+    ssh = "git@github.com:foo/bar.git"
+    assert _git_clone_remote_for_ssh_pem(ssh) == ssh
+    assert _git_clone_remote_for_ssh_pem("http://github.com/foo/bar") == "http://github.com/foo/bar"

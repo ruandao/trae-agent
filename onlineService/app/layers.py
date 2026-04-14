@@ -114,6 +114,16 @@ def create_job_layer(layer_id: str, parent_layer_id: str) -> Path:
     return p.resolve()
 
 
+def create_empty_layer(layer_id: str) -> Path:
+    """创建空层级节点：仅含元数据，无 base/ 或 diff/ 目录，作为后续业务的根节点。"""
+    p = layer_path(layer_id)
+    if p.exists():
+        shutil.rmtree(p)
+    p.mkdir(parents=True, exist_ok=True)
+    write_layer_meta(layer_id, kind="empty", parent_layer_id=None)
+    return p.resolve()
+
+
 def create_stacked_layer(layer_id: str, parent_layer_path: Path) -> Path:
     child = layer_path(layer_id)
     if child.exists():

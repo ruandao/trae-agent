@@ -7,12 +7,12 @@ import contextlib
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote
 
 from fastapi import HTTPException
 
@@ -33,6 +33,7 @@ from .overlay_diff import (
     prune_empty_dirs_under,
 )
 from .paths import runtime_dir
+from .task_api_bootstrap import _git_clone_remote_for_ssh_pem
 
 
 def layer_git_workspace_root(layer_id: str) -> Path:
@@ -95,6 +96,20 @@ def _persist_overlay_layer_diff_after_commit(layer_id: str, workspace_root: Path
 
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
 _SKIP_PARTS = {".git", "__pycache__", ".DS_Store"}
+# os.walk 时跳过进入这些目录名，减轻扫描成本（不在此列的目录仍会向下查找嵌套 .git）
+_SKIP_GIT_DISCOVER_DIRNAMES = _SKIP_PARTS | {
+    "node_modules",
+    ".npm",
+    ".yarn",
+    ".pnpm-store",
+    ".venv",
+    "venv",
+    ".tox",
+    "dist",
+    "build",
+    ".idea",
+    ".cursor",
+}
 log = logging.getLogger(__name__)
 
 _runtime_git_identity: dict[str, str] = {}
@@ -136,24 +151,20 @@ def _dir_has_git_metadata(p: Path) -> bool:
 
 
 def _discover_git_workspace_roots_under(root: Path, *, layer_id: str = "") -> list[Path]:
-    """定位 root 下所有 git 工作区根（层根/base/子目录仓库）。"""
+    """定位 root 下所有 git 工作区根（层根、base、任意深度的子目录中的独立仓库）。"""
     if not root.is_dir():
         return []
 
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-    for base in (root, root / "base"):
-        try:
-            base_res = base.resolve()
-        except OSError:
-            continue
-        if base_res in seen or not base_res.is_dir():
-            continue
-        seen.add(base_res)
-        candidates.append(base_res)
+    max_depth_raw = (os.environ.get("TRAE_LAYER_GIT_DISCOVER_MAX_DEPTH") or "48").strip()
+    try:
+        max_depth = int(max_depth_raw)
+    except ValueError:
+        max_depth = 48
+    if max_depth < 1:
+        max_depth = 48
 
-    repos: list[Path] = []
     repo_seen: set[Path] = set()
+    repos: list[Path] = []
 
     def add_repo(repo: Path) -> None:
         try:
@@ -165,23 +176,38 @@ def _discover_git_workspace_roots_under(root: Path, *, layer_id: str = "") -> li
         repo_seen.add(rr)
         repos.append(rr)
 
-    for base in candidates:
-        if _dir_has_git_metadata(base):
-            add_repo(base)
-
-    for base in candidates:
+    starts: list[Path] = []
+    start_seen: set[Path] = set()
+    for cand in (root, root / "base"):
         try:
-            children = sorted(base.iterdir(), key=lambda p: p.name)
+            cr = cand.resolve()
         except OSError:
             continue
-        for child in children:
+        if not cr.is_dir() or cr in start_seen:
+            continue
+        start_seen.add(cr)
+        starts.append(cr)
+
+    for start in starts:
+        try:
+            anchor_len = len(start.parts)
+        except OSError:
+            continue
+        for dirpath, dirnames, _filenames in os.walk(start, topdown=True):
+            dp = Path(dirpath)
             try:
-                if not child.is_dir() or child.name in _SKIP_PARTS:
-                    continue
-            except OSError:
+                rel_depth = len(dp.parts) - anchor_len
+            except (OSError, ValueError):
+                rel_depth = 0
+            if rel_depth > max_depth:
+                dirnames[:] = []
                 continue
-            if _dir_has_git_metadata(child):
-                add_repo(child)
+            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_GIT_DISCOVER_DIRNAMES)
+            if _dir_has_git_metadata(dp):
+                add_repo(dp)
+
+    # 深层子仓库先于上层提交，便于父仓库随后收录子仓指针等变更
+    repos.sort(key=lambda p: (-len(p.parts), str(p)))
 
     if len(repos) > 1 and layer_id:
         log.info(
@@ -450,9 +476,19 @@ async def commit_layer_worktree(
             else (str(command_hint or "").strip() or traj_task or "完成当前任务目标")
         )
 
+        repos_discovered = [
+            {
+                "repo": _repo_label_for_message(r, base_root),
+                "path": r.as_posix(),
+            }
+            for r in roots
+        ]
+
         results: list[dict[str, Any]] = []
         all_outputs: list[str] = []
+        skipped_clean: list[dict[str, Any]] = []
         for root in roots:
+            repo_label = _repo_label_for_message(root, base_root)
             proc_add = await asyncio.create_subprocess_exec(
                 "git",
                 "add",
@@ -474,6 +510,13 @@ async def commit_layer_worktree(
                 )
             files = [p for p in names_out.split("\0") if p.strip()]
             if not files:
+                skipped_clean.append(
+                    {
+                        "repo": repo_label,
+                        "path": root.as_posix(),
+                        "detail": "工作区干净，无暂存变更",
+                    }
+                )
                 continue
 
             stat_text, code_s = await _git_diff_cached_text(root, env, "--stat")
@@ -485,7 +528,6 @@ async def commit_layer_worktree(
             if code_ss != 0:
                 shortstat = ""
 
-            repo_label = _repo_label_for_message(root, base_root)
             msg = _format_multi_repo_commit_message(
                 overall_goal=overall_goal,
                 repo_label=repo_label,
@@ -533,6 +575,10 @@ async def commit_layer_worktree(
             )
 
         if not results:
+            summary = (
+                f"已在层工作区内扫描 {len(roots)} 个 Git 仓库并完成暂存检查："
+                f"未创建新提交（{len(skipped_clean)} 个仓库无暂存变更）。"
+            )
             return {
                 "layer_id": layer_id,
                 "status": "noop",
@@ -540,6 +586,12 @@ async def commit_layer_worktree(
                 "detail": "所有仓库均无变更，未创建提交",
                 "output": "",
                 "commit_results": [],
+                "repos_discovered": repos_discovered,
+                "repos_discovered_count": len(roots),
+                "committed_count": 0,
+                "skipped_clean_count": len(skipped_clean),
+                "repos_skipped_clean": skipped_clean,
+                "summary": summary,
             }
 
         if is_overlay_v1_layer(layer_id):
@@ -550,12 +602,24 @@ async def commit_layer_worktree(
                     status_code=500, detail=f"persist overlay diff failed: {e}"
                 ) from e
 
+        summary = (
+            f"已在层工作区内扫描 {len(roots)} 个 Git 仓库："
+            f"成功提交 {len(results)} 个"
+            + (f"，另 {len(skipped_clean)} 个无暂存变更未产生提交" if skipped_clean else "")
+            + "。"
+        )
         return {
             "layer_id": layer_id,
             "status": "ok",
             "commit_message": overall_goal,
             "output": "\n\n".join(x for x in all_outputs if x),
             "commit_results": results,
+            "repos_discovered": repos_discovered,
+            "repos_discovered_count": len(roots),
+            "committed_count": len(results),
+            "skipped_clean_count": len(skipped_clean),
+            "repos_skipped_clean": skipped_clean,
+            "summary": summary,
         }
 
 
@@ -994,20 +1058,6 @@ _GITHUB_REMOTE_RE = re.compile(
 )
 
 
-def _normalize_github_auth(github_auth: list[dict[str, str]] | None) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not github_auth:
-        return out
-    for item in github_auth:
-        if not isinstance(item, dict):
-            continue
-        repo = str(item.get("repo") or "").strip().lower()
-        token = str(item.get("token") or "").strip()
-        if repo and token:
-            out[repo] = token
-    return out
-
-
 def _remote_origin_url(root: Path) -> str:
     try:
         r = subprocess.run(
@@ -1039,12 +1089,6 @@ def _parse_github_repo_slug(remote_url: str) -> str | None:
     return f"{owner}/{repo}".lower()
 
 
-def _build_github_push_url(repo_slug: str, token: str) -> str:
-    owner, repo = repo_slug.split("/", 1)
-    token_q = quote(token, safe="")
-    return f"https://x-access-token:{token_q}@github.com/{owner}/{repo}.git"
-
-
 def _redact_tokens(text: str, secrets: list[str]) -> str:
     out = str(text or "")
     for token in secrets:
@@ -1053,75 +1097,118 @@ def _redact_tokens(text: str, secrets: list[str]) -> str:
     return out
 
 
+def _write_ephemeral_ssh_keyfile(private_key: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="layer_git_ssh_", suffix=".key", text=True)
+    try:
+        key_content = private_key.strip()
+        if not key_content.endswith("\n"):
+            key_content += "\n"
+        os.write(fd, key_content.encode("utf-8"))
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return path
+
+
 async def push_layer_worktree(
     layer_id: str,
     target_branch: str | None = None,
-    github_auth: list[dict[str, str]] | None = None,
+    *,
+    ephemeral_ssh_private_key: str | None = None,
+    ephemeral_git_remote_username: str | None = None,
 ) -> dict[str, Any]:
     """将当前层下所有 git 仓库推送到上游；可指定 ``target_branch``。"""
+    _ = ephemeral_git_remote_username  # 预留：远端展示名/后续 HTTPS 凭据扩展
     _ensure_layer_id(layer_id)
-    with _layer_git_workspace_root_stable(layer_id) as base_root:
-        if not base_root.is_dir():
-            raise HTTPException(status_code=404, detail="layer not found")
-        roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
-        if not roots:
-            raise HTTPException(status_code=400, detail="layer has no git repo")
+    key_path: str | None = None
+    git_ssh_env_extra: dict[str, str] = {}
+    pk = str(ephemeral_ssh_private_key or "").strip()
+    if pk:
+        key_path = await asyncio.to_thread(_write_ephemeral_ssh_keyfile, pk)
+        qpath = shlex.quote(key_path)
+        git_ssh_env_extra["GIT_SSH_COMMAND"] = (
+            f"ssh -i {qpath} -o StrictHostKeyChecking=accept-new "
+            "-o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null"
+        )
+    try:
+        with _layer_git_workspace_root_stable(layer_id) as base_root:
+            if not base_root.is_dir():
+                raise HTTPException(status_code=404, detail="layer not found")
+            roots = _discover_git_workspace_roots_under(base_root, layer_id=layer_id)
+            if not roots:
+                raise HTTPException(status_code=400, detail="layer has no git repo")
 
-        branch = str(target_branch or "").strip()
-        if branch and any(ch.isspace() for ch in branch):
-            raise HTTPException(status_code=400, detail="invalid target_branch")
+            branch = str(target_branch or "").strip()
+            if branch and any(ch.isspace() for ch in branch):
+                raise HTTPException(status_code=400, detail="invalid target_branch")
 
-        github_auth_map = _normalize_github_auth(github_auth)
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-        results: list[dict[str, Any]] = []
-        outputs: list[str] = []
-        for root in roots:
-            repo_label = _repo_label_for_message(root, base_root)
-            remote_origin = _remote_origin_url(root)
-            github_repo = _parse_github_repo_slug(remote_origin)
-            push_remote = "origin"
-            redaction_secrets: list[str] = []
-            if github_repo:
-                token = github_auth_map.get(github_repo)
-                if token:
-                    push_remote = _build_github_push_url(github_repo, token)
-                    redaction_secrets.append(token)
-            cmd = ["git", "push"]
-            if branch:
-                cmd.extend([push_remote, f"HEAD:{branch}"])
-            elif push_remote != "origin":
-                cmd.append(push_remote)
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(root),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            )
-            assert proc.stdout is not None
-            out_b = await proc.stdout.read()
-            code = await proc.wait()
-            out = _redact_tokens(out_b.decode(errors="replace").strip(), redaction_secrets)
-            if code != 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "message": "git push failed",
-                        "repo": repo_label,
-                        "exit_code": code,
-                        "output": out,
-                    },
+            results: list[dict[str, Any]] = []
+            outputs: list[str] = []
+            for root in roots:
+                repo_label = _repo_label_for_message(root, base_root)
+                remote_origin = _remote_origin_url(root)
+                github_repo = _parse_github_repo_slug(remote_origin)
+                push_remote = "origin"
+                redaction_secrets: list[str] = []
+                if key_path:
+                    if github_repo and remote_origin.lower().startswith("https://github.com"):
+                        push_remote = _git_clone_remote_for_ssh_pem(remote_origin)
+                    elif remote_origin.startswith("git@") or remote_origin.startswith("ssh://"):
+                        pass
+                elif github_repo and remote_origin.lower().startswith("https://github.com"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": "git push 需要 ephemeral_ssh_private_key（已移除 github_auth OAuth 路径）",
+                            "repo": repo_label,
+                        },
+                    )
+                env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **git_ssh_env_extra}
+                cmd = ["git", "push"]
+                if branch:
+                    cmd.extend([push_remote, f"HEAD:{branch}"])
+                elif push_remote != "origin":
+                    cmd.append(push_remote)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(root),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
                 )
-            outputs.append(out)
-            results.append({"repo": repo_label, "output": out})
+                assert proc.stdout is not None
+                out_b = await proc.stdout.read()
+                code = await proc.wait()
+                out = _redact_tokens(out_b.decode(errors="replace").strip(), redaction_secrets)
+                if code != 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": "git push failed",
+                            "repo": repo_label,
+                            "exit_code": code,
+                            "output": out,
+                        },
+                    )
+                outputs.append(out)
+                results.append({"repo": repo_label, "output": out})
 
-        return {
-            "layer_id": layer_id,
-            "status": "ok",
-            "target_branch": branch or None,
-            "output": "\n\n".join(x for x in outputs if x),
-            "push_results": results,
-        }
+            return {
+                "layer_id": layer_id,
+                "status": "ok",
+                "target_branch": branch or None,
+                "output": "\n\n".join(x for x in outputs if x),
+                "push_results": results,
+            }
+    finally:
+        if key_path:
+
+            def _unlink() -> None:
+                with contextlib.suppress(OSError):
+                    os.unlink(key_path)
+
+            await asyncio.to_thread(_unlink)
 
 
 async def latest_commit_log(layer_id: str) -> dict[str, Any]:

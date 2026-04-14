@@ -48,7 +48,13 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/repos/clone` | JSON：`url`（必填），`branch`、`depth`（可选）。在新可写层目录内执行 `git clone`；成功返回 `layer_id`、`layer_path`、`output`。失败时 400，响应体可含 `exit_code`、`output`。克隆过程与结果会通过 SSE 推送（见下文）。 |
+| `POST` | `/api/repos/clone` | JSON：`url`（必填），`branch`、`depth`、`ssh_identity_file`、`ephemeral_ssh_private_key`（可选）。在新可写层目录内执行 `git clone`；成功返回 `layer_id`、`layer_path`、`output`。失败时 400，响应体可含 `exit_code`、`output`。克隆过程与结果会通过 SSE 推送（见下文）。 |
+
+- **`ssh_identity_file`**（可选）：本机可读 SSH **私钥文件路径**（非密钥内容）。用于 `git@host:…`、`ssh://…` 等 SSH 克隆。服务端会先 `Path.resolve()` 为**绝对路径**，再在 `git clone` 命令中注入
+  `-c core.sshCommand='ssh -i <绝对路径> -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'`
+  与在 Shell 中手写 `git clone -c core.sshCommand="ssh -i …" <url>` 等价；**不**再为克隆子进程设置 `GIT_SSH_COMMAND`。路径须存在且为常规文件，否则 400。
+- **`ephemeral_ssh_private_key`**（可选）：单次请求临时 SSH 私钥（PEM 文本）。服务端将其写入临时文件（权限 600），用于 `git@` / `ssh://` 克隆；克隆结束后自动删除。若 URL 为 HTTPS（如 `https://github.com/…`）且提供私钥，服务端会自动将远程转换为 SSH 形式（如 `git@github.com:…`）以配合 `GIT_SSH_COMMAND`。适用于私有仓库克隆或无服务器本机密钥的场景。
+- 容器启动引导中的多仓克隆（`task_api_bootstrap`）在持有 PEM 时同样通过 **`git -c core.sshCommand=…`** 使用临时密钥文件（含 `UserKnownHostsFile=/dev/null`），与 UI 克隆路径一致。
 
 ## 任务门控
 
@@ -115,10 +121,12 @@
 |------|------|------|
 | `GET` | `/api/layers/{layer_id}/git/branches` | 列出该层内仓库分支（需存在 `.git`）。 |
 | `POST` | `/api/layers/{layer_id}/git/commit` | JSON：`message`（可选，空则服务端可据任务指令与 diff 生成）。对当前工作区 `git add -A` 并 `git commit`（仅本地，不 push）。 |
-| `POST` | `/api/layers/{layer_id}/git/push` | 将当前分支 `git push` 到已配置上游；可选 JSON：`target_branch`、`github_auth`。 |
+| `POST` | `/api/layers/{layer_id}/git/push` | 将当前分支 `git push` 到已配置上游。可选 JSON：`target_branch`；`ephemeral_ssh_private_key`（单次请求内 PEM 文本，服务端写入**临时文件**并在 push 结束后删除，用于 `git@` / `ssh://` 远程；若 `origin` 为 `https://github.com/...` 且提供私钥，服务端会改用 SSH 形式远程以配合 `GIT_SSH_COMMAND`）；`ephemeral_git_remote_username`（预留）。 |
 | `GET` | `/api/layers/{layer_id}/git/commit/latest-log` | 该层各 git 根目录最近一次 `git log -1 --stat` 聚合文本。 |
 | `GET` | `/api/git/identity` | 当前进程内用于 `git commit` 的 `user.name` / `user.email` 运行时配置（可能为空）。 |
 | `POST` | `/api/git/identity` | JSON：`name`、`email`，设置上述运行时身份。 |
+
+- **任务云执行日志（可选）**：若已配置 `TaskApiEndPoint` 及 `tenantId` / `workspaceId` / `taskId` 与 `ACCESS_TOKEN` 等（与容器换票、层变动上报相同前提），本服务在 **`POST .../git/commit` 与 `POST .../git/push` 每次返回前**（含成功与 `HTTPException` 失败）会向任务云 **`…/server-container-token/git-clone-progress/`** 追加一条摘要（与克隆进度同一通道，经 SSE 进入任务详情执行区）。未配置任务云时不发起该请求。
 
 ## 实时事件（SSE）
 
@@ -153,7 +161,7 @@
 | `GET` | `/api/config` | 拉取当前 YAML 到编辑区。 |
 | `POST` | `/api/project/view` | JSON：`{"layer_id":"…"}`，切换「层 / 任务」选择时更新 `onlineProject` 指向。 |
 | `GET` | `/api/requirements/task-gate` | 是否允许新建任务（`clone_done`）。 |
-| `POST` | `/api/repos/clone` | 克隆到新建可写层。 |
+| `POST` | `/api/repos/clone` | 克隆到新建可写层；JSON 可含 `ssh_identity_file`（服务器本机私钥路径）或 `ephemeral_ssh_private_key`（粘贴的 PEM 私钥内容）。页面对应「SSH 私钥路径」与「SSH 私钥内容」两个输入框。 |
 | `GET` | `/api/repos/clone-log/{layer_id}` | 克隆日志轮询。 |
 | `GET` | `/api/repos/bootstrap-clone-log` | 启动引导批量克隆日志。 |
 | `GET` | `/api/jobs` | 任务列表与卡片。 |
@@ -173,7 +181,7 @@
 | `GET` | `/api/layers/{layer_id}/diff/parent/file` | 查询参数 **`path`**（必填）：单路径 diff。 |
 | `GET` | `/api/layers/{layer_id}/git/commit/latest-log` | 提交日志面板「最后一次提交」。 |
 | `POST` | `/api/layers/{layer_id}/git/commit` | JSON：`message`（可选）；「提交」按钮。 |
-| `POST` | `/api/layers/{layer_id}/git/push` | 「推送」按钮（无 body 亦可）。 |
+| `POST` | `/api/layers/{layer_id}/git/push` | 「推送」按钮；页面提供「SSH 私钥」输入框，JSON 可携带 `ephemeral_ssh_private_key`。 |
 | `GET` | `/api/layers/{layer_id}/children` | 查询参数：`dir`、`prefix`、`offset`、`limit`；层内文件树分页。 |
 | `GET` | `/api/layers/{layer_id}/files/{file_rel_posix}` | 查询参数：`max_bytes`、`max_text_chars`；读取选中文件内容。 |
 

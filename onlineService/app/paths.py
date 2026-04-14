@@ -82,6 +82,38 @@ def clear_runtime_ephemeral_task_dirs() -> dict[str, list[str]]:
     return {"runtime_ephemeral_removed": removed}
 
 
+def clear_state_dirs() -> dict[str, list[str]]:
+    """清空 ``onlineProject_state/{logs, reqLogs, runtime}`` 目录内容。
+
+    供 ``POST /api/jobs/reset`` 使用，重置所有运行时状态。
+    """
+    result: dict[str, list[str]] = {}
+
+    for dir_name, dir_func in (
+        ("logs", logs_dir),
+        ("reqLogs", req_logs_dir),
+        ("runtime", runtime_dir),
+    ):
+        d = dir_func()
+        removed: list[str] = []
+        try:
+            for item in d.iterdir():
+                try:
+                    if item.is_symlink() or item.is_file():
+                        item.unlink(missing_ok=True)
+                        removed.append(item.name)
+                    elif item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                        removed.append(item.name)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        result[f"{dir_name}_removed"] = removed
+
+    return result
+
+
 def commands_log_path() -> Path:
     """历史/旁路命令日志（若有）；与 jobs_state 独立，重置任务时需一并清理。"""
     return runtime_dir() / "commands.json"

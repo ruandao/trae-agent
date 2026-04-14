@@ -68,6 +68,8 @@ def storage_path_for_layer(layer_id: str) -> Path:
         return root
     if meta.kind == "clone":
         return root / BASE
+    if meta.kind == "empty":
+        return root
     return root / DIFF
 
 

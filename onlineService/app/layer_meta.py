@@ -21,7 +21,7 @@ def _layer_root(layer_id: str) -> Path:
 @dataclass(frozen=True)
 class LayerMeta:
     version: int
-    kind: Literal["clone", "job"]
+    kind: Literal["clone", "job", "empty"]
     parent_layer_id: str | None
 
 
@@ -37,7 +37,7 @@ def read_layer_meta(layer_id: str) -> LayerMeta | None:
         raw = json.loads(p.read_text(encoding="utf-8"))
         v = int(raw.get("version", 1))
         kind = raw.get("kind")
-        if kind not in ("clone", "job"):
+        if kind not in ("clone", "job", "empty"):
             return None
         pl = raw.get("parent_layer_id")
         parent = str(pl).strip() if pl else None
@@ -49,7 +49,7 @@ def read_layer_meta(layer_id: str) -> LayerMeta | None:
 
 
 def write_layer_meta(
-    layer_id: str, *, kind: Literal["clone", "job"], parent_layer_id: str | None
+    layer_id: str, *, kind: Literal["clone", "job", "empty"], parent_layer_id: str | None
 ) -> None:
     root = _layer_root(layer_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -74,7 +74,7 @@ def layer_chain_root_to_tip(layer_id: str) -> list[str]:
         if meta is None:
             break
         chain_tip_to_root.append(cur)
-        if meta.kind == "clone":
+        if meta.kind in ("clone", "empty"):
             break
         cur = meta.parent_layer_id
     return list(reversed(chain_tip_to_root))
