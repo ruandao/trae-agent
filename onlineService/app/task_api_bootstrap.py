@@ -146,7 +146,12 @@ def _business_api_endpoint() -> str:
 
 
 def _skip_exchange_for_local_business_api(endpoint: str) -> bool:
-    """BusinessApiEndPoint 指向本机 onlineService 时跳过换票，保留 ACCESS_TOKEN 便于 /ui/<token> 本地调试。"""
+    """BusinessApiEndPoint 指向本机 onlineService 时跳过换票，保留 ACCESS_TOKEN 便于 /ui/<token> 本地调试。
+
+    注意：此跳过逻辑仅在 TaskApiEndPoint 也指向本机 Django 时生效（本地开发调试场景）。
+    若 TaskApiEndPoint 指向宿主机 Django（容器环境），即使 BusinessApiEndPoint 指向本机 onlineService，
+    也必须执行换票以获取访问 Django API 的有效 access_token。
+    """
     e = endpoint.rstrip("/").lower()
     listen = os.environ.get("PORT", "").strip()
     try:
@@ -156,9 +161,23 @@ def _skip_exchange_for_local_business_api(endpoint: str) -> bool:
     for host in ("127.0.0.1", "localhost"):
         base = f"http://{host}:{pnum}"
         if e == base or e.startswith(f"{base}/"):
-            return True
+            task_api_ep = (os.environ.get("TaskApiEndPoint", "") or "").strip().lower()
+            if not task_api_ep:
+                return True
+            for h in ("127.0.0.1", "localhost", "::1"):
+                if task_api_ep.startswith(f"http://{h}:") or task_api_ep.startswith(f"http://{h}/"):
+                    return True
+            return False
     base6 = f"http://[::1]:{pnum}"
-    return bool(e == base6 or e.startswith(f"{base6}/"))
+    if e == base6 or e.startswith(f"{base6}/"):
+        task_api_ep = (os.environ.get("TaskApiEndPoint", "") or "").strip().lower()
+        if not task_api_ep:
+            return True
+        for h in ("127.0.0.1", "localhost", "::1"):
+            if task_api_ep.startswith(f"http://{h}:") or task_api_ep.startswith(f"http://{h}/"):
+                return True
+        return False
+    return False
 
 
 def _redact_for_log(obj: Any) -> Any:
