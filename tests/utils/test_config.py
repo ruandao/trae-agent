@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from trae_agent.utils.config import Config, ModelConfig, ModelProvider, TraeAgentConfig
 from trae_agent.utils.legacy_config import LegacyConfig
@@ -89,7 +89,7 @@ class TestConfigBaseURL(unittest.TestCase):
         client = OpenAIClient(model_config)
 
         mock_openai.assert_called_once_with(
-            api_key="test-api-key", base_url="https://custom-openai.example.com/v1"
+            api_key="test-api-key", base_url="https://custom-openai.example.com/v1", http_client=ANY
         )
         self.assertEqual(client.base_url, "https://custom-openai.example.com/v1")
 
@@ -134,7 +134,7 @@ class TestConfigBaseURL(unittest.TestCase):
         client = AnthropicClient(model_config)
 
         mock_anthropic.assert_called_once_with(
-            api_key="test-api-key", base_url="https://custom-anthropic.example.com"
+            api_key="test-api-key", base_url="https://custom-anthropic.example.com", http_client=ANY
         )
         self.assertEqual(client.base_url, "https://custom-anthropic.example.com")
 

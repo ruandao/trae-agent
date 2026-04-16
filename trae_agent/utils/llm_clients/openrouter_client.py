@@ -6,6 +6,7 @@
 import os
 from typing import override
 
+import httpx
 import openai
 
 from trae_agent.utils.config import ModelConfig
@@ -19,10 +20,16 @@ class OpenRouterProvider(ProviderConfig):
     """OpenRouter provider configuration."""
 
     def create_client(
-        self, api_key: str, base_url: str | None, api_version: str | None
+        self,
+        api_key: str,
+        base_url: str | None,
+        api_version: str | None,
+        timeout: float | None = None,
     ) -> openai.OpenAI:
         """Create OpenAI client with OpenRouter base URL."""
-        return openai.OpenAI(api_key=api_key, base_url=base_url)
+        effective_timeout = timeout or 120.0
+        http_client = httpx.Client(timeout=httpx.Timeout(effective_timeout, connect=60.0))
+        return openai.OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
 
     def get_service_name(self) -> str:
         """Get the service name for retry logging."""

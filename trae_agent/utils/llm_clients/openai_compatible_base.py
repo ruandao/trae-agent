@@ -38,7 +38,11 @@ class ProviderConfig(ABC):
 
     @abstractmethod
     def create_client(
-        self, api_key: str, base_url: str | None, api_version: str | None
+        self,
+        api_key: str,
+        base_url: str | None,
+        api_version: str | None,
+        timeout: float | None = None,
     ) -> openai.OpenAI:
         """Create the OpenAI client instance."""
         pass
@@ -67,10 +71,15 @@ class ProviderConfig(ABC):
 class OpenAICompatibleClient(BaseLLMClient):
     """Base class for OpenAI-compatible clients with shared logic."""
 
+    DEFAULT_TIMEOUT = 120.0
+
     def __init__(self, model_config: ModelConfig, provider_config: ProviderConfig):
         super().__init__(model_config)
         self.provider_config = provider_config
-        self.client = provider_config.create_client(self.api_key, self.base_url, self.api_version)
+        timeout = getattr(model_config, "timeout", None) or self.DEFAULT_TIMEOUT
+        self.client = provider_config.create_client(
+            self.api_key, self.base_url, self.api_version, timeout
+        )
         self.message_history: list[ChatCompletionMessageParam] = []
         self.logger = LLMLogger(model_config.model)
 
@@ -221,7 +230,9 @@ class OpenAICompatibleClient(BaseLLMClient):
                 )
             elif llm_response.content:
                 self.message_history.append(
-                    ChatCompletionAssistantMessageParam(content=llm_response.content, role="assistant")
+                    ChatCompletionAssistantMessageParam(
+                        content=llm_response.content, role="assistant"
+                    )
                 )
 
             # Log the response

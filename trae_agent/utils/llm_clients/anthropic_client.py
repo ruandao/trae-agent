@@ -8,6 +8,7 @@ import time
 from typing import override
 
 import anthropic
+import httpx
 from anthropic.types.tool_union_param import TextEditor20250429
 
 from trae_agent.tools.base import Tool, ToolCall, ToolResult
@@ -21,11 +22,15 @@ from trae_agent.utils.llm_clients.retry_utils import retry_with
 class AnthropicClient(BaseLLMClient):
     """Anthropic client wrapper with tool schema generation."""
 
+    DEFAULT_TIMEOUT = 120.0
+
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
 
+        timeout = getattr(model_config, "timeout", None) or self.DEFAULT_TIMEOUT
+        http_client = httpx.Client(timeout=httpx.Timeout(timeout, connect=60.0))
         self.client: anthropic.Anthropic = anthropic.Anthropic(
-            api_key=self.api_key, base_url=self.base_url
+            api_key=self.api_key, base_url=self.base_url, http_client=http_client
         )
         self.message_history: list[anthropic.types.MessageParam] = []
         self.system_message: str | anthropic.NotGiven = anthropic.NOT_GIVEN

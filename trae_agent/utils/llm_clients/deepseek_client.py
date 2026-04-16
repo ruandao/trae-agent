@@ -7,6 +7,7 @@ import json
 import time
 from typing import override
 
+import httpx
 import openai
 from openai.types.responses import (
     FunctionToolParam,
@@ -27,10 +28,16 @@ from trae_agent.utils.llm_clients.retry_utils import retry_with
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek client wrapper with tool schema generation."""
 
+    DEFAULT_TIMEOUT = 120.0
+
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
 
-        self.client: openai.OpenAI = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
+        timeout = getattr(model_config, "timeout", None) or self.DEFAULT_TIMEOUT
+        http_client = httpx.Client(timeout=httpx.Timeout(timeout, connect=60.0))
+        self.client: openai.OpenAI = openai.OpenAI(
+            api_key=self.api_key, base_url=self.base_url, http_client=http_client
+        )
         self.message_history: ResponseInputParam = []
         self.logger = LLMLogger(model_config.model)
 
@@ -88,7 +95,7 @@ class DeepSeekClient(BaseLLMClient):
                 )
 
         # 转换LLMMessage对象为字典格式并清理消息
-        cleaned_messages = []
+        cleaned_messages: list[dict] = []
         for msg in api_call_input:
             # 处理LLMMessage对象
             if hasattr(msg, "role"):
@@ -201,7 +208,7 @@ class DeepSeekClient(BaseLLMClient):
 
         # Clean deepseek_messages to avoid consecutive assistant messages
         if len(deepseek_messages) > 1:
-            cleaned_deepseek_messages = []
+            cleaned_deepseek_messages: list[dict] = []
             for msg in deepseek_messages:
                 # Only add the message if it's not an assistant message or if the previous message is not an assistant message
                 if (
@@ -431,7 +438,7 @@ class DeepSeekClient(BaseLLMClient):
 
         # Final cleaning to ensure no consecutive assistant messages
         if len(deepseek_messages) > 1:
-            cleaned_messages = []
+            cleaned_messages: list[dict] = []
             for msg in deepseek_messages:
                 if (
                     not cleaned_messages

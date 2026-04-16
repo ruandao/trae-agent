@@ -16,10 +16,18 @@ class DoubaoProvider(ProviderConfig):
     """Doubao provider configuration."""
 
     def create_client(
-        self, api_key: str, base_url: str | None, api_version: str | None
+        self,
+        api_key: str,
+        base_url: str | None,
+        api_version: str | None,
+        timeout: float | None = None,
     ) -> openai.OpenAI:
         """Create OpenAI client with Doubao base URL."""
-        return openai.OpenAI(base_url=base_url, api_key=api_key)
+        effective_timeout = timeout or 120.0
+        import httpx
+
+        http_client = httpx.Client(timeout=httpx.Timeout(effective_timeout, connect=60.0))
+        return openai.OpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
 
     def get_service_name(self) -> str:
         """Get the service name for retry logging."""

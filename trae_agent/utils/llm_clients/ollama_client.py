@@ -10,6 +10,7 @@ import time
 import uuid
 from typing import override
 
+import httpx
 import openai
 from ollama import chat as ollama_chat  # pyright: ignore[reportUnknownVariableType]
 from openai.types.responses import (
@@ -28,15 +29,19 @@ from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
 class OllamaClient(BaseLLMClient):
+    DEFAULT_TIMEOUT = 120.0
+
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
 
+        timeout = getattr(model_config, "timeout", None) or self.DEFAULT_TIMEOUT
+        http_client = httpx.Client(timeout=httpx.Timeout(timeout, connect=60.0))
         self.client: openai.OpenAI = openai.OpenAI(
-            # by default ollama doesn't require any api key. It should set to be "ollama".
             api_key=self.api_key,
             base_url=model_config.model_provider.base_url
             if model_config.model_provider.base_url
             else "http://localhost:11434/v1",
+            http_client=http_client,
         )
 
         self.message_history: ResponseInputParam = []
