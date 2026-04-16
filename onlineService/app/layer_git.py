@@ -26,7 +26,7 @@ from .layer_merge import (
     lower_paths_parent_stack,
 )
 from .layer_meta import is_overlay_v1_layer, read_layer_meta
-from .layers import layer_path
+from .layers import create_job_layer, create_stacked_layer, layer_path, new_layer_id
 from .overlay_diff import (
     compute_diff_between_trees,
     materialize_merged_chain,
@@ -34,6 +34,8 @@ from .overlay_diff import (
 )
 from .paths import runtime_dir
 from .task_api_bootstrap import _git_clone_remote_for_ssh_pem
+
+logger = logging.getLogger(__name__)
 
 
 def layer_git_workspace_root(layer_id: str) -> Path:
@@ -602,12 +604,25 @@ async def commit_layer_worktree(
                     status_code=500, detail=f"persist overlay diff failed: {e}"
                 ) from e
 
+        child_layer_id: str | None = None
+        try:
+            nid = new_layer_id()
+            if is_overlay_v1_layer(layer_id):
+                create_job_layer(nid, layer_id)
+            else:
+                create_stacked_layer(nid, layer_path(layer_id))
+            child_layer_id = nid
+        except Exception as e:  # noqa: BLE001
+            logger.warning("commit ok but create stacked child layer failed: %s", e)
+
         summary = (
             f"已在层工作区内扫描 {len(roots)} 个 Git 仓库："
             f"成功提交 {len(results)} 个"
             + (f"，另 {len(skipped_clean)} 个无暂存变更未产生提交" if skipped_clean else "")
             + "。"
         )
+        if child_layer_id:
+            summary += f" 已新建子层级节点 {child_layer_id}，可在层级树中继续叠改。"
         return {
             "layer_id": layer_id,
             "status": "ok",
@@ -620,6 +635,7 @@ async def commit_layer_worktree(
             "skipped_clean_count": len(skipped_clean),
             "repos_skipped_clean": skipped_clean,
             "summary": summary,
+            "child_layer_id": child_layer_id,
         }
 
 
