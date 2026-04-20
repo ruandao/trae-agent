@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from trae_agent.utils.auto_commit_message import load_latest_trajectory_data
 
 from .git_clone import _validate_branch
+from .layer_fs import _validate_safe_rel_posix
 from .layer_merge import (
     layer_merged_root_for_api,
     layer_merged_root_for_api_locked,
@@ -1268,4 +1269,138 @@ async def latest_commit_log(layer_id: str) -> dict[str, Any]:
             "status": "ok",
             "logs": results,
             "output": "\n\n".join(outputs),
+        }
+
+
+_MAX_GIT_LOG_TEXT_CHARS = 200_000
+
+
+async def git_log_at_path(layer_id: str, repo_rel_posix: str, *, limit: int) -> dict[str, Any]:
+    """在层内某目录下执行 ``git log``（该路径须在某一 git 工作区内）。"""
+    _ensure_layer_id(layer_id)
+    raw = (repo_rel_posix or "").replace("\\", "/").strip().lstrip("/")
+    if not raw:
+        raise HTTPException(status_code=400, detail="path is required")
+    rel = _validate_safe_rel_posix(raw)
+    lim = max(1, min(int(limit), 100))
+
+    with _layer_git_workspace_root_stable(layer_id) as base_root:
+        if not base_root.is_dir():
+            raise HTTPException(status_code=404, detail="layer not found")
+        layer_res = base_root.resolve()
+        target = layer_res / Path(*rel.parts)
+        try:
+            target_res = target.resolve()
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
+        if not target_res.is_relative_to(layer_res):
+            raise HTTPException(status_code=400, detail="path escapes layer root")
+        if not target_res.exists():
+            raise HTTPException(status_code=404, detail="path not found")
+        if not target_res.is_dir():
+            raise HTTPException(status_code=400, detail="path is not a directory")
+
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        proc_chk = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(target_res),
+            "rev-parse",
+            "--is-inside-work-tree",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        out_chk, err_chk = await proc_chk.communicate()
+        if proc_chk.returncode != 0 or (out_chk.decode(errors="replace").strip() != "true"):
+            msg = (err_chk.decode(errors="replace") or out_chk.decode(errors="replace")).strip()
+            raise HTTPException(
+                status_code=400,
+                detail=msg or "not a git worktree",
+            )
+
+        proc_top = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(target_res),
+            "rev-parse",
+            "--show-toplevel",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        top_b, _ = await proc_top.communicate()
+        git_root = (top_b.decode(errors="replace").strip()) if proc_top.returncode == 0 else ""
+
+        proc_log = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(target_res),
+            "log",
+            f"-{lim}",
+            "--date=iso-strict",
+            "--pretty=format:%H%x09%h%x09%s%x09%an%x09%ae%x09%ci",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        log_b, _ = await proc_log.communicate()
+        log_text_raw = log_b.decode(errors="replace")
+        if proc_log.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=log_text_raw.strip() or "git log failed",
+            )
+
+        commits: list[dict[str, str]] = []
+        for line in log_text_raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 5)
+            if len(parts) < 6:
+                continue
+            commits.append(
+                {
+                    "hash": parts[0],
+                    "short": parts[1],
+                    "subject": parts[2],
+                    "author": parts[3],
+                    "email": parts[4],
+                    "date": parts[5],
+                }
+            )
+
+        proc_pretty = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(target_res),
+            "log",
+            f"-{lim}",
+            "--decorate",
+            "--date=iso-strict",
+            "--pretty=medium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        pretty_b, _ = await proc_pretty.communicate()
+        text = pretty_b.decode(errors="replace").strip()
+        truncated = False
+        if len(text) > _MAX_GIT_LOG_TEXT_CHARS:
+            text = text[:_MAX_GIT_LOG_TEXT_CHARS] + "\n\n…（输出已截断）"
+            truncated = True
+
+        top_path = Path(git_root) if git_root else target_res
+        repo_label = _repo_label_for_message(top_path, layer_res)
+
+        return {
+            "layer_id": layer_id,
+            "path": rel.as_posix(),
+            "repo": repo_label,
+            "repo_root": git_root or None,
+            "status": "ok",
+            "commits": commits,
+            "text": text,
+            "truncated": truncated,
         }

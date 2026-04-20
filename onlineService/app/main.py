@@ -48,7 +48,9 @@ from .layer_git import (
     diff_layer_worktree_vs_parent,
     get_runtime_git_identity,
     git_ahead_of_upstream,
+    git_log_at_path,
     git_worktree_dirty,
+    latest_commit_log,
     list_layer_changes_vs_parent,
     push_layer_worktree,
     set_runtime_git_identity,
@@ -1058,6 +1060,28 @@ async def events_stream(
 async def api_layer_git_branches(_: AuthDep, layer_id: str) -> dict[str, Any]:
     """列出该可写层内 git 仓库的分支（需存在 ``.git``）。"""
     return await list_layer_git_branches(layer_id)
+
+
+@app.get("/api/layers/{layer_id}/git/log")
+async def api_layer_git_log(
+    _: AuthDep,
+    layer_id: str,
+    path: Annotated[
+        str | None, Query(description="层内目录相对路径；省略则返回各仓库最近一次提交")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> dict[str, Any]:
+    """在指定目录下查看 ``git log``；无 ``path`` 时等价于各仓库 ``git log -1`` 汇总。"""
+    p = (path or "").strip()
+    if not p:
+        return await latest_commit_log(layer_id)
+    return await git_log_at_path(layer_id, p, limit=limit)
+
+
+@app.get("/api/layers/{layer_id}/git/commit/latest-log")
+async def api_layer_git_commit_latest_log(_: AuthDep, layer_id: str) -> dict[str, Any]:
+    """各 git 仓库最近一次提交（``git log -1 --stat``），与 ``GET .../git/log`` 无 path 时一致。"""
+    return await latest_commit_log(layer_id)
 
 
 @app.post("/api/layers/{layer_id}/git/commit")
