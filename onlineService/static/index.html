@@ -4,9 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Trae Online Service</title>
-  <link rel="stylesheet" href="/static/vendor/ztree/css/zTreeStyle/zTreeStyle.css" />
-  <script src="/static/vendor/jquery/jquery-3.7.1.min.js"></script>
-  <script src="/static/vendor/ztree/js/jquery.ztree.all.min.js"></script>
   <style>
     :root {
       --bg: #0f1419;
@@ -136,8 +133,8 @@
     .tree-more { margin-left: 14px; margin-top: 0.25rem; }
     .tree-path-meta { margin-top: 0.45rem; }
     .layer-relation-tree { margin-top: 0.35rem; }
-    /* zTree：任务关联树（深色主题；单一顶层「任务」根） */
-    #ztree_layer_graph.ztree {
+    /* 可写层任务关联：串行列表（按创建时间） */
+    #layer_serial_graph.layer-serial-graph {
       width: 100%;
       min-height: 420px;
       max-height: 420px;
@@ -146,46 +143,68 @@
       border-radius: 8px;
       background: var(--bg);
       margin: 0;
-      padding: 0.5rem 0.35rem;
+      padding: 0.45rem 0.4rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
     }
-    #layerRelationTree .ztree * {
+    .layer-serial-banner {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      padding: 0.15rem 0.2rem 0.35rem;
+      font-family: ui-monospace, monospace;
+    }
+    button.layer-serial-row {
+      display: block;
+      width: 100%;
+      text-align: left;
       font-family: ui-monospace, monospace;
       font-size: 11px;
       line-height: 1.45;
-    }
-    #layerRelationTree .ztree {
       color: var(--text);
-      background: transparent;
-    }
-    #layerRelationTree .ztree li a {
-      color: inherit;
-      height: auto;
-      min-height: 17px;
-      padding: 3px 6px;
-      white-space: normal;
-      max-width: 100%;
-      word-break: break-word;
       background-color: #1a2332;
       border: 1px solid var(--border);
       border-radius: 6px;
+      padding: 6px 8px;
+      white-space: normal;
+      word-break: break-word;
+      cursor: pointer;
+      margin: 0;
     }
-    #layerRelationTree .ztree li a:hover {
-      text-decoration: none;
+    button.layer-serial-row:hover {
       background: rgba(61, 139, 253, 0.14);
     }
-    #layerRelationTree .ztree li a.curSelectedNode {
-      padding-top: 3px;
-      background-color: rgba(61, 139, 253, 0.28) !important;
-      color: var(--text) !important;
-      border: 1px solid var(--accent) !important;
-      opacity: 1;
+    button.layer-serial-row.layer-serial-active {
+      background-color: rgba(61, 139, 253, 0.28);
+      border-color: var(--accent);
     }
-    #layerRelationTree .ztree li span.button.switch {
-      opacity: 0.85;
+    button.layer-serial-row.layer-serial-job {
+      margin-left: 0.65rem;
+      width: calc(100% - 0.65rem);
     }
-    #layerRelationTree .ztree li.level0 > a {
+    button.layer-serial-row.zt-virtual {
       font-weight: 600;
       color: var(--text);
+    }
+    button.layer-serial-row.zt-active {
+      color: #fcd34d;
+      font-weight: 600;
+    }
+    button.layer-serial-row.zt-no_git {
+      color: #94a3b8;
+      font-weight: 600;
+    }
+    button.layer-serial-row.zt-clean {
+      color: #a7f3d0;
+      font-weight: 600;
+    }
+    button.layer-serial-row.zt-dirty {
+      color: #cbd5e1;
+      font-weight: 600;
+    }
+    button.layer-serial-row.zt-cycle {
+      color: #f87171;
     }
     .layer-relation-actions {
       display: flex;
@@ -440,19 +459,19 @@
       <h2>新建任务</h2>
       <p id="taskGateMsg" class="err-msg" style="display: none; margin: 0 0 0.5rem"></p>
       <div style="margin: 0 0 0.65rem;">
-        <label>任务关联（zTree 树形图）</label>
-        <p class="meta" style="margin: 0.25rem 0 0.35rem;"><strong>可写层</strong>按 <code>parent_layer_id</code> 嵌套；每层下为该层上的<strong>任务</strong>（按创建时间正序排列）。点击<strong>层</strong>或<strong>任务</strong>会同步「选择层」、刷新文件树，并加载相对父层的<strong>变动路径列表</strong>（<code>diff -rq</code>，排除 <code>.git</code>）。逐文件 diff 见下方「可写层变动浏览」。操作栏在选中层时默认以该层上最新任务为上下文（排队 / 叠建子层等）。尚无任务时也可展开层树并<code>选择层</code>后新建任务；全局已有任务时，点选<strong>任务</strong>节点后再叠建。</p>
+        <label>任务关联（可写层串行列表）</label>
+        <p class="meta" style="margin: 0.25rem 0 0.35rem;"><strong>可写层</strong>按创建时间<strong>串行</strong>排列（含子层）；同一层上多条任务时，在对应层条目下<strong>串行</strong>列出任务。点击<strong>层</strong>或<strong>任务</strong>会同步「选择层」、刷新文件树，并加载相对父层的<strong>变动路径列表</strong>（<code>diff -rq</code>，含 <code>.git</code>）。逐文件 diff 见下方「可写层变动浏览」。操作栏在选中层时默认以该层上最新任务为上下文（排队 / 叠建子层等）。尚无任务时也可点选某层后新建任务；全局已有任务时，点选<strong>任务</strong>行后再叠建。</p>
         <div id="layerRelationTree" class="layer-relation-tree"></div>
         <div id="layerRelationActions" class="layer-relation-actions"></div>
         <p class="meta" id="layerRelationMeta" style="margin-top:0.35rem;"></p>
         <div id="layerParentDiffWrap" style="margin-top: 0.65rem;">
           <span class="meta" style="display:block;margin-bottom:0.3rem;">与上层可写层的差异（文件列表）</span>
-          <div id="layerParentDiff">（点击上方树中的可写层或任务节点以加载）</div>
+          <div id="layerParentDiff">（点击上方串行列表中的可写层或任务行以加载）</div>
           <p class="meta" id="layerParentDiffMeta" style="margin-top:0.35rem;"></p>
         </div>
       </div>
       <p id="newTaskFormHint" class="meta" style="margin: 0.65rem 0 0.35rem;">
-        新建、排队或叠建任务请在上方的 zTree 中点选<strong>可写层</strong>或<strong>任务</strong>节点，使用节点下方操作栏内的指令框与类型选择（与下方「选择层」联动）。
+        新建、排队或叠建任务请在上方的串行列表中点选<strong>可写层</strong>或<strong>任务</strong>行，使用下方操作栏内的指令框与类型选择（与下方「选择层」联动）。
       </p>
     </section>
     <section>
@@ -463,7 +482,7 @@
     <section id="writableChangesSection">
       <h2>可写层变动浏览</h2>
       <p class="meta" style="margin: 0 0 0.65rem;">
-        对比<strong>当前任务所在层</strong>与其<strong>解析后的父可写层</strong>（与上方「与上层可写层的差异」相同基准：<code>diff -rq</code> / <code>diff -uN</code>，排除 <code>.git</code>）。用于查看某次命令叠加的层相对父层改动了哪些路径，并逐文件查看 diff。
+        对比<strong>当前任务所在层</strong>与其<strong>解析后的父可写层</strong>（与上方「与上层可写层的差异」相同基准：<code>diff -rq</code> / <code>diff -uN</code>，含 <code>.git</code>）。用于查看某次命令叠加的层相对父层改动了哪些路径，并逐文件查看 diff。
       </p>
       <div class="row">
         <div>
@@ -602,7 +621,25 @@
       });
     }
 
-    /** 同一 layer_id 在 API 中若重复出现，只保留一条合并后的记录，避免 zTree 出现相同 id 的多个层节点。 */
+    /** 串行视图：全部可写层按 created_at 旧→新（同秒内 bootstrap 层优先）。 */
+    function sortLayersSerialChronological(layerList) {
+      const bs =
+        lastBootstrapLayerId &&
+        layerList.some((r) => r.layer_id === lastBootstrapLayerId)
+          ? lastBootstrapLayerId
+          : '';
+      return [...layerList].sort((a, b) => {
+        const da = createdAtMs(a.created_at);
+        const db = createdAtMs(b.created_at);
+        if (da !== db) return da - db;
+        const sa = bs && a.layer_id === bs ? 1 : 0;
+        const sb = bs && b.layer_id === bs ? 1 : 0;
+        if (sa !== sb) return sb - sa;
+        return String(a.layer_id || '').localeCompare(String(b.layer_id || ''));
+      });
+    }
+
+    /** 同一 layer_id 在 API 中若重复出现，只保留一条合并后的记录，避免串行列表出现相同 id 的多个层行。 */
     function dedupeLayersById(layers) {
       const by = new Map();
       for (const l of layers || []) {
@@ -1336,12 +1373,31 @@
 
     /** 延后连接 SSE：避免与首屏 fetch 并发长连接，使 wait_until=networkidle 等探测可结束（否则刷新会“永远加载”）。 */
     let sseStarted = false;
+    /** 供克隆前等待：须在阻塞的 POST /api/repos/clone 之前建立连接，否则会错过 repo_clone_started，克隆区无轮询更新。 */
+    let sseEventSource = null;
+    function waitEventSourceOpen() {
+      return new Promise((resolve) => {
+        const es = sseEventSource;
+        if (!es) return resolve();
+        if (es.readyState === 1) return resolve();
+        const t = setTimeout(resolve, 2500);
+        es.addEventListener(
+          'open',
+          () => {
+            clearTimeout(t);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    }
     function connectSse() {
       if (sseStarted) return;
       sseStarted = true;
       const es = new EventSource(
         '/api/events/stream?access_token=' + encodeURIComponent(ACCESS_TOKEN)
       );
+      sseEventSource = es;
       es.onmessage = (ev) => {
       try {
         const o = JSON.parse(ev.data);
@@ -1509,6 +1565,8 @@
       void runAsyncButton(
         btn,
         async () => {
+          connectSse();
+          await waitEventSourceOpen();
           let emptyRootId = null;
           try {
             const er = await api('/api/layers/empty-root');
@@ -1918,13 +1976,13 @@
       if (j.same && changes.length === 0) {
         const p = document.createElement('p');
         p.className = 'meta';
-        p.textContent = '与父层工作区一致（除 .git）。';
+        p.textContent = '与父层工作区一致（含 .git 在内无差异）。';
         listEl.appendChild(p);
         return;
       }
       for (const c of changes) {
         const row = document.createElement('div');
-        row.className = 'tree-node writable-change-row';
+        row.className = 'layer-parent-diff-file-row writable-change-row';
         const badge = document.createElement('span');
         const k = c.kind || '';
         badge.className = 'writable-change-kind kind-' + k;
@@ -1932,6 +1990,8 @@
           k === 'modified' ? '改' : k === 'added' ? '增' : k === 'removed' ? '删' : '?';
         const label = document.createElement('span');
         label.style.marginLeft = '0.35rem';
+        label.style.fontFamily = 'ui-monospace, monospace';
+        label.style.wordBreak = 'break-word';
         label.textContent = c.path || '';
         row.appendChild(badge);
         row.appendChild(label);
@@ -2302,7 +2362,7 @@
       if (j.same && changes.length === 0) {
         const p = document.createElement('p');
         p.className = 'meta';
-        p.textContent = '与父层工作区一致（除 .git）。';
+        p.textContent = '与父层工作区一致（含 .git 在内无差异）。';
         box.appendChild(p);
         return;
       }
@@ -2336,15 +2396,6 @@
       return s.slice(LAYER_TREE_NODE_PREFIX.length);
     }
 
-    function zTreeExpandAncestors(z, treeNode) {
-      if (!z || !treeNode) return;
-      let p = treeNode.getParentNode();
-      while (p) {
-        z.expandNode(p, true);
-        p = p.getParentNode();
-      }
-    }
-
     function handleLayerGraphNodeSelect(nid) {
       if (!nid || nid === LAYER_GRAPH_ROOT_ID) {
         updateLayerRelationToolbar(nid || null);
@@ -2371,33 +2422,22 @@
       try {
         const lid = String(layerId || '').trim();
         if (!lid) return false;
-        const z = window._layerZtree;
-        if (!z) return false;
         const nid = layerNodeId(lid);
-        const n = z.getNodeByParam('id', nid, null);
-        if (!n) return false;
-        zTreeExpandAncestors(z, n);
-        z.selectNode(n, false);
-        handleLayerGraphNodeSelect(nid);
+        const host = document.getElementById('layer_serial_graph');
+        if (!host) return false;
+        const btn = Array.from(host.querySelectorAll('button.layer-serial-row')).find(
+          (b) => b.getAttribute('data-mind-node-id') === nid,
+        );
+        if (!btn) return false;
+        btn.click();
         return true;
       } catch (_e) {
         return false;
       }
     };
 
-    /** zTree：按可写层 parent_layer_id 组织；任务挂在对应 layer_id 下（同级正序），不再按 parent_job_id 嵌套。 */
-    function buildZTreeNodesFromLayers(layers, jobs, layerById) {
-      const ZROOT = 0;
-      const layerChildMap = new Map();
-      for (const l of layers) {
-        const p = l.parent_layer_id;
-        const pk = p && layerById.has(p) ? p : '__root__';
-        if (!layerChildMap.has(pk)) layerChildMap.set(pk, []);
-        layerChildMap.get(pk).push(l);
-      }
-      for (const arr of layerChildMap.values()) {
-        sortZTreeLayerSiblings(arr);
-      }
+    /** 串行列表：全部可写层按创建时间一条接一条；层内多条任务时再列出任务行（合并单任务、隐藏 clone 任务行等规则与旧版 zTree 一致）。 */
+    function buildSerialRowsFromLayers(layers, jobs, layerById) {
       const jobsByLayer = new Map();
       const jobApiOrder = new Map();
       for (let i = 0; i < (jobs || []).length; i++) {
@@ -2418,7 +2458,6 @@
         });
       }
 
-      /** omitLayerCommand：下方会挂多条任务子节点时不在层行重复 command（否则会与每个任务行各显示一遍，像两个任务节点）。 */
       function topicForLayer(layer, omitLayerCommand) {
         const lid = layer.layer_id || '';
         const bits = [lid];
@@ -2440,7 +2479,6 @@
         return sub.length ? line1 + '\n' + sub.join(' · ') : line1;
       }
 
-      /** 该层仅一条可见（非 clone）任务：合并到同一层节点，避免「层行一条 + 任务行一条」的双重展示。 */
       function topicForLayerMergedWithJob(layer, job) {
         const lid = layer.layer_id || '';
         const st = job.status || '—';
@@ -2472,7 +2510,6 @@
         return 'dirty';
       }
 
-      /** 挂在层节点下的任务：不重复展示 layer_id（父节点已是该层），避免界面上出现两个节点同显一个 layerId。 */
       function topicForJobUnderLayer(job) {
         const st = job.status || '—';
         const bits = [st];
@@ -2504,35 +2541,10 @@
         return 'dirty';
       }
 
-      const nodes = [];
+      const rows = [];
+      const sortedLayers = sortLayersSerialChronological(layers);
 
-      function visitJobUnderLayer(job, parentPid) {
-        const fullTopic = topicForJobUnderLayer(job);
-        nodes.push({
-          id: job.id,
-          pId: parentPid,
-          name: fullTopic.split('\n').join(' · '),
-          title: fullTopic,
-          nodeKind: 'job',
-          ztStyle: ztStyleForJob(job),
-          open: false,
-        });
-      }
-
-      function visitLayer(layer, parentZId, pathVisited) {
-        if (pathVisited.has(layer.layer_id)) {
-          nodes.push({
-            id: 'cycle_ly_' + layer.layer_id,
-            pId: parentZId,
-            name: '（层循环） ' + layer.layer_id,
-            title: layer.layer_id,
-            nodeKind: 'cycle',
-            open: false,
-          });
-          return;
-        }
-        const nextPath = new Set(pathVisited);
-        nextPath.add(layer.layer_id);
+      for (const layer of sortedLayers) {
         const zid = layerNodeId(layer.layer_id);
         const jlist = jobsByLayer.get(layer.layer_id) || [];
         const visibleJobs = jlist.filter((j) => j.command_kind !== 'clone');
@@ -2540,73 +2552,46 @@
         const ltopic = soleVisible
           ? topicForLayerMergedWithJob(layer, soleVisible)
           : topicForLayer(layer, visibleJobs.length > 1);
-        nodes.push({
+        rows.push({
           id: zid,
-          pId: parentZId,
           name: ltopic.split('\n').join(' · '),
           title: ltopic,
-          nodeKind: 'layer',
+          nodeKind: soleVisible ? 'layer_merged' : 'layer',
           ztStyle: soleVisible ? ztStyleForJob(soleVisible) : ztStyleForLayer(layer),
-          open: true,
         });
-        const sublayers = layerChildMap.get(layer.layer_id) || [];
-        const childEntries = [];
-        for (const ch of sublayers) {
-          childEntries.push({ kind: 'layer', t: ch.created_at || '', layer: ch });
-        }
         if (!soleVisible) {
           for (const j of jlist) {
             if (j.command_kind === 'clone') continue;
-            childEntries.push({ kind: 'job', t: j.created_at || '', job: j });
+            const fullTopic = topicForJobUnderLayer(j);
+            rows.push({
+              id: j.id,
+              name: fullTopic.split('\n').join(' · '),
+              title: fullTopic,
+              nodeKind: 'job',
+              ztStyle: ztStyleForJob(j),
+            });
           }
         }
-        childEntries.sort((a, b) => {
-          const ta =
-            a.kind === 'layer'
-              ? createdAtMs(a.layer.created_at)
-              : createdAtMs(a.job.created_at);
-          const tb =
-            b.kind === 'layer'
-              ? createdAtMs(b.layer.created_at)
-              : createdAtMs(b.job.created_at);
-          if (ta !== tb) return ta - tb;
-          if (a.kind !== b.kind) return a.kind === 'layer' ? -1 : 1;
-          if (a.kind === 'layer')
-            return String(a.layer.layer_id || '').localeCompare(
-              String(b.layer.layer_id || ''),
-            );
-          return (
-            (jobApiOrder.get(a.job.id) ?? 0) - (jobApiOrder.get(b.job.id) ?? 0)
-          );
-        });
-        for (let i = 0; i < childEntries.length; i++) {
-          const e = childEntries[i];
-          if (e.kind === 'layer') visitLayer(e.layer, zid, nextPath);
-          else visitJobUnderLayer(e.job, zid);
-        }
       }
+      return rows;
+    }
 
-      const rootLayers = layerChildMap.get('__root__') || [];
-      const nRoot = rootLayers.length;
-      nodes.push({
-        id: LAYER_GRAPH_ROOT_ID,
-        pId: ZROOT,
-        name:
-          nRoot <= 1
-            ? '可写层'
-            : '可写层（' + nRoot + ' 个顶层 · 同级按时间正序）',
-        title:
-          nRoot <= 1
-            ? '可写层'
-            : '可写层\n（' + nRoot + ' 个顶层，同级按创建时间旧→新）',
-        nodeKind: 'virtual',
-        ztStyle: 'virtual',
-        open: true,
+    function serialRowZtClass(ztStyle) {
+      const s = ztStyle || '';
+      if (s === 'virtual') return 'zt-virtual';
+      if (s === 'active') return 'zt-active';
+      if (s === 'no_git') return 'zt-no_git';
+      if (s === 'clean') return 'zt-clean';
+      if (s === 'dirty') return 'zt-dirty';
+      if (s === 'cycle') return 'zt-cycle';
+      return 'zt-dirty';
+    }
+
+    function clearLayerSerialActive(host) {
+      if (!host) return;
+      host.querySelectorAll('button.layer-serial-row.layer-serial-active').forEach((b) => {
+        b.classList.remove('layer-serial-active');
       });
-      for (const r of rootLayers) {
-        visitLayer(r, LAYER_GRAPH_ROOT_ID, new Set());
-      }
-      return nodes;
     }
 
     function setLayerCommitExecLog(layerId, text) {
@@ -2673,10 +2658,7 @@
       if (!selectedMindNodeId || selectedMindNodeId === LAYER_GRAPH_ROOT_ID) {
         const hint = document.createElement('span');
         hint.className = 'meta';
-        hint.textContent =
-          selectedMindNodeId === LAYER_GRAPH_ROOT_ID
-            ? '（请展开根节点「可写层」并点选子层或任务进行操作）'
-            : '（点选可写层或任务节点以查看差异与管理队列）';
+        hint.textContent = '（在串行列表中点选可写层或任务行以查看差异与管理队列）';
         bar.appendChild(hint);
         return;
       }
@@ -3097,13 +3079,6 @@
       const el = document.getElementById('layerRelationTree');
       const meta = document.getElementById('layerRelationMeta');
       if (!el) return;
-      try {
-        if (typeof jQuery !== 'undefined' && jQuery.fn && jQuery.fn.zTree) {
-          if (document.getElementById('ztree_layer_graph')) {
-            jQuery.fn.zTree.destroy('ztree_layer_graph');
-          }
-        }
-      } catch (_) {}
       el.replaceChildren();
       if (meta) meta.textContent = '';
       window.__layerGraphMaps = null;
@@ -3125,20 +3100,6 @@
         return;
       }
 
-      if (
-        typeof jQuery === 'undefined' ||
-        !jQuery.fn ||
-        typeof jQuery.fn.zTree === 'undefined'
-      ) {
-        window.__layersForMind = dedupeLayersById(layers);
-        const err = document.createElement('div');
-        err.className = 'err-msg';
-        err.textContent = 'jQuery 或 zTree 未加载，请检查 /static/vendor 下脚本是否完整。';
-        el.appendChild(err);
-        updateLayerRelationToolbar(null);
-        return;
-      }
-
       const layerList = dedupeLayersById(layers);
       window.__layersForMind = layerList;
       normalizeLayerMindApiFields(layerList);
@@ -3151,61 +3112,49 @@
       });
       sortZTreeLayerSiblings(rootLayerRows);
 
-      const zNodes = buildZTreeNodesFromLayers(layerList, jobs, layerById);
+      const serialRows = buildSerialRowsFromLayers(layerList, jobs, layerById);
 
-      const graphEl = document.createElement('ul');
-      graphEl.id = 'ztree_layer_graph';
-      graphEl.className = 'ztree';
+      const graphEl = document.createElement('div');
+      graphEl.id = 'layer_serial_graph';
+      graphEl.className = 'layer-serial-graph';
       el.appendChild(graphEl);
 
-      /* 仅改文字色：避免 fontCss 内联 background 压过 .curSelectedNode */
-      const fontCss = function (_treeId, treeNode) {
-        if (!treeNode) return {};
-        if (treeNode.nodeKind === 'virtual') {
-          return { 'font-weight': '600', color: 'var(--text)' };
-        }
-        if (treeNode.nodeKind === 'layer') {
-          const ls = treeNode.ztStyle;
-          if (ls === 'active') return { color: '#fcd34d', 'font-weight': '600' };
-          if (ls === 'no_git') return { color: '#94a3b8', 'font-weight': '600' };
-          if (ls === 'clean') return { color: '#a7f3d0', 'font-weight': '600' };
-          return { color: '#cbd5e1', 'font-weight': '600' };
-        }
-        if (treeNode.nodeKind === 'cycle') {
-          return { color: '#f87171' };
-        }
-        const s = treeNode.ztStyle;
-        if (s === 'active') return { color: '#fcd34d' };
-        if (s === 'no_git') return { color: '#94a3b8' };
-        if (s === 'clean') return { color: '#a7f3d0' };
-        return { color: '#cbd5e1' };
-      };
+      const banner = document.createElement('div');
+      banner.className = 'layer-serial-banner';
+      banner.textContent =
+        layerList.length <= 1
+          ? '可写层（串行 · 按创建时间旧→新）'
+          : '可写层（串行 · ' +
+            layerList.length +
+            ' 层 · 顶层 ' +
+            rootLayerRows.length +
+            ' 个 · 按创建时间旧→新）';
+      graphEl.appendChild(banner);
 
-      const zSetting = {
-        view: {
-          fontCss: fontCss,
-          showIcon: false,
-          nameIsHTML: false,
-          dblClickExpand: false,
-        },
-        data: {
-          simpleData: {
-            enable: true,
-            idKey: 'id',
-            pIdKey: 'pId',
-            rootPId: 0,
-          },
-        },
-        callback: {
-          onClick: function (_evt, _treeId, treeNode) {
-            if (!treeNode) return;
-            handleLayerGraphNodeSelect(treeNode.id);
-          },
-        },
-      };
+      function clickSerialMind(mindId) {
+        const btn = Array.from(graphEl.querySelectorAll('button.layer-serial-row')).find(
+          (b) => b.getAttribute('data-mind-node-id') === String(mindId),
+        );
+        if (!btn) return false;
+        clearLayerSerialActive(graphEl);
+        btn.classList.add('layer-serial-active');
+        handleLayerGraphNodeSelect(mindId);
+        return true;
+      }
 
-      jQuery.fn.zTree.init(jQuery('#ztree_layer_graph'), zSetting, zNodes);
-      window._layerZtree = jQuery.fn.zTree.getZTreeObj('ztree_layer_graph');
+      for (const row of serialRows) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'layer-serial-row' + (row.nodeKind === 'job' ? ' layer-serial-job' : '');
+        btn.classList.add(serialRowZtClass(row.ztStyle));
+        btn.setAttribute('data-mind-node-id', row.id);
+        btn.title = row.title || row.name || '';
+        btn.textContent = row.name || '';
+        btn.onclick = debounceClick(() => {
+          clickSerialMind(row.id);
+        }, BTN_DEBOUNCE_MS);
+        graphEl.appendChild(btn);
+      }
 
       const sel = document.getElementById('layerSelect');
       const currentLayer = sel && sel.value ? sel.value : null;
@@ -3262,67 +3211,26 @@
         }
         requestAnimationFrame(function () {
           try {
-            const z = window._layerZtree;
-            if (!z) return;
-            const vr = z.getNodeByParam('id', LAYER_GRAPH_ROOT_ID, null);
-            if (vr) z.expandNode(vr, true);
-            const tn = z.getNodeByParam('id', selectJobId, null);
-            if (tn) {
-              zTreeExpandAncestors(z, tn);
-              z.selectNode(tn, false);
-            } else {
-              const jsel = jobs.find((x) => x.id === selectJobId);
-              if (jsel && jsel.layer_id) {
-                const onVis = jobs.filter(
-                  (x) =>
-                    x.layer_id === jsel.layer_id && x.command_kind !== 'clone',
-                );
-                const soleOnLayer =
-                  onVis.length === 1 && onVis[0].id === selectJobId;
-                const pickLayerNode =
-                  jsel.command_kind === 'clone' || soleOnLayer;
-                if (pickLayerNode) {
-                  const ln = z.getNodeByParam('id', layerNodeId(jsel.layer_id), null);
-                  if (ln) {
-                    zTreeExpandAncestors(z, ln);
-                    z.selectNode(ln, false);
-                  }
-                }
+            if (clickSerialMind(selectJobId)) return;
+            const jsel = jobs.find((x) => x.id === selectJobId);
+            if (jsel && jsel.layer_id) {
+              const onVis = jobs.filter(
+                (x) =>
+                  x.layer_id === jsel.layer_id && x.command_kind !== 'clone',
+              );
+              const soleOnLayer = onVis.length === 1 && onVis[0].id === selectJobId;
+              const pickLayerNode = jsel.command_kind === 'clone' || soleOnLayer;
+              if (pickLayerNode) {
+                clickSerialMind(layerNodeId(jsel.layer_id));
               }
             }
-            handleLayerGraphNodeSelect(selectJobId);
           } catch (_) {}
         });
       } else if (rootLayerRows.length) {
         const l0 = rootLayerRows[0].layer_id;
         requestAnimationFrame(function () {
           try {
-            const z = window._layerZtree;
-            if (!z) return;
-            const vr = z.getNodeByParam('id', LAYER_GRAPH_ROOT_ID, null);
-            if (vr) z.expandNode(vr, true);
-            const zn = z.getNodeByParam('id', layerNodeId(l0), null);
-            if (zn) {
-              zTreeExpandAncestors(z, zn);
-              z.selectNode(zn, false);
-              handleLayerGraphNodeSelect(layerNodeId(l0));
-            } else if (vr) {
-              z.selectNode(vr, false);
-              handleLayerGraphNodeSelect(LAYER_GRAPH_ROOT_ID);
-            }
-          } catch (_) {}
-        });
-      } else {
-        requestAnimationFrame(function () {
-          try {
-            const z = window._layerZtree;
-            if (!z) return;
-            const vr = z.getNodeByParam('id', LAYER_GRAPH_ROOT_ID, null);
-            if (vr) {
-              z.expandNode(vr, true);
-              z.selectNode(vr, false);
-            }
-            handleLayerGraphNodeSelect(LAYER_GRAPH_ROOT_ID);
+            clickSerialMind(layerNodeId(l0));
           } catch (_) {}
         });
       }
@@ -3331,7 +3239,7 @@
         meta.textContent =
           '可写层 ' +
           layerList.length +
-          ' 个（按 parent_layer_id）· 顶层 ' +
+          ' 个（串行 · 按创建时间）· 顶层 ' +
           rootLayerRows.length +
           ' 个 · 任务 ' +
           jobs.length +

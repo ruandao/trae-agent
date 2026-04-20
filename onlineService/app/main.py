@@ -24,6 +24,7 @@ from starlette.staticfiles import StaticFiles
 from . import git_clone, task_api_bootstrap
 from .auth import AuthDep
 from .git_clone import (
+    _git_core_ssh_command_args,
     clear_clone_layer_log,
     clone_into_new_layer,
     get_clone_layer_log_text,
@@ -34,11 +35,12 @@ from .jobs import JobRecord, job_layer_git_destructive_locked, store
 from .layer_changes_saas_push import run_layer_changes_saas_push_loop
 from .layer_fs import (
     any_layer_has_git_repo,
-    infer_layer_parent_from_workspace,
+    ensure_startup_empty_layer_id,
     list_layer_children,
     list_layer_files,
     list_layers,
     read_layer_file,
+    resolved_parent_layer_id,
 )
 from .layer_git import (
     commit_layer_worktree,
@@ -58,7 +60,7 @@ from .layer_graph_saas_push import (
     push_layer_graph_snapshot_if_changed,
     run_layer_graph_saas_push_loop,
 )
-from .layers import create_empty_layer, new_layer_id
+from .layer_meta import read_layer_meta
 from .online_project_view import get_online_project_active_info, set_online_project_tip
 from .paths import (
     config_file_path,
@@ -107,13 +109,14 @@ async def _lifespan(_app: FastAPI):
             "(set TASK_API_BOOTSTRAP_STRICT_STARTUP=1 to fail-fast)"
         )
 
-    empty_layer_id = new_layer_id()
     try:
-        await asyncio.to_thread(create_empty_layer, empty_layer_id)
-        _startup_empty_layer_id = empty_layer_id
-        log.info("startup: 创建空层级节点 layer_id=%s", empty_layer_id)
+        jobs_for_empty = await asyncio.to_thread(store.list_jobs)
+        eid = await asyncio.to_thread(ensure_startup_empty_layer_id, jobs_for_empty)
+        _startup_empty_layer_id = eid
+        if eid:
+            log.info("startup: 空层级节点 layer_id=%s（复用或新建，并已清理未引用的重复空层）", eid)
     except Exception:
-        log.exception("startup: 创建空层级节点失败")
+        log.exception("startup: 空层级节点初始化失败")
 
     bs_lid = task_api_bootstrap.bootstrap_clone_layer_id
     if bs_lid:
@@ -261,7 +264,8 @@ def _parse_token_int(value: Any) -> int | None:
 def _step_token_total(step: Any) -> int | None:
     if not isinstance(step, dict):
         return None
-    usage = step.get("llm_response", {}).get("usage")
+    lr = step.get("llm_response")
+    usage = lr.get("usage") if isinstance(lr, dict) else None
     if not isinstance(usage, dict):
         usage = step.get("usage")
     if not isinstance(usage, dict):
@@ -380,6 +384,11 @@ class RepoRecloneBody(BaseModel):
     """重新克隆仓库：删除容器内旧克隆目录并重新克隆。"""
 
     repo_url: str = Field(..., min_length=1, max_length=4096)
+    ephemeral_ssh_private_key: str | None = Field(
+        default=None,
+        max_length=65536,
+        description="SaaS 下发的临时 SSH 私钥；与引导克隆一致，HTTPS 远程将按 SSH 形式克隆。",
+    )
 
 
 class ProjectViewBody(BaseModel):
@@ -653,28 +662,28 @@ async def api_bootstrap_clone_log(_: AuthDep) -> dict[str, Any]:
 async def repo_reclone(_: AuthDep, body: RepoRecloneBody) -> dict[str, Any]:
     """重新克隆仓库：删除容器内旧克隆目录并重新克隆。
 
-    用于处理克隆一半失败的情况。在 bootstrap_clone_layer_id 对应的层中找到对应仓库目录，
-    删除后重新克隆。
+    优先使用引导克隆层；若内存中未记录（启动异常、跳过克隆等），则根据磁盘上的仓库目录、
+    ``onlineProject`` 指向的层解析；仍无时新建一层并克隆。
     """
     from .layers import layer_path
     from .task_api_bootstrap import (
         _bootstrap_git_clone_timeout_sec,
+        _bootstrap_write_ssh_keyfile,
         _clone_subprocess_env,
+        _git_clone_remote_for_ssh_pem,
         _git_config_prefix,
         _make_ipv4_curl_config_file,
         _max_clone_attempts,
         _repo_dir_name_from_url,
         _sleep_before_retry,
-        bootstrap_clone_layer_id,
+        default_repo_dir_for_reclone,
+        ensure_reclone_layer_id,
+        find_existing_repo_dir_in_layer,
     )
 
-    lid = bootstrap_clone_layer_id
-    if not lid:
-        raise HTTPException(
-            status_code=400,
-            detail="容器启动引导克隆层不存在，无法重新克隆",
-        )
-
+    repo_url = body.repo_url.strip()
+    repo_dir_name = _repo_dir_name_from_url(repo_url)
+    lid = ensure_reclone_layer_id(repo_url)
     layer_root = layer_path(lid)
     if not layer_root.is_dir():
         raise HTTPException(
@@ -682,32 +691,53 @@ async def repo_reclone(_: AuthDep, body: RepoRecloneBody) -> dict[str, Any]:
             detail=f"克隆层目录不存在: {lid}",
         )
 
-    repo_url = body.repo_url.strip()
-    repo_dir_name = _repo_dir_name_from_url(repo_url)
-    repo_dir = layer_root / repo_dir_name
+    existing = find_existing_repo_dir_in_layer(lid, repo_dir_name)
+    repo_dir = existing if existing else default_repo_dir_for_reclone(lid, repo_dir_name)
 
-    if not repo_dir.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"仓库目录不存在: {repo_dir_name}",
-        )
-
-    log.info("reclone: 删除旧克隆目录 %s 并重新克隆 %s", repo_dir.name, repo_url[:200])
-
-    shutil.rmtree(repo_dir, ignore_errors=True)
+    if repo_dir.exists():
+        log.info("reclone: 删除旧克隆目录 %s 并重新克隆 %s", repo_dir.name, repo_url[:200])
+        shutil.rmtree(repo_dir, ignore_errors=True)
+    else:
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        log.info("reclone: 在层 %s 路径 %s 首次克隆 %s", lid, repo_dir.name, repo_url[:200])
 
     tout = _bootstrap_git_clone_timeout_sec()
     max_attempts = _max_clone_attempts()
     git_env = _clone_subprocess_env()
+    pem = (body.ephemeral_ssh_private_key or "").strip()
+    if not pem and repo_url.lower().startswith("https://"):
+        log.warning(
+            "reclone: 未收到 ephemeral_ssh_private_key，将使用 HTTPS 克隆（私有仓库通常会失败）；"
+            "请确认 SaaS 已解析身份并转发私钥"
+        )
+    _ssh_url_via_env = os.environ.get("GIT_CLONE_USE_SSH_URL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if pem or _ssh_url_via_env and repo_url.lower().startswith("https://"):
+        clone_remote = _git_clone_remote_for_ssh_pem(repo_url)
+    else:
+        clone_remote = repo_url
 
     for attempt in range(max_attempts):
         ipv4_curl_cfg = None
+        ssh_keyfile: str | None = None
         try:
             ipv4_curl_cfg = _make_ipv4_curl_config_file()
+            if pem:
+                ssh_keyfile = await asyncio.to_thread(_bootstrap_write_ssh_keyfile, pem)
             cmd = list(_git_config_prefix())
             if ipv4_curl_cfg is not None:
                 cmd.extend(["-c", f"http.curlConfig={ipv4_curl_cfg}"])
-            cmd.extend(["clone", "--progress", repo_url, str(repo_dir)])
+            if ssh_keyfile:
+                cmd.extend(
+                    _git_core_ssh_command_args(
+                        ssh_keyfile,
+                        user_known_hosts_file_dev_null=True,
+                    )
+                )
+            cmd.extend(["clone", "--progress", clone_remote, str(repo_dir)])
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -758,6 +788,10 @@ async def repo_reclone(_: AuthDep, body: RepoRecloneBody) -> dict[str, Any]:
                 log.info(
                     "reclone 完成: %s HEAD=%s", repo_dir.name, head_sha[:12] if head_sha else "?"
                 )
+                try:
+                    await asyncio.to_thread(set_online_project_tip, lid)
+                except Exception:
+                    log.exception("reclone: 无法更新 onlineProject 指向层 %s", lid)
                 return {
                     "status": "ok",
                     "repo_url": repo_url,
@@ -810,6 +844,9 @@ async def repo_reclone(_: AuthDep, body: RepoRecloneBody) -> dict[str, Any]:
                 },
             ) from None
         finally:
+            if ssh_keyfile is not None:
+                with suppress(OSError):
+                    os.unlink(ssh_keyfile)
             if ipv4_curl_cfg is not None:
                 with suppress(OSError):
                     ipv4_curl_cfg.unlink(missing_ok=True)
@@ -1089,11 +1126,11 @@ async def api_git_identity_set(_: AuthDep, body: GitIdentityBody) -> dict[str, A
 
 @app.get("/api/layers/{layer_id}/diff/parent/files")
 async def api_layer_diff_parent_files(_: AuthDep, layer_id: str) -> dict[str, Any]:
-    """子层相对已解析父层的变动路径列表（``diff -rq -x .git`` 解析摘要）。"""
+    """子层相对已解析父层的变动路径列表（``diff -rq`` 解析摘要，含 ``.git``）。"""
     layers = await asyncio.to_thread(list_layers)
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
     jobs = await asyncio.to_thread(store.list_jobs)
-    parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
+    parent = resolved_parent_layer_id(layer_id, known_ids, jobs)
     if not parent:
         return {
             "layer_id": layer_id,
@@ -1112,11 +1149,11 @@ async def api_layer_diff_parent_file(
     layer_id: str,
     path: str = Query(..., min_length=1, description="层内相对 POSIX 路径"),
 ) -> dict[str, Any]:
-    """单路径相对已解析父层的 unified diff（文件 ``diff -uN``；目录树 ``diff -ruN -x .git``）。"""
+    """单路径相对已解析父层的 unified diff（文件 ``diff -uN``；目录 ``diff -ruN``，含 ``.git``）。"""
     layers = await asyncio.to_thread(list_layers)
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
     jobs = await asyncio.to_thread(store.list_jobs)
-    parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
+    parent = resolved_parent_layer_id(layer_id, known_ids, jobs)
     if not parent:
         raise HTTPException(
             status_code=400,
@@ -1127,11 +1164,11 @@ async def api_layer_diff_parent_file(
 
 @app.get("/api/layers/{layer_id}/diff/parent")
 async def api_layer_diff_parent(_: AuthDep, layer_id: str) -> dict[str, Any]:
-    """当前可写层工作区目录与已解析父层目录的差异（``diff -ruN -x .git``）。"""
+    """当前可写层工作区目录与已解析父层目录的差异（``diff -ruN``，含 ``.git``）。"""
     layers = list_layers()
     known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
     jobs = store.list_jobs()
-    parent = _resolved_parent_layer_id(layer_id, known_ids, jobs)
+    parent = resolved_parent_layer_id(layer_id, known_ids, jobs)
     if not parent:
         return {
             "layer_id": layer_id,
@@ -1175,33 +1212,6 @@ async def api_get_empty_root_layer(_: AuthDep) -> dict[str, Any]:
     return {"layer_id": _startup_empty_layer_id}
 
 
-def _layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
-    """无 ``.git`` 符号链接时（例如旧版逐层复制），用任务记录推断父层。"""
-    job_by_layer: dict[str, Any] = {}
-    for j in jobs:
-        if j.layer_id not in job_by_layer:
-            job_by_layer[j.layer_id] = j
-    by_id = {j.id: j for j in jobs}
-    j = job_by_layer.get(layer_id)
-    if not j:
-        return None
-    if j.parent_job_id:
-        p = by_id.get(j.parent_job_id)
-        return str(p.layer_id) if p else None
-    if j.repo_layer_id:
-        return str(j.repo_layer_id)
-    return None
-
-
-def _resolved_parent_layer_id(layer_id: str, known_ids: set[str], jobs: list[Any]) -> str | None:
-    p = infer_layer_parent_from_workspace(str(layer_id)) or _layer_parent_from_jobs(
-        str(layer_id), jobs
-    )
-    if p and p in known_ids:
-        return p
-    return None
-
-
 async def _layer_git_meta(lid: str) -> tuple[bool | None, dict[str, Any]]:
     """在线程中跑 git 子进程，避免阻塞事件循环。
 
@@ -1212,12 +1222,24 @@ async def _layer_git_meta(lid: str) -> tuple[bool | None, dict[str, Any]]:
     return dirty, remote
 
 
+def _layer_row_is_empty_anchor(layer_id: str) -> bool:
+    """仅含 ``layer_meta.kind=empty`` 的锚点层：供克隆 API 使用，不进入层关系 UI 列表。"""
+    if not layer_id:
+        return False
+    m = read_layer_meta(layer_id)
+    return m is not None and m.kind == "empty"
+
+
 async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
     """与 GET /api/layers 相同的层列表富集逻辑，并附带 jobs 列表供 SaaS 评论区 zTree。"""
     layers, jobs = await asyncio.gather(
         asyncio.to_thread(list_layers),
         asyncio.to_thread(store.list_jobs),
     )
+    # ``kind=empty`` 仅作克隆父锚点，不应出现在串行列表（避免每次重启多一条「无 git」空层）
+    layers = [
+        x for x in layers if not _layer_row_is_empty_anchor(str(x.get("layer_id") or "").strip())
+    ]
     cmd_by_layer_id: dict[str, str] = {j.layer_id: j.command for j in jobs}
     job_by_layer_id: dict[str, JobRecord] = {}
     for j in jobs:
@@ -1232,7 +1254,10 @@ async def build_layer_graph_snapshot_for_saas() -> dict[str, Any]:
         lid_s = str(lid)
         if lid_s in cmd_by_layer_id:
             item["command"] = cmd_by_layer_id[lid_s]
-        item["parent_layer_id"] = _resolved_parent_layer_id(lid_s, known_ids, jobs)
+        lm = read_layer_meta(lid_s)
+        if lm:
+            item["meta_kind"] = lm.kind
+        item["parent_layer_id"] = resolved_parent_layer_id(lid_s, known_ids, jobs)
         jrec = job_by_layer_id.get(lid_s)
         if jrec:
             item["job_id"] = jrec.id

@@ -57,6 +57,26 @@ def reset_before_each_test(request: pytest.FixtureRequest, page: Page) -> None:
 
 
 @pytest.mark.skip_reset
+def test_api_layers_excludes_empty_anchor_kind(page: Page) -> None:
+    """GET /api/layers 不应列出 layer_meta.kind=empty 的锚点层（仅克隆 API 使用，避免重启堆积「无 git」行）。"""
+    page.goto(_ui_url(), wait_until="domcontentloaded", timeout=25_000)
+    page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
+    j = page.evaluate(
+        """async (token) => {
+          const u = new URL('/api/layers', location.origin);
+          u.searchParams.set('access_token', token);
+          const r = await fetch(u.toString(), { headers: { 'X-Access-Token': token } });
+          return r.json();
+        }""",
+        ACCESS_TOKEN,
+    )
+    assert isinstance(j, dict)
+    for x in j.get("layers") or []:
+        mk = x.get("meta_kind")
+        assert mk != "empty", f"不应暴露 empty 锚点层: {x}"
+
+
+@pytest.mark.skip_reset
 def test_localhost_hostname_ui_page_loads(page: Page) -> None:
     """run_local 默认端口下，浏览器使用 http://localhost（非仅 127.0.0.1）应能打开 /ui/<token>。"""
     port = os.environ.get("PORT", "8765")
@@ -216,8 +236,8 @@ def test_after_reset_new_task_is_locked(page: Page) -> None:
     expect(msg).to_contain_text("克隆")
 
 
-def test_clone_layer_ztree_has_no_duplicate_clone_job_node(page: Page) -> None:
-    """克隆完成后：zTree 中该层仅一层节点展示克隆信息，不再挂一条重复的 command_kind=clone 任务子节点。"""
+def test_clone_layer_serial_has_no_duplicate_clone_job_row(page: Page) -> None:
+    """克隆完成后：串行列表中仅可写层行展示克隆层，不另挂 command_kind=clone 的任务行。"""
     page.locator("#cloneUrl").fill(TEST_REPO)
     page.locator("#cloneDepth").fill("1")
     page.locator("#btnClone").click()
@@ -227,7 +247,7 @@ def test_clone_layer_ztree_has_no_duplicate_clone_job_node(page: Page) -> None:
 
     page.locator("#btnRefresh").click()
     page.wait_for_function(
-        """() => document.getElementById('ztree_layer_graph') !== null""",
+        """() => document.getElementById('layer_serial_graph') !== null""",
         timeout=60_000,
     )
 
@@ -240,24 +260,143 @@ def test_clone_layer_ztree_has_no_duplicate_clone_job_node(page: Page) -> None:
       ).then((r) => r.json());
       const tip = pa.active_tip_layer_id;
       if (!tip) return { ok: false, reason: 'no active_tip_layer_id' };
-      const z = jQuery.fn.zTree.getZTreeObj('ztree_layer_graph');
-      if (!z) return { ok: false, reason: 'no ztree' };
-      const n = z.getNodeByParam('id', '__layer__:' + tip, null);
-      if (!n) return { ok: false, reason: 'no layer znode for tip', tip };
-      const kids = n.children || [];
-      const PREFIX = '__layer__:';
-      const jobLike = kids.filter((c) => {
-        const id = String(c.id);
-        return (
-          id.indexOf(PREFIX) !== 0 &&
-          id !== '__layer_graph_root__' &&
-          id.indexOf('cycle_') !== 0
-        );
-      });
-      return { ok: jobLike.length === 0, tip, childCount: kids.length, jobLike: jobLike.length };
+      const host = document.getElementById('layer_serial_graph');
+      if (!host) return { ok: false, reason: 'no layer_serial_graph' };
+      const nid = '__layer__:' + tip;
+      const layerBtn = Array.from(host.querySelectorAll('button.layer-serial-row')).find(
+        (b) => b.getAttribute('data-mind-node-id') === nid
+      );
+      if (!layerBtn) return { ok: false, reason: 'no serial row for tip layer', tip };
+      const jobRows = host.querySelectorAll('button.layer-serial-row.layer-serial-job');
+      return { ok: jobRows.length === 0, tip, nJobRows: jobRows.length };
     }"""
     )
     assert probe.get("ok") is True, probe
+
+
+def test_recreate_from_upper_layer_clears_descendant_layers(page: Page) -> None:
+    """选中克隆层（该层有代表任务）后两次「创建并执行」：中间子层应被替换而非累加。
+
+    回归：仅用 repo_layer_id 清理时，UI 走 parent_job_id 路径会跳过清理，可写层数递增。
+    """
+    page.locator("#cloneUrl").fill(TEST_REPO)
+    page.locator("#cloneDepth").fill("1")
+    page.locator("#btnClone").click()
+
+    expect(page.locator("#btnClone")).to_be_enabled(timeout=300_000)
+    expect(page.locator("#cloneErr")).to_have_text("", timeout=10_000)
+
+    page.wait_for_function(
+        """() => document.querySelector('#layerRelationActions textarea') !== null""",
+        timeout=120_000,
+    )
+
+    tip = page.evaluate(
+        """async (token) => {
+          const u = new URL('/api/project/active', location.origin);
+          u.searchParams.set('access_token', token);
+          const r = await fetch(u.toString(), { headers: { 'X-Access-Token': token } });
+          const j = await r.json();
+          return j.active_tip_layer_id;
+        }""",
+        ACCESS_TOKEN,
+    )
+    assert isinstance(tip, str) and len(tip) > 4
+
+    mind_id = "__layer__:" + tip
+    page.locator(f'button.layer-serial-row[data-mind-node-id="{mind_id}"]').click()
+    cmd_ta = page.locator("#layerRelationActions textarea[data-testid=layer-new-job-command]")
+    cmd_ta.wait_for(state="visible", timeout=15_000)
+    cmd_ta.fill("echo e2e-upper-sweep-1")
+    page.locator("#layerRelationActions select[data-testid=layer-new-job-kind]").select_option(
+        "shell"
+    )
+
+    with page.expect_response(
+        lambda r: r.request.method == "POST"
+        and "/api/jobs" in r.url
+        and "/redo" not in r.url
+        and "/interrupt" not in r.url
+        and "/reset" not in r.url,
+        timeout=60_000,
+    ) as post_job:
+        page.locator("#layerRelationActions").get_by_role("button", name="创建并执行").click()
+    assert post_job.value.ok, post_job.value.text()
+
+    page.wait_for_function(
+        """async (token) => {
+          const u = new URL('/api/jobs', location.origin);
+          u.searchParams.set('access_token', token);
+          const r = await fetch(u.toString(), { headers: { 'X-Access-Token': token } });
+          const j = await r.json();
+          const jobs = j.jobs || [];
+          const shell = jobs.filter((x) =>
+            x.command_kind === 'shell' && String(x.command || '').indexOf('e2e-upper-sweep-1') >= 0
+          );
+          return shell.length >= 1 && shell[0].status === 'completed';
+        }""",
+        ACCESS_TOKEN,
+        timeout=120_000,
+    )
+
+    n1 = page.evaluate(
+        """async (token) => {
+          const u = new URL('/api/layers', location.origin);
+          u.searchParams.set('access_token', token);
+          const r = await fetch(u.toString(), { headers: { 'X-Access-Token': token } });
+          const j = await r.json();
+          return (j.layers || []).length;
+        }""",
+        ACCESS_TOKEN,
+    )
+
+    page.locator(f'button.layer-serial-row[data-mind-node-id="{mind_id}"]').click()
+    cmd_ta2 = page.locator("#layerRelationActions textarea[data-testid=layer-new-job-command]")
+    cmd_ta2.wait_for(state="visible", timeout=15_000)
+    cmd_ta2.fill("echo e2e-upper-sweep-2")
+    page.locator("#layerRelationActions select[data-testid=layer-new-job-kind]").select_option(
+        "shell"
+    )
+
+    with page.expect_response(
+        lambda r: r.request.method == "POST"
+        and "/api/jobs" in r.url
+        and "/redo" not in r.url
+        and "/interrupt" not in r.url
+        and "/reset" not in r.url,
+        timeout=60_000,
+    ) as post_job2:
+        page.locator("#layerRelationActions").get_by_role("button", name="创建并执行").click()
+    assert post_job2.value.ok, post_job2.value.text()
+
+    page.wait_for_function(
+        """async (token) => {
+          const u = new URL('/api/jobs', location.origin);
+          u.searchParams.set('access_token', token);
+          const r = await fetch(u.toString(), { headers: { 'X-Access-Token': token } });
+          const j = await r.json();
+          const jobs = j.jobs || [];
+          const shell = jobs.filter((x) =>
+            x.command_kind === 'shell' && String(x.command || '').indexOf('e2e-upper-sweep-2') >= 0
+          );
+          return shell.length >= 1 && shell[0].status === 'completed';
+        }""",
+        ACCESS_TOKEN,
+        timeout=120_000,
+    )
+
+    n2 = page.evaluate(
+        """async (token) => {
+          const u = new URL('/api/layers', location.origin);
+          u.searchParams.set('access_token', token);
+          const r = await fetch(u.toString(), { headers: { 'X-Access-Token': token } });
+          const j = await r.json();
+          return (j.layers || []).length;
+        }""",
+        ACCESS_TOKEN,
+    )
+
+    assert n1 == n2, f"第二次从上层创建后层数应不变（替换子层），得到 n1={n1} n2={n2}"
 
 
 def test_shallow_clone_somanyad_unlocks_new_task_and_gate_api(page: Page) -> None:
@@ -369,8 +508,8 @@ def test_redo_button(page: Page) -> None:
 
 
 @pytest.mark.skip_reset
-def test_ztree_layer_nodes_unique_and_match_deduped_api(page: Page) -> None:
-    """zTree 层节点与 API 去重后层数一致；所有 zNode.id 唯一，且无重复 __layer__ 前缀节点。"""
+def test_serial_layer_rows_unique_and_match_deduped_api(page: Page) -> None:
+    """串行列表中层行与 API 去重后层数一致；所有 data-mind-node-id 唯一，且无重复 __layer__ 前缀。"""
     page.goto(_ui_url(), wait_until="domcontentloaded", timeout=25_000)
     page.locator("#btnRefresh").wait_for(state="visible", timeout=15_000)
     page.locator("#btnRefresh").click()
@@ -381,8 +520,7 @@ def test_ztree_layer_nodes_unique_and_match_deduped_api(page: Page) -> None:
           if (!host) return false;
           const t = host.textContent || '';
           if (t.includes('暂无可写层')) return true;
-          const ul = document.getElementById('ztree_layer_graph');
-          return ul !== null;
+          return document.getElementById('layer_serial_graph') !== null;
         }""",
         timeout=25_000,
     )
@@ -394,22 +532,15 @@ def test_ztree_layer_nodes_unique_and_match_deduped_api(page: Page) -> None:
       if (hint.includes('暂无可写层')) {
         return { skip: true, reason: 'no writable layers in this environment' };
       }
-      const ul = document.getElementById('ztree_layer_graph');
-      if (!ul) {
-        return { ok: false, reason: 'missing #ztree_layer_graph though layers expected' };
+      const graph = document.getElementById('layer_serial_graph');
+      if (!graph) {
+        return { ok: false, reason: 'missing #layer_serial_graph though layers expected' };
       }
-      if (typeof jQuery === 'undefined' || !jQuery.fn || !jQuery.fn.zTree) {
-        return { ok: false, reason: 'jQuery/zTree not on page' };
-      }
-      const z = jQuery.fn.zTree.getZTreeObj('ztree_layer_graph');
-      if (!z) {
-        return { ok: false, reason: 'zTree instance missing' };
-      }
-      const nodes = z.transformToArray(z.getNodes());
-      const ids = nodes.map((n) => n.id);
+      const btns = Array.from(graph.querySelectorAll('button.layer-serial-row'));
+      const ids = btns.map((b) => b.getAttribute('data-mind-node-id')).filter(Boolean);
       const idSet = new Set(ids);
       if (ids.length !== idSet.size) {
-        return { ok: false, reason: 'duplicate zTree id', n: ids.length, uniq: idSet.size };
+        return { ok: false, reason: 'duplicate mind node id', n: ids.length, uniq: idSet.size };
       }
       const PREFIX = '__layer__:';
       const layerStrip = ids
@@ -418,7 +549,7 @@ def test_ztree_layer_nodes_unique_and_match_deduped_api(page: Page) -> None:
         .map((id) => id.slice(PREFIX.length));
       const layerSet = new Set(layerStrip);
       if (layerStrip.length !== layerSet.size) {
-        return { ok: false, reason: 'duplicate layer znode for same layer_id', layerStrip };
+        return { ok: false, reason: 'duplicate layer row for same layer_id', layerStrip };
       }
       let r;
       try {
@@ -450,12 +581,12 @@ def test_ztree_layer_nodes_unique_and_match_deduped_api(page: Page) -> None:
       if (by.size !== layerStrip.length) {
         return {
           ok: false,
-          reason: 'deduped API layer count !== zTree layer nodes',
+          reason: 'deduped API layer count !== serial layer rows',
           apiDeduped: by.size,
-          zLayerNodes: layerStrip.length,
+          serialLayerRows: layerStrip.length,
         };
       }
-      return { ok: true, apiDeduped: by.size, zNodes: nodes.length };
+      return { ok: true, apiDeduped: by.size, serialRows: btns.length };
     }"""
     )
     if result.get("skip"):

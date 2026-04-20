@@ -48,13 +48,18 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/repos/clone` | JSON：`url`（必填），`branch`、`depth`、`ssh_identity_file`、`ephemeral_ssh_private_key`（可选）。在新可写层目录内执行 `git clone`；成功返回 `layer_id`、`layer_path`、`output`。失败时 400，响应体可含 `exit_code`、`output`。克隆过程与结果会通过 SSE 推送（见下文）。 |
+| `POST` | `/api/repos/clone` | JSON：`url`（必填），`branch`、`depth`、`ssh_identity_file`、`ephemeral_ssh_private_key`、`parent_layer_id`（可选）。在新可写层目录内执行 `git clone`；成功返回 `layer_id`、`layer_path`、`output`。失败时 400，响应体可含 `exit_code`、`output`。克隆过程与结果会通过 SSE 推送（见下文）。 |
 
 - **`ssh_identity_file`**（可选）：本机可读 SSH **私钥文件路径**（非密钥内容）。用于 `git@host:…`、`ssh://…` 等 SSH 克隆。服务端会先 `Path.resolve()` 为**绝对路径**，再在 `git clone` 命令中注入
   `-c core.sshCommand='ssh -i <绝对路径> -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'`
   与在 Shell 中手写 `git clone -c core.sshCommand="ssh -i …" <url>` 等价；**不**再为克隆子进程设置 `GIT_SSH_COMMAND`。路径须存在且为常规文件，否则 400。
 - **`ephemeral_ssh_private_key`**（可选）：单次请求临时 SSH 私钥（PEM 文本）。服务端将其写入临时文件（权限 600），用于 `git@` / `ssh://` 克隆；克隆结束后自动删除。若 URL 为 HTTPS（如 `https://github.com/…`）且提供私钥，服务端会自动将远程转换为 SSH 形式（如 `git@github.com:…`）以配合 `GIT_SSH_COMMAND`。适用于私有仓库克隆或无服务器本机密钥的场景。
 - 容器启动引导中的多仓克隆（`task_api_bootstrap`）在持有 PEM 时同样通过 **`git -c core.sshCommand=…`** 使用临时密钥文件（含 `UserKnownHostsFile=/dev/null`），与 UI 克隆路径一致。
+- **`parent_layer_id`**（可选）：父可写层 `layer_id`。Web 控制台在克隆前会请求 `GET /api/layers/empty-root` 取得当前空层锚点，并在本字段中传入，使克隆层在层关系上挂到该父层下；脚本也可自行指定任意已存在的父层。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/repos/reclone` | JSON：`repo_url`（必填）。在**容器引导**已克隆的共享层内，删除对应仓库子目录并重新 `git clone`（带重试）；用于修复半失败克隆。非容器场景可能不适用。 |
 
 ## 任务门控
 
@@ -68,7 +73,7 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/jobs` | JSON 正文字段：`command`（必填，非空字符串）、`parent_job_id`（可选）、`repo_layer_id`（可选）、`git_branch`（可选）。 |
+| `POST` | `/api/jobs` | JSON 正文字段：`command`（必填，非空字符串）、`command_kind`（`trae` \| `shell`，默认 `trae`）、`parent_job_id`（可选）、`repo_layer_id`（可选）、`git_branch`（可选）、`env`（可选：附加环境变量键值对）。 |
 | `GET` | `/api/jobs` | 返回 `{ "jobs": [ ... ] }`，每条为任务记录并额外包含 `git_destructive_locked`（布尔）：若任务开始后工作区 `HEAD` 相对记录基线已变化，则禁止中断、重做、继续、删除等破坏性操作。 |
 | `GET` | `/api/jobs/{job_id}` | 单条任务详情（同上结构）。 |
 | `GET` | `/api/jobs/{job_id}/parent` | 父任务：根任务返回 `parent: null`；若父记录缺失则带 `note`。 |
@@ -77,12 +82,14 @@
 ### `POST /api/jobs` 行为说明
 
 - **前置**：已存在有效 `service_config.yaml`、venv 可激活，且全局已有至少一层含 `.git`（通常来自克隆）。
-- **无 `parent_job_id` 且无 `repo_layer_id`**：在 `onlineProject/layers/<layer_id>/` 新建**空**根层再执行。
+- **无 `parent_job_id` 且无 `repo_layer_id`**：在可写层根目录下（默认 `{REPO_ROOT}/onlineProject_state/layers/<layer_id>/`，见 `ONLINE_PROJECT_LAYERS`）新建**空**根层再执行。
 - **`parent_job_id` 有值**：从父任务对应目录**复制**出新层（不复制 `.git`，子层通过符号链接共享父层 `.git`），再执行。不可与 `repo_layer_id` 同时出现。
 - **`repo_layer_id` 有值**（且无父任务）：从指定 `layer_id` 对应目录复制出新层并链接 `.git`，再执行。
+- **叠层前清理**：只要本次创建会基于某一**父可写层**叠新层（由 `repo_layer_id` 或 `parent_job_id` 解析出的父层目录），服务端会**先**删除该父层在磁盘上、在层关系图中解析出的**所有直接子可写层**（每个子层按 `DELETE /api/layers/{id}` 语义递归删任务与子层）。这样从同一上层再次「创建并执行」时不会堆积中间子层；Web 上选中**已有代表任务**的可写层时通常走 `parent_job_id` 路径，同样适用。
 - **`git_branch`**：任务启动前在工作区内执行 `git checkout`；须同时提供 `parent_job_id` 或 `repo_layer_id`（不能单独用于纯空根层）。
-- 执行命令等价于：
-  `source <venv>/bin/activate && trae-cli run "<command>" --config-file=<service_config.yaml> --working-dir=<层目录>`
+- **`command_kind=trae`**（默认）：等价于
+  `source <venv>/bin/activate && trae-cli run "<command>" --config-file=<service_config.yaml> --working-dir=<层目录>`。
+- **`command_kind=shell`**：在层工作区内以 `bash -lc` 执行指令全文，**不**经 `trae-cli`。
 - 「继续」类任务在内部使用 `trae-cli run "继续"` 并保留先前输出（见 `POST .../continue`）。
 
 ### 运行中控制与清理
@@ -101,7 +108,8 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/api/layers` | 列出可写层；每项可含 `command`（若当前任务列表中有对应层）、`parent_layer_id`、`git_worktree_dirty` 等。 |
+| `GET` | `/api/layers` | 列出可写层；每项可含 `command`、`parent_layer_id`、`job_id`、`job_status`、`queue_depth`、`mind_state`、`git_worktree_dirty`、`git_remote`、`meta_kind` 等。其中 **`meta_kind`** 来自 `layer_meta.json`：一般为 `clone` 或 `job`。**不会**返回 `meta_kind=empty` 的层（见下文「空层锚点」）。 |
+| `GET` | `/api/layers/empty-root` | 返回 `layer_id`：当前进程用于克隆父挂载的**空层锚点**。服务启动时会**复用**磁盘上已有的 `kind=empty` 目录（按 `layer_id` 升序取最早一条），必要时新建；并尝试删除**未被引用**的重复空层目录（避免多次重启堆积「无 git」空目录）。 |
 | `GET` | `/api/layers/{layer_id}/files` | 查询参数：`prefix`（可选路径前缀）、`max_files`（默认 2000，上限 5000）。 |
 | `GET` | `/api/layers/{layer_id}/files/{file_rel_posix}` | 读取单文件；可选 `max_bytes`、`max_text_chars` 限制返回大小。路径为层内相对 POSIX 路径。 |
 | `GET` | `/api/layers/{layer_id}/children` | 列目录子项；查询参数：`dir`（相对路径，默认根）、`prefix`、`offset`、`limit`。 |
@@ -114,6 +122,11 @@
 | `GET` | `/api/repos/bootstrap-clone-log` | 容器引导阶段批量克隆的日志；无进行中的引导时 `layer_id` 可能为 `null`。 |
 | `POST` | `/api/project/view` | JSON：`layer_id`。将仓库根下 `onlineProject` 符号链接指向该层 tip（物化或层目录）。 |
 | `GET` | `/api/project/active` | 解析当前 `onlineProject` 指向与 `active_tip_layer_id` 等。 |
+
+### 空层锚点（`layer_meta.kind=empty`）
+
+- 服务启动时在 `layers/` 下保证存在一个 **`layer_meta.json` 中 `kind` 为 `empty`** 的目录，仅作克隆时父指针与层关系根，**不含** `base/`、`diff/` 与 git 工作区。
+- **`GET /api/layers` 的列表不包含这些锚点层**，避免在串行列表中出现多条「无 git」占位行；克隆仍通过 `GET /api/layers/empty-root` + `POST /api/repos/clone` 的 `parent_layer_id` 使用它们。
 
 ## 层内 Git
 
@@ -142,6 +155,7 @@
 - `repo_cloned` — 克隆成功后的补充事件。
 - `job_created`、`job_started`、`job_output`（含 `chunk`）、`job_finished` — 任务生命周期。
 - `job_interrupt_requested`、`job_redone`、`job_continued`、`job_deleted`。
+- `layer_deleted` — 某可写层目录已删除（含通过删除任务或 `DELETE /api/layers/…`）。
 - `jobs_reset` — 全局重置完成。
 
 ## Web 控制台
@@ -161,7 +175,8 @@
 | `GET` | `/api/config` | 拉取当前 YAML 到编辑区。 |
 | `POST` | `/api/project/view` | JSON：`{"layer_id":"…"}`，切换「层 / 任务」选择时更新 `onlineProject` 指向。 |
 | `GET` | `/api/requirements/task-gate` | 是否允许新建任务（`clone_done`）。 |
-| `POST` | `/api/repos/clone` | 克隆到新建可写层；JSON 可含 `ssh_identity_file`（服务器本机私钥路径）或 `ephemeral_ssh_private_key`（粘贴的 PEM 私钥内容）。页面对应「SSH 私钥路径」与「SSH 私钥内容」两个输入框。 |
+| `GET` | `/api/layers/empty-root` | 克隆前取空层锚点 `layer_id`，用于 `POST /api/repos/clone` 的 `parent_layer_id`。 |
+| `POST` | `/api/repos/clone` | 克隆到新建可写层；JSON 可含 `parent_layer_id`、`ssh_identity_file`（服务器本机私钥路径）或 `ephemeral_ssh_private_key`（粘贴的 PEM 私钥内容）。页面对应「SSH 私钥路径」与「SSH 私钥内容」两个输入框。 |
 | `GET` | `/api/repos/clone-log/{layer_id}` | 克隆日志轮询。 |
 | `GET` | `/api/repos/bootstrap-clone-log` | 启动引导批量克隆日志。 |
 | `GET` | `/api/jobs` | 任务列表与卡片。 |
@@ -174,7 +189,7 @@
 | `POST` | `/api/jobs/{job_id}/continue` | 继续（仅 `interrupted`）。 |
 | `DELETE` | `/api/jobs/{job_id}` | 删除任务。 |
 | `POST` | `/api/jobs/reset` | 「重置（中断并清空）」。 |
-| `GET` | `/api/layers` | 下拉与 zTree 层图；含 `git_worktree_dirty`、`git_remote` 等。 |
+| `GET` | `/api/layers` | 下拉与串行层图；含 `meta_kind`、`git_worktree_dirty`、`git_remote` 等（不含 `empty` 锚点层）。 |
 | `DELETE` | `/api/layers/{layer_id}` | zTree 操作栏「删除该层」。 |
 | `POST` | `/api/layers/{layer_id}/queue` | 运行中任务时「加入队列」。 |
 | `GET` | `/api/layers/{layer_id}/diff/parent/files` | 可写层变动列表 / 心智图父层差异。 |
@@ -221,4 +236,5 @@ PUSH_IMAGE=1 IMAGE=your-registry/trae-online:latest onlineService/docker-build.s
 - 子层叠加时**不复制** `.git`，而用符号链接指回父层 `.git`，多子层共享同一仓库元数据；与旧版「逐层完整复制」行为不同。
 - `git_destructive_locked` 用于在已有新提交后禁止误删/误中断破坏历史。
 - `POST /api/jobs/reset` 会删除可写层目录下符合命名规则的全部层，慎用。
+- 叠建新任务时服务端会清理所选父层下的直接子层（见上文 `POST /api/jobs`）；**空层锚点**不进入 `GET /api/layers` 列表，启动时复用并清理孤立重复空目录。
 - 配置、克隆日志与任务输出可能含敏感信息，请妥善保管 `ACCESS_TOKEN` 与运行时文件。

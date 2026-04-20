@@ -33,7 +33,7 @@ from .git_clone import (
     get_clone_layer_log_text,
     verify_git_clone_workspace,
 )
-from .layers import create_root_layer, new_layer_id
+from .layers import _LAYER_ID_RE, create_root_layer, layer_path, new_layer_id
 from .paths import config_file_path, req_logs_dir
 from .request_trace import TRACE_ID_HEADER, get_trace_id_for_outbound_http
 
@@ -705,12 +705,19 @@ async def _clone_repos_into_shared_layer(
         pem = (
             str(cred.get("ephemeral_ssh_private_key", "")).strip() if isinstance(cred, dict) else ""
         )
-        clone_remote = _git_clone_remote_for_ssh_pem(u) if pem else u
-        if pem and clone_remote != u:
+        _ssh_url_via_env = os.environ.get("GIT_CLONE_USE_SSH_URL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if pem or _ssh_url_via_env and u.lower().startswith("https://"):
+            clone_remote = _git_clone_remote_for_ssh_pem(u)
+        else:
+            clone_remote = u
+        if clone_remote != u:
             await append_clone_layer_log(
                 layer_id,
-                "[bootstrap-clone] 已配置 SSH 私钥，HTTPS 登记地址将改用 SSH 传输克隆：\n"
-                f"    {clone_remote}\n",
+                f"[bootstrap-clone] HTTPS 已转为 SSH 地址克隆：\n    {clone_remote}\n",
             )
         max_attempts = _max_clone_attempts()
         for attempt in range(max_attempts):
@@ -948,3 +955,90 @@ def bootstrap_container_config() -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(yaml_text, encoding="utf-8")
     log.info("已从任务云拉取功能参数 YAML 并写入 %s", dest)
+
+
+def _iter_layer_ids_newest_first() -> list[str]:
+    """列出 layers_root 下符合命名规则的层目录，按 mtime 新到旧。"""
+    from .paths import layers_root
+
+    root = layers_root()
+    if not root.is_dir():
+        return []
+    pairs: list[tuple[float, str]] = []
+    for p in root.iterdir():
+        if not p.is_dir():
+            continue
+        if not _LAYER_ID_RE.match(p.name):
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        pairs.append((mtime, p.name))
+    pairs.sort(key=lambda x: -x[0])
+    return [name for _, name in pairs]
+
+
+def find_existing_repo_dir_in_layer(layer_id: str, repo_dir_name: str) -> Path | None:
+    """返回层内已有克隆目录（扁平层或 overlay 下 ``base/``）。"""
+    root = layer_path(layer_id)
+    p = root / repo_dir_name
+    if p.is_dir():
+        return p
+    p2 = root / "base" / repo_dir_name
+    if p2.is_dir():
+        return p2
+    return None
+
+
+def default_repo_dir_for_reclone(layer_id: str, repo_dir_name: str) -> Path:
+    """Bootstrap 共享层为扁平目录；overlay 克隆层在 ``base/`` 下。"""
+    root = layer_path(layer_id)
+    base = root / "base"
+    if base.is_dir():
+        return base / repo_dir_name
+    return root / repo_dir_name
+
+
+def resolve_reclone_layer_id(repo_url: str) -> str | None:
+    """内存中 ``bootstrap_clone_layer_id`` 缺失时，从磁盘或 onlineProject 解析可重新克隆的层。"""
+    from .online_project_view import get_online_project_active_info
+
+    name = _repo_dir_name_from_url((repo_url or "").strip())
+    if not name:
+        return None
+
+    bid = bootstrap_clone_layer_id
+    if bid:
+        lp = layer_path(bid)
+        if lp.is_dir():
+            return bid
+
+    for lid in _iter_layer_ids_newest_first():
+        if find_existing_repo_dir_in_layer(lid, name):
+            return lid
+
+    tip = get_online_project_active_info().get("active_tip_layer_id")
+    if tip:
+        lp = layer_path(str(tip))
+        if lp.is_dir():
+            return str(tip)
+
+    return None
+
+
+def ensure_reclone_layer_id(repo_url: str) -> str:
+    """保证存在可写入的层 id；必要时新建层并写回 ``bootstrap_clone_layer_id``。"""
+    global bootstrap_clone_layer_id
+
+    lid = resolve_reclone_layer_id(repo_url)
+    if lid:
+        if bootstrap_clone_layer_id is None:
+            bootstrap_clone_layer_id = lid
+        return lid
+
+    lid = new_layer_id()
+    create_root_layer(lid)
+    bootstrap_clone_layer_id = lid
+    log.info("reclone: 新建层用于克隆 layer_id=%s", lid)
+    return lid

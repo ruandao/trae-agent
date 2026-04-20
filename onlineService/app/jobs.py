@@ -21,7 +21,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .hub import hub
-from .layer_fs import any_layer_has_git_repo
+from .layer_fs import any_layer_has_git_repo, direct_child_layer_ids, list_layers
 from .layer_git import git_checkout
 from .layer_merge import (
     finalize_job_overlay_finished,
@@ -478,6 +478,25 @@ class JobStore:
         out.append(job_id)
         return out
 
+    async def _clear_descendant_layers_under_base(self, base_layer_id: str) -> None:
+        """在从某可写层再次叠建新任务前，清除其下所有「直接子可写层」。
+
+        每个 ``delete_layer_by_layer_id`` 会递归删除该子层下的任务子树与更深层子层。
+        覆盖「repo_layer_id」与「parent_job_id」两种路径（后者在 UI 上选中已有任务时常见）。
+        """
+        if not base_layer_id or not _LAYER_ID_RE.match(base_layer_id):
+            return
+        layers = await asyncio.to_thread(list_layers)
+        jobs = list(self._jobs.values())
+        direct = direct_child_layer_ids(base_layer_id, layers, jobs)
+        for lid in direct:
+            try:
+                await self.delete_layer_by_layer_id(lid)
+            except ValueError as e:
+                if str(e) == "Job not found":
+                    continue
+                raise
+
     def _load(self) -> None:
         p = jobs_state_path()
         if not p.exists():
@@ -565,6 +584,7 @@ class JobStore:
             raise ValueError("git_branch requires parent_job_id or repo_layer_id")
 
         # 等待层空闲时不得持有 _creation_lock，否则 reset_all 等无法取得锁，重置请求会一直挂起。
+        cleared_stack_descendants = False
         while True:
             async with self._lock:
                 if parent_job_id:
@@ -584,6 +604,9 @@ class JobStore:
                 await self._wait_until_layer_idle(stack_parent)
 
             async with self._creation_lock:
+                if stack_parent and not cleared_stack_descendants:
+                    cleared_stack_descendants = True
+                    await self._clear_descendant_layers_under_base(stack_parent)
                 async with self._lock:
                     if parent_job_id:
                         parent_rec = self._jobs.get(parent_job_id)

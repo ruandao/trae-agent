@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -19,7 +20,7 @@ from fastapi import HTTPException
 
 from .layer_merge import layer_merged_root_for_api
 from .layer_meta import is_overlay_v1_layer, read_layer_meta
-from .layers import layer_path
+from .layers import create_empty_layer, layer_path, new_layer_id
 from .paths import layers_root
 
 _LAYER_ID_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<suf>[0-9a-fA-F]+)$")
@@ -165,7 +166,108 @@ def infer_layer_parent_from_workspace(layer_id: str) -> str | None:
     return parent_id
 
 
-def _validate_safe_rel_posix(rel_posix: str) -> PurePosixPath:
+def layer_parent_from_jobs(layer_id: str, jobs: list[Any]) -> str | None:
+    """无 ``.git`` 符号链接时（例如旧版逐层复制），用任务记录推断父层。"""
+    job_by_layer: dict[str, Any] = {}
+    for j in jobs:
+        if j.layer_id not in job_by_layer:
+            job_by_layer[j.layer_id] = j
+    by_id = {j.id: j for j in jobs}
+    j = job_by_layer.get(layer_id)
+    if not j:
+        return None
+    if j.parent_job_id:
+        p = by_id.get(j.parent_job_id)
+        return str(p.layer_id) if p else None
+    if j.repo_layer_id:
+        return str(j.repo_layer_id)
+    return None
+
+
+def resolved_parent_layer_id(layer_id: str, known_ids: set[str], jobs: list[Any]) -> str | None:
+    """与 ``GET /api/layers`` 中 ``parent_layer_id`` 相同的解析逻辑。"""
+    p = infer_layer_parent_from_workspace(str(layer_id)) or layer_parent_from_jobs(
+        str(layer_id), jobs
+    )
+    if p and p in known_ids:
+        return p
+    return None
+
+
+def direct_child_layer_ids(
+    base_layer_id: str,
+    layers: list[dict[str, Any]],
+    jobs: list[Any],
+) -> list[str]:
+    """在已知层列表中，父层为 ``base_layer_id`` 的直接子可写层（不含 base 自身）。"""
+    known_ids = {str(x.get("layer_id")) for x in layers if x.get("layer_id")}
+    out: list[str] = []
+    for item in layers:
+        lid = str(item.get("layer_id") or "").strip()
+        if not lid or lid == base_layer_id:
+            continue
+        p = resolved_parent_layer_id(lid, known_ids, jobs)
+        if p == base_layer_id:
+            out.append(lid)
+    out.sort()
+    return out
+
+
+def iter_empty_layer_ids_sorted() -> list[str]:
+    """磁盘上 ``layer_meta.kind == empty`` 的可写层目录名（按 id 升序，时间早的在前）。"""
+    root = layers_root().resolve()
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in root.iterdir():
+        if not p.is_dir():
+            continue
+        m = read_layer_meta(p.name)
+        if m and m.kind == "empty":
+            out.append(p.name)
+    out.sort()
+    return out
+
+
+def empty_layer_is_referenced(empty_id: str, jobs: list[Any]) -> bool:
+    """是否有任务或其它可写层仍引用该空层（父指针或 repo_layer_id）。"""
+    for j in jobs:
+        rid = getattr(j, "repo_layer_id", None)
+        if rid and str(rid).strip() == empty_id:
+            return True
+    root = layers_root().resolve()
+    if not root.is_dir():
+        return False
+    for p in root.iterdir():
+        if not p.is_dir() or p.name == empty_id:
+            continue
+        m = read_layer_meta(p.name)
+        if m and m.parent_layer_id == empty_id:
+            return True
+    return False
+
+
+def ensure_startup_empty_layer_id(jobs: list[Any]) -> str | None:
+    """启动时复用已有空层目录；若无则新建。删除未被引用的重复 ``kind=empty`` 目录（多次重启曾每次新建一条）。"""
+    ids = iter_empty_layer_ids_sorted()
+    if not ids:
+        lid = new_layer_id()
+        create_empty_layer(lid)
+        return lid
+    keep = ids[0]
+    for eid in ids[1:]:
+        if empty_layer_is_referenced(eid, jobs):
+            continue
+        lp = layer_path(eid)
+        try:
+            if lp.is_dir():
+                shutil.rmtree(lp, ignore_errors=True)
+        except OSError:
+            pass
+    return keep
+
+
+def _validate_safe_rel_posix(rel_posix: str, *, allow_git: bool = False) -> PurePosixPath:
     # Empty is not allowed (must point to something within the layer).
     if not rel_posix:
         raise HTTPException(status_code=400, detail="Empty path")
@@ -174,8 +276,11 @@ def _validate_safe_rel_posix(rel_posix: str) -> PurePosixPath:
         raise HTTPException(status_code=400, detail="Absolute path is not allowed")
     if ".." in rel.parts:
         raise HTTPException(status_code=400, detail="Path traversal is not allowed")
+    forbidden = _SKIP_PARTS
+    if allow_git:
+        forbidden = _SKIP_PARTS - {".git"}
     for part in rel.parts:
-        if part in _SKIP_PARTS:
+        if part in forbidden:
             raise HTTPException(status_code=400, detail=f"Path contains forbidden part: {part}")
     return rel
 
@@ -191,8 +296,8 @@ def list_layer_files(layer_id: str, prefix: str | None, max_files: int) -> dict[
         if not prefix_norm:
             prefix_norm = None
         else:
-            rel = _validate_safe_rel_posix(prefix_norm)
-            prefix_norm = rel.as_posix()
+            validated_prefix = _validate_safe_rel_posix(prefix_norm)
+            prefix_norm = validated_prefix.as_posix()
 
     files: list[dict[str, Any]] = []
 
@@ -208,16 +313,16 @@ def list_layer_files(layer_id: str, prefix: str | None, max_files: int) -> dict[
                 continue
             if not p.is_file():
                 continue
-            rel = p.relative_to(layer_dir).as_posix()
-            parts = PurePosixPath(rel).parts
+            rel_str = p.relative_to(layer_dir).as_posix()
+            parts = PurePosixPath(rel_str).parts
             if any(part in _SKIP_PARTS for part in parts):
                 continue
-            if prefix_norm and not rel.startswith(prefix_norm):
+            if prefix_norm and not rel_str.startswith(prefix_norm):
                 continue
             st = p.stat()
             files.append(
                 {
-                    "path": rel,
+                    "path": rel_str,
                     "size": st.st_size,
                     "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
                 }

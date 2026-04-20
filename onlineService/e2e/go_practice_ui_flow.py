@@ -36,7 +36,7 @@ def _is_get_jobs(r) -> bool:
 
 
 def _refresh_jobs_and_wait_layer_in_ztree(page, layer_id: str) -> None:
-    """刷新任务列表，直到 zTree 出现对应可写层节点（异步渲染）。"""
+    """刷新任务列表，直到串行可写层列表出现对应层行（异步渲染）。"""
     lid = str(layer_id or "").strip()
     if not lid:
         raise ValueError("empty layer_id")
@@ -48,10 +48,12 @@ def _refresh_jobs_and_wait_layer_in_ztree(page, layer_id: str) -> None:
         try:
             page.wait_for_function(
                 """(lid) => {
-                  const z = window._layerZtree;
-                  if (!z || !lid) return false;
+                  const host = document.getElementById('layer_serial_graph');
+                  if (!host || !lid) return false;
                   const nid = '__layer__:' + lid;
-                  return !!z.getNodeByParam('id', nid, null);
+                  return Array.from(host.querySelectorAll('button.layer-serial-row')).some(
+                    (b) => b.getAttribute('data-mind-node-id') === nid
+                  );
                 }""",
                 arg=lid,
                 timeout=25_000,
@@ -60,7 +62,7 @@ def _refresh_jobs_and_wait_layer_in_ztree(page, layer_id: str) -> None:
         except Exception as e:
             last_err = str(e)
             continue
-    raise TimeoutError(f"zTree 未在多次刷新后出现层节点 {layer_id!r}；最后错误: {last_err}")
+    raise TimeoutError(f"串行列表未在多次刷新后出现层节点 {layer_id!r}；最后错误: {last_err}")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -215,13 +217,13 @@ def main() -> int:
             browser.close()
             return 6
 
-        # 任务结束后 zTree 可能尚未含新子层节点：刷新并轮询直至可点选
+        # 任务结束后串行列表可能尚未含新子层行：刷新并轮询直至可点选
         _refresh_jobs_and_wait_layer_in_ztree(page, layer_id)
 
         ok = page.evaluate("(lid) => window.__traeE2e_selectLayerNode(lid)", layer_id)
         if not ok:
             print(
-                f"无法在 zTree 选中层 {layer_id}（__traeE2e_selectLayerNode 返回 false）",
+                f"无法在串行列表选中层 {layer_id}（__traeE2e_selectLayerNode 返回 false）",
                 file=sys.stderr,
             )
             browser.close()

@@ -325,10 +325,10 @@ def _write_ephemeral_ssh_keyfile(private_key: str) -> str:
 
 
 def _git_clone_remote_for_ssh_pem(canonical_url: str) -> str:
-    """当使用 SSH 私钥克隆时，将常见 ``https://`` 远程转为 ``git@host:path.git``。
+    """将常见 ``https://`` 远程规范为 ``git@host:path.git``（与 ``git clone`` 的 SSH 传输一致）。
 
-    ``git -c core.sshCommand=…`` 仅对基于 SSH 的传输生效；若仍用 ``https://`` 克隆 GitHub/GitLab 等，
-    私有仓库会触发 ``could not read Username for 'https://github.com'``。
+    用于：粘贴的 GitHub/GitLab HTTPS 地址改为 ``git@github.com:org/repo.git`` 等形式；
+    配合 ``core.sshCommand`` 或用户本机 ``ssh-agent`` 进行克隆。
     """
     from urllib.parse import urlsplit
 
@@ -391,7 +391,9 @@ def _validate_url(url: str) -> str:
 
 
 def _convert_http_to_git_url(url: str) -> str:
-    """将 HTTP/HTTPS URL 转换为 Git 协议 URL。
+    """将 HTTP/HTTPS URL 转换为 git://（可选，需 ``GIT_CLONE_USE_GIT_PROTOCOL``）。
+
+    注意：GitHub 等已停用原生 git 协议（9418）；默认克隆应使用 HTTPS，勿启用本转换。
 
     例如：
     - https://github.com/user/repo.git -> git://github.com/user/repo.git
@@ -447,7 +449,9 @@ async def clone_into_new_layer(
 
     If ``ephemeral_ssh_private_key`` is provided, it will be written to a temporary file
     and used for SSH authentication. The file will be deleted after the clone completes.
-    If the URL is HTTPS and a private key is provided, the URL will be converted to SSH format.
+    HTTPS URLs are only rewritten to ``git@host:…`` when SSH credentials are in use
+    (inline PEM / ``ssh_identity_file``) or when ``GIT_CLONE_USE_SSH_URL=1`` (use host ``ssh-agent``);
+    otherwise HTTPS is kept so **public** repos can clone without any key.
 
     Returns ``(layer_id, resolved_layer_path, combined_output, exit_code)``.
     On non-zero exit, the layer directory is removed if it exists under ``layers_root``.
@@ -467,9 +471,20 @@ async def clone_into_new_layer(
     if pk and not ssh_path:
         ephemeral_key_path = await asyncio.to_thread(_write_ephemeral_ssh_keyfile, pk)
         ssh_path = ephemeral_key_path
-        if u.lower().startswith("https://"):
-            u = _git_clone_remote_for_ssh_pem(u)
-    u = _convert_http_to_git_url(u)
+    # git@ 克隆必须能通过 SSH 认证；HTTPS 公仓可匿名。仅在有密钥或显式要求时用 SSH 形式。
+    _ssh_url_via_env = os.environ.get("GIT_CLONE_USE_SSH_URL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if u.lower().startswith("https://") and (ssh_path or _ssh_url_via_env):
+        u = _git_clone_remote_for_ssh_pem(u)
+    if os.environ.get("GIT_CLONE_USE_GIT_PROTOCOL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        u = _convert_http_to_git_url(u)
 
     root = layers_root().resolve()
     cfg = _git_config_prefix()

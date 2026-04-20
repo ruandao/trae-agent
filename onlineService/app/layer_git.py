@@ -861,7 +861,7 @@ def _parse_diff_rq_output(output: str, parent_root: Path, child_root: Path) -> l
 
 
 def list_layer_changes_vs_parent(parent_layer_id: str, layer_id: str) -> dict[str, Any]:
-    """列出子层相对父层工作区（排除 ``.git``）的变动路径摘要，基于 ``diff -rq``。"""
+    """列出子层相对父层工作区的变动路径摘要（含 ``.git``），基于 ``diff -rq``。"""
     _ensure_layer_id(layer_id)
     _ensure_layer_id(parent_layer_id)
     if parent_layer_id == layer_id:
@@ -878,7 +878,7 @@ def list_layer_changes_vs_parent(parent_layer_id: str, layer_id: str) -> dict[st
 
         try:
             proc = subprocess.run(
-                ["diff", "-rq", "-x", ".git", str(parent_root), str(child_root)],
+                ["diff", "-rq", str(parent_root), str(child_root)],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -915,7 +915,7 @@ def diff_layer_one_path_vs_parent(
     layer_id: str,
     file_rel_posix: str,
 ) -> dict[str, Any]:
-    """单路径相对父层的 unified diff（文件用 ``diff -uN``；目录用 ``diff -ruN -x .git``）。"""
+    """单路径相对父层的 unified diff（文件用 ``diff -uN``；目录用 ``diff -ruN``，含 ``.git``）。"""
     from .layer_fs import _validate_safe_rel_posix
 
     _ensure_layer_id(layer_id)
@@ -924,7 +924,7 @@ def diff_layer_one_path_vs_parent(
         raise HTTPException(status_code=400, detail="invalid parent/child pair")
 
     norm = (file_rel_posix or "").replace("\\", "/").lstrip("/")
-    rel = _validate_safe_rel_posix(norm)
+    rel = _validate_safe_rel_posix(norm, allow_git=True)
     rel_s = rel.as_posix()
 
     with (
@@ -991,7 +991,7 @@ def diff_layer_one_path_vs_parent(
         diff_text, code = run_diff(["diff", "-uN", left, right])
     else:
         kind = "dir"
-        diff_text, code = run_diff(["diff", "-ruN", "-x", ".git", str(p_res), str(c_res)])
+        diff_text, code = run_diff(["diff", "-ruN", str(p_res), str(c_res)])
 
     if len(diff_text) > _MAX_SINGLE_PATH_DIFF_CHARS:
         diff_text = (
@@ -1012,7 +1012,7 @@ def diff_layer_one_path_vs_parent(
 
 
 def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[str, Any]:
-    """对比子层工作区目录与父层目录（排除 ``.git``），使用系统 ``diff -ruN``。"""
+    """对比子层工作区目录与父层目录（含 ``.git``），使用系统 ``diff -ruN``。"""
     _ensure_layer_id(layer_id)
     _ensure_layer_id(parent_layer_id)
     if parent_layer_id == layer_id:
@@ -1029,7 +1029,7 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
 
         try:
             proc = subprocess.run(
-                ["diff", "-ruN", "-x", ".git", str(parent_root), str(child_root)],
+                ["diff", "-ruN", str(parent_root), str(child_root)],
                 capture_output=True,
                 text=True,
                 timeout=180,
@@ -1052,10 +1052,7 @@ def diff_layer_worktree_vs_parent(parent_layer_id: str, layer_id: str) -> dict[s
 
     truncated = False
     if len(out) > _MAX_PARENT_DIFF_CHARS:
-        out = (
-            out[:_MAX_PARENT_DIFF_CHARS]
-            + "\n\n…（输出已截断，可在本地对两层目录执行 diff -ruN -x .git）"
-        )
+        out = out[:_MAX_PARENT_DIFF_CHARS] + "\n\n…（输出已截断，可在本地对两层目录执行 diff -ruN）"
         truncated = True
 
     return {
