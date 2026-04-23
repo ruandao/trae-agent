@@ -22,7 +22,8 @@ repos:
   - id: codespell
     exclude: >
             (?x)^(
-                .*\.jsonl
+                .*\.jsonl|
+                onlineServiceJS/static/vendor/.*
             )$
 
 - repo: https://github.com/pre-commit/mirrors-mypy

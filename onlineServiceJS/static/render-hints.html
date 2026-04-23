@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent 富文本呈现声明 · onlineServiceJS</title>
+    <style>
+      :root {
+        --bg: #1a1b1e;
+        --panel: #232428;
+        --text: #e8e8e8;
+        --muted: #9aa0a6;
+        --accent: #3d8bfd;
+        --border: #3a3d44;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        margin: 0;
+        padding: 1.25rem 1.5rem 2rem;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.5;
+        max-width: 1100px;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0 0 0.5rem;
+      }
+      .meta {
+        color: var(--muted);
+        font-size: 0.88rem;
+        margin: 0 0 1rem;
+      }
+      .meta code {
+        font-size: 0.82rem;
+        background: var(--panel);
+        padding: 0.12rem 0.35rem;
+        border-radius: 4px;
+      }
+      .actions {
+        margin-bottom: 1rem;
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      pre#out {
+        margin: 0;
+        padding: 1rem;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: auto;
+        font-size: 0.78rem;
+        line-height: 1.4;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Agent 步骤富文本呈现声明</h1>
+    <p class="meta">
+      数据接口：<code>GET /api/ui/agent-render-hints</code>（须携带与控制台相同的
+      <code>access_token</code>）。其中 <code>rich_text_editor.html_allowlist</code> 与
+      <code>src/htmlSanitize.mjs</code> 净化规则一致，可作为富文本编辑器的白名单/导出契约；人读约定见
+      <code>machine_container.md</code> §7；表驱动字段见
+      <code>src/agentRenderHints.mjs</code>。
+    </p>
+    <p class="actions">
+      <a id="backLink" href="#">← 返回控制台</a>
+    </p>
+    <pre id="out">加载中…</pre>
+    <script>
+      const ACCESS_TOKEN = JSON.parse('__ACCESS_TOKEN_JSON__');
+      document.getElementById('backLink').href =
+        '/ui/' + encodeURIComponent(ACCESS_TOKEN);
+      (async () => {
+        const pre = document.getElementById('out');
+        try {
+          const u = new URL('/api/ui/agent-render-hints', location.origin);
+          u.searchParams.set('access_token', ACCESS_TOKEN);
+          const r = await fetch(u.toString(), {
+            headers: { 'X-Access-Token': ACCESS_TOKEN },
+          });
+          const text = await r.text();
+          if (!r.ok) {
+            pre.textContent = 'HTTP ' + r.status + '\n' + text;
+            return;
+          }
+          try {
+            const j = JSON.parse(text);
+            pre.textContent = JSON.stringify(j, null, 2);
+          } catch {
+            pre.textContent = text;
+          }
+        } catch (e) {
+          pre.textContent = String(e && e.message ? e.message : e);
+        }
+      })();
+    </script>
+  </body>
+</html>
