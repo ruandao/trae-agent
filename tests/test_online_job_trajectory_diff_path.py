@@ -22,7 +22,7 @@ def test_load_agent_steps_from_diff_tae_agent_json(monkeypatch, tmp_path: Path) 
         encoding="utf-8",
     )
 
-    from onlineService.app.job_trajectory import load_agent_steps_for_job
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
 
     out = load_agent_steps_for_job(str(layer.resolve()), job_id)
     assert len(out["steps"]) == 1
@@ -56,7 +56,7 @@ def test_prefers_root_with_more_steps(monkeypatch, tmp_path: Path) -> None:
             encoding="utf-8",
         )
 
-    from onlineService.app.job_trajectory import load_agent_steps_for_job
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
 
     out = load_agent_steps_for_job(str(layer.resolve()), job_id)
     assert len(out["steps"]) == 2
@@ -85,7 +85,7 @@ def test_backfills_llm_response_content_from_delivery_summary(monkeypatch, tmp_p
         encoding="utf-8",
     )
 
-    from onlineService.app.job_trajectory import load_agent_steps_for_job
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
 
     out = load_agent_steps_for_job(str(layer.resolve()), job_id)
     got = out["steps"][0]["llm_response"]["content"]
@@ -110,7 +110,7 @@ def test_load_agent_steps_from_runtime_job_logs(monkeypatch, tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    from onlineService.app.job_trajectory import load_agent_steps_for_job
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
 
     out = load_agent_steps_for_job(str(layer.resolve()), job_id)
     assert len(out["steps"]) == 1

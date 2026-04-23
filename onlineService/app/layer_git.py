@@ -17,6 +17,9 @@ from typing import Any
 from fastapi import HTTPException
 
 from trae_agent.utils.auto_commit_message import load_latest_trajectory_data
+from trae_agent_online.task_cloud_bootstrap import (
+    git_clone_remote_for_ssh_pem as _git_clone_remote_for_ssh_pem,
+)
 
 from .git_clone import _validate_branch
 from .layer_fs import _validate_safe_rel_posix
@@ -34,7 +37,6 @@ from .overlay_diff import (
     prune_empty_dirs_under,
 )
 from .paths import runtime_dir
-from .task_api_bootstrap import _git_clone_remote_for_ssh_pem
 
 logger = logging.getLogger(__name__)
 

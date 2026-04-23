@@ -1,19 +1,35 @@
 ---
-description: onlineService 入站/出站 HTTP 请求日志约定，避免漏记
+description: Trae 业务服务（onlineServiceJS / 遗留 onlineService）HTTP 请求日志约定
 alwaysApply: true
 ---
 
-# onlineService HTTP 请求日志（元规则）
+# Trae 业务服务 HTTP 请求日志（元规则）
 
-在 `onlineService/` 内改动或新增网络相关代码时，**必须**维持下列约定，避免入站或出站请求漏记。
+默认实现为 **`onlineServiceJS/`**（Node）；**`onlineService/`**（Python）为遗留。改动或新增网络相关代码时，应维持下列约定，避免入站或出站请求漏记。
 
-## 入站（客户端 → 本服务）
+## onlineServiceJS（Node / Express）
+
+### 入站（客户端 → 本服务）
+
+- **位置**：`{ONLINE_PROJECT_STATE_ROOT}/logs/requests.log`（默认 `{REPO_ROOT}/onlineProject_state/logs/requests.log`），见 `src/server.mjs` 中 `accessLogPath()` + `logReq`。
+- **不要**移除该 `finish` 钩子或另起入口而不写访问日志。
+
+### 出站（本服务 → 外部 HTTP）
+
+- **位置**：`{ONLINE_PROJECT_STATE_ROOT}/reqLogs/`（与 `src/paths.mjs` 的 `reqLogsDir()` 一致）。
+- 新增对外 `fetch`/HTTP 客户端调用时，应经与现有实现一致的日志与脱敏路径；避免裸请求且不落盘。
+
+---
+
+## onlineService（Python / FastAPI，遗留）
+
+### 入站（客户端 → 本服务）
 
 - **位置**：`onlineService/logs/`，主文件 `requests.log`（按行滚动，见 `RotatingFileHandler`）。
 - **实现**：`app/main.py` 中 `_RequestAccessLogMiddleware` + `paths.logs_dir()`；**不要**移除或绕过该中间件另起 ASGI 入口而不打访问日志。
 - **本地开发**：`run_local.sh` 已 `mkdir` 且 `--reload-exclude` 包含 `logs/`；若新增同类持久化目录，应同样排除以免触发热重载。
 
-## 出站（本服务 → 外部 HTTP）
+### 出站（本服务 → 外部 HTTP）
 
 - **位置**：`onlineService/reqLogs/`，主文件 `outbound.log`。
 - **当前统一出口**：`app/task_api_bootstrap.py` 的 `_post_json`（内部调用 `_log_outbound_post`、脱敏、文件 handler）。

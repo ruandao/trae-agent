@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import contextlib
 import json
 import logging
@@ -11,14 +10,35 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
+
+from trae_agent_online.online_job_stdio import (
+    build_trae_run_cmd as _build_trae_run_cmd,
+)
+from trae_agent_online.online_job_stdio import (
+    filter_trae_output_chunk as _filter_trae_output_chunk,
+)
+from trae_agent_online.online_job_stdio import (
+    finalize_trae_output_carry as _finalize_trae_output_carry,
+)
+from trae_agent_online.online_job_stdio import (
+    iter_stdout_text as _iter_stdout_text,
+)
+from trae_agent_online.online_job_stdio import (
+    job_subprocess_env as _job_subprocess_env,
+)
+from trae_agent_online.online_job_stdio import (
+    normalize_job_env as _normalize_job_env,
+)
+from trae_agent_online.online_job_stdio import (
+    resolve_model_cli_args_from_command_env as _resolve_model_cli_args_from_command_env,
+)
 
 from .hub import hub
 from .layer_fs import any_layer_has_git_repo, direct_child_layer_ids, list_layers
@@ -47,7 +67,6 @@ from .paths import (
     job_trajectory_dir,
     jobs_state_path,
     layers_root,
-    repo_root,
     venv_activate_path,
 )
 
@@ -104,10 +123,6 @@ def _git_workdir_for_lock_probe(rec: JobRecord) -> Path:
     return root
 
 
-# Rich 需要有限列宽，无法用「无限」；用极大值近似不折行，避免长路径/JSON 在管道下被 80 列切碎。
-# TRAE_JOB_COLUMNS=0 / unlimited / max 等均表示使用该默认值；也可设具体正整数（上限见实现）。
-_DEFAULT_JOB_WIDE_COLUMNS = 999_999
-_MAX_JOB_COLUMNS = 9_999_999
 _job_event_step_no: dict[str, int] = {}
 _job_event_step_no_lock = threading.Lock()
 
@@ -146,169 +161,9 @@ def _remove_job_event_file(job_id: str) -> None:
         log.exception("remove job event file failed: job_id=%s", job_id)
 
 
-# 按块读取 stdout，减少「一行一条 SSE」的风暴（仍保持 UTF-8 边界正确）。
-
-
-def _stdout_chunk_bytes() -> int:
-    raw = os.environ.get("TRAE_JOB_STDOUT_CHUNK_BYTES", "16384")
-    try:
-        # 下限避免过小导致频繁 await；测试可用 64 验证多分块
-        return max(int(raw), 64)
-    except ValueError:
-        return 16384
-
-
-async def _iter_stdout_text(stream: asyncio.StreamReader) -> AsyncIterator[str]:
-    """Decode subprocess stdout in fixed-size binary chunks (not line-based)."""
-    chunk_sz = _stdout_chunk_bytes()
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    while True:
-        block = await stream.read(chunk_sz)
-        if not block:
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                yield tail
-            break
-        text = decoder.decode(block)
-        if text:
-            yield text
-
-
-def _is_trae_noise_line(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return False
-    return (
-        s.startswith("Changed working directory to:")
-        or s == "Initialising MCP tools..."
-        or s.startswith("Trajectory saved to:")
-    )
-
-
-def _filter_trae_output_chunk(text: str, carry: str = "") -> tuple[str, str]:
-    """Filter noisy fixed trae-cli lines and keep chunk boundaries safe."""
-    merged = f"{carry}{text}" if carry else text
-    if not merged:
-        return "", ""
-    lines = merged.splitlines(keepends=True)
-    next_carry = ""
-    if lines and not lines[-1].endswith(("\n", "\r")):
-        next_carry = lines.pop()
-    kept: list[str] = []
-    for line in lines:
-        if _is_trae_noise_line(line.rstrip("\r\n")):
-            continue
-        kept.append(line)
-    return "".join(kept), next_carry
-
-
-def _finalize_trae_output_carry(carry: str) -> str:
-    if not carry:
-        return ""
-    return "" if _is_trae_noise_line(carry.rstrip("\r\n")) else carry
-
-
-def _job_subprocess_columns() -> str:
-    raw = (os.environ.get("TRAE_JOB_COLUMNS") or "").strip().lower()
-    if not raw or raw in ("0", "unlimited", "none", "max", "inf"):
-        return str(_DEFAULT_JOB_WIDE_COLUMNS)
-    if raw.isdigit():
-        n = int(raw)
-        if n <= 0:
-            return str(_DEFAULT_JOB_WIDE_COLUMNS)
-        return str(min(n, _MAX_JOB_COLUMNS))
-    return str(_DEFAULT_JOB_WIDE_COLUMNS)
-
-
-def _normalize_job_env(extra_env: dict[str, Any] | None) -> dict[str, str]:
-    if not isinstance(extra_env, dict):
-        return {}
-    out: dict[str, str] = {}
-    for k, v in extra_env.items():
-        key = str(k).strip()
-        if not key:
-            continue
-        out[key] = str(v)
-    return out
-
-
-def _job_subprocess_env(
-    *,
-    trae_json_log_dir: str | None = None,
-    extra_env: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    base = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    base["COLUMNS"] = _job_subprocess_columns()
-    if not base.get("PYTHONPATH"):
-        # 允许在未安装 console script 时回退到 `python -m trae_agent.cli`
-        base["PYTHONPATH"] = str(repo_root())
-    if trae_json_log_dir:
-        base["TRAE_AGENT_JSON_OUTPUT_DIR"] = trae_json_log_dir
-    base.update(_normalize_job_env(extra_env))
-    return base
-
-
-def _venv_python_path() -> Path:
-    activate = venv_activate_path()
-    return activate.parent / "python"
-
-
-def _is_executable_file(path: Path) -> bool:
-    return path.is_file() and os.access(path, os.X_OK)
-
-
 def _build_shell_cmd(script: str) -> list[str]:
     """在工作区目录下以 login shell 执行用户给出的整条命令行文本。"""
     return ["bash", "-lc", script]
-
-
-def _build_trae_run_cmd(
-    cfg: Path,
-    work: str,
-    cmd_text: str,
-    *,
-    trajectory_file: str | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-) -> list[str]:
-    activate = venv_activate_path()
-    trae_bin = activate.parent / "trae-cli"
-    py = _venv_python_path()
-    py3 = activate.parent / "python3"
-    if _is_executable_file(py):
-        base = [str(py), "-m", "trae_agent.cli"]
-    elif _is_executable_file(py3):
-        base = [str(py3), "-m", "trae_agent.cli"]
-    elif _is_executable_file(trae_bin):
-        # 最后兜底：某些环境仅有 entrypoint 脚本
-        base = [str(trae_bin)]
-    else:
-        base = [sys.executable, "-m", "trae_agent.cli"]
-    cmd = [
-        *base,
-        "run",
-        cmd_text,
-        f"--config-file={str(cfg)}",
-        f"--working-dir={work}",
-    ]
-    if provider:
-        cmd.append(f"--provider={provider}")
-    if model:
-        cmd.append(f"--model={model}")
-    if trajectory_file:
-        cmd.append(f"--trajectory-file={trajectory_file}")
-    return cmd
-
-
-def _resolve_model_cli_args_from_command_env(
-    command_env: dict[str, str] | None,
-) -> tuple[str | None, str | None]:
-    """将任务级环境变量映射为 trae-cli 参数，避免回落到配置默认模型。"""
-    if not isinstance(command_env, dict):
-        return None, None
-    provider = str(command_env.get("TRAE_MODEL_PROVIDER") or "").strip() or None
-    model = str(command_env.get("TRAE_MODEL") or "").strip() or None
-    return provider, model
 
 
 @dataclass
