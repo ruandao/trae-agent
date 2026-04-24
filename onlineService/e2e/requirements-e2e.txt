@@ -1,3 +1,0 @@
-# E2E：pip install -r onlineService/e2e/requirements-e2e.txt && playwright install chromium
-playwright>=1.40.0
-pytest>=7.4.0

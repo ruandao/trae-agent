@@ -1,4 +1,4 @@
-"""Read agent steps from runtime job logs or legacy layer-local artifacts."""
+"""从 ONLINE_PROJECT_STATE_ROOT 下的 job_logs、layer_artifacts 等读取 agent 步骤（不读层工作区）。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 from trae_agent_online.online_project_paths import (
     job_agent_json_root,
     job_trajectory_dir,
+    layer_artifacts_root,
     layers_root,
 )
 
@@ -26,16 +27,6 @@ def _layer_dir_must_be_allowed(layer_path: str) -> Path:
     if p != root and root not in p.parents:
         raise ValueError("layer path outside configured layers root")
     return p
-
-
-def _latest_trajectory_file(layer_dir: Path) -> Path | None:
-    traj = layer_dir / ".trajectories"
-    if not traj.is_dir():
-        return None
-    files = [f for f in traj.glob("trajectory_*.json") if f.is_file()]
-    if not files:
-        return None
-    return max(files, key=lambda f: f.stat().st_mtime)
 
 
 def _latest_runtime_trajectory_file(job_id: str) -> Path | None:
@@ -130,17 +121,8 @@ def _safe_job_id_segment(job_id: str) -> bool:
     return ".." not in s
 
 
-def _load_agent_steps_from_trajectory_dir(layer_dir: Path) -> dict[str, Any]:
-    """Return trajectory metadata and agent_steps from ``.trajectories/trajectory_*.json``."""
-    traj_file = _latest_trajectory_file(layer_dir)
-    if traj_file is None:
-        return {
-            "trajectory_file": None,
-            "task": None,
-            "steps": [],
-            "note": "no .trajectories/trajectory_*.json under layer",
-        }
-
+def _agent_steps_from_trajectory_file(traj_file: Path) -> dict[str, Any]:
+    """将单个 ``trajectory_*.json`` 解析为 steps 结构。"""
     try:
         data = json.loads(traj_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as e:
@@ -174,6 +156,32 @@ def _load_agent_steps_from_trajectory_dir(layer_dir: Path) -> dict[str, Any]:
         "steps": steps_out,
         "note": None,
     }
+
+
+def _latest_trajectory_file_in_state_artifacts(layer_id: str) -> Path | None:
+    traj = layer_artifacts_root(str(layer_id).strip(), ensure=False) / ".trajectories"
+    if not traj.is_dir():
+        return None
+    files = [f for f in traj.glob("trajectory_*.json") if f.is_file()]
+    if not files:
+        return None
+    return max(files, key=lambda f: f.stat().st_mtime)
+
+
+def _load_state_artifacts_trajectory_for_job(layer_id: str, job_id: str) -> dict[str, Any] | None:
+    """onlineProject_state/runtime/layer_artifacts/{layer_id}/.trajectories/trajectory_{job_id}.json"""
+    if not _safe_job_id_segment(job_id) or not str(layer_id).strip():
+        return None
+    ex = (
+        layer_artifacts_root(str(layer_id).strip(), ensure=False)
+        / ".trajectories"
+        / f"trajectory_{job_id}.json"
+    )
+    if ex.is_file():
+        p = _agent_steps_from_trajectory_file(ex)
+        if p.get("steps"):
+            return p
+    return None
 
 
 def _load_agent_steps_from_runtime_trajectory(job_id: str) -> dict[str, Any] | None:
@@ -270,52 +278,50 @@ def _steps_from_tae_agent_job_root(root: Path) -> dict[str, Any] | None:
     }
 
 
-def _try_load_steps_from_trae_agent_json(layer_dir: Path, job_id: str) -> dict[str, Any] | None:
-    """Load steps from ``SimpleCLIConsole`` output."""
+def _steps_from_tae_agent_json_state_only(job_id: str) -> dict[str, Any] | None:
+    """仅 ``ONLINE_PROJECT_STATE_ROOT/runtime/job_logs/trae_agent_json/{job_id}``。"""
     if not _safe_job_id_segment(job_id):
         return None
-
-    rel_job_roots = (
-        Path(".trae_agent_json") / job_id,
-        Path("diff") / ".trae_agent_json" / job_id,
-        Path("merged") / ".trae_agent_json" / job_id,
-        Path("upper") / ".trae_agent_json" / job_id,
-    )
-    runtime_root = job_agent_json_root(job_id, ensure=False)
-
-    best: dict[str, Any] | None = None
-    best_n = -1
-    for rel in rel_job_roots:
-        payload = _steps_from_tae_agent_job_root(layer_dir / rel)
-        if payload is None:
-            continue
-        n = len(payload.get("steps") or [])
-        if n > best_n:
-            best_n = n
-            best = payload
-    payload = _steps_from_tae_agent_job_root(runtime_root)
-    if payload is not None:
-        n = len(payload.get("steps") or [])
-        if n > best_n:
-            best_n = n
-            best = payload
-
-    return best
+    return _steps_from_tae_agent_job_root(job_agent_json_root(job_id, ensure=False))
 
 
 def load_agent_steps_for_layer(layer_path: str) -> dict[str, Any]:
-    """Return trajectory metadata and agent_steps (optionally truncated for JSON size)."""
+    """从 state 的 ``layer_artifacts/{layer_id}/.trajectories`` 读取（可选截断以控制 JSON 体积）。"""
     layer_dir = _layer_dir_must_be_allowed(layer_path)
-    return _load_agent_steps_from_trajectory_dir(layer_dir)
+    latest_st = _latest_trajectory_file_in_state_artifacts(layer_dir.name)
+    if latest_st is not None:
+        p = _agent_steps_from_trajectory_file(latest_st)
+        if p.get("steps"):
+            return p
+    return {
+        "trajectory_file": None,
+        "task": None,
+        "steps": [],
+        "note": "no trajectory in state layer_artifacts",
+    }
 
 
 def load_agent_steps_for_job(layer_path: str, job_id: str) -> dict[str, Any]:
-    """优先读取 runtime job logs；再回退层目录遗留产物。"""
+    """按 job：state 精确轨迹 → state 下 tae json → runtime job 轨迹 → state 层下最新轨迹。"""
     layer_dir = _layer_dir_must_be_allowed(layer_path)
-    from_json = _try_load_steps_from_trae_agent_json(layer_dir, job_id)
+    layer_id = layer_dir.name
+    from_state = _load_state_artifacts_trajectory_for_job(layer_id, job_id)
+    if from_state is not None:
+        return from_state
+    from_json = _steps_from_tae_agent_json_state_only(job_id)
     if from_json is not None:
         return from_json
     runtime_traj = _load_agent_steps_from_runtime_trajectory(job_id)
     if runtime_traj is not None:
         return runtime_traj
-    return _load_agent_steps_from_trajectory_dir(layer_dir)
+    latest_st = _latest_trajectory_file_in_state_artifacts(layer_id)
+    if latest_st is not None:
+        p = _agent_steps_from_trajectory_file(latest_st)
+        if p.get("steps"):
+            return p
+    return {
+        "trajectory_file": None,
+        "task": None,
+        "steps": [],
+        "note": "no agent steps in state (layer_artifacts, job_logs/trae_agent_json, or runtime/trajectory)",
+    }

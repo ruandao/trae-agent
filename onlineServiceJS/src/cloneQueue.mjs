@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { appendCloneLayerLog } from './bootstrap.mjs';
 import { completeExecStream } from './execStream.mjs';
 import { broadcast } from './sseHub.mjs';
+import { gitCmd } from './gitCmd.mjs';
 
 /** @type {Map<string, { status: string, queue_position?: number, detail?: string }>} */
 const opState = new Map();
@@ -90,9 +91,15 @@ function executeCloneTask(task) {
     });
     appendCloneLayerLog(lid, `[clone] ${gitArgs.join(' ')}\n`);
 
-    const proc = spawn('git', gitArgs, {
+    const proc = spawn(gitCmd(), gitArgs, {
       cwd: cloneCwd,
-      env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' },
+      env: {
+        ...process.env,
+        ...env,
+        GIT_TERMINAL_PROMPT: '0',
+        // 与 run.sh 宿主机上 GIT_HTTP_IPV4=1 一致；在容器内也避免 libcurl 走 IPv6 失败
+        GIT_HTTP_IPV4: String(env.GIT_HTTP_IPV4 || process.env.GIT_HTTP_IPV4 || '1'),
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

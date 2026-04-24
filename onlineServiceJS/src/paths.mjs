@@ -40,6 +40,31 @@ export const configFilePath = () => path.join(runtimeDir(), 'service_config.yaml
 
 export const jobsStatePath = () => path.join(runtimeDir(), 'jobs_state.json');
 
+/** 可写层在 state 根下的智能体侧车根路径（与 onlineProject 解耦，不含仅 mkdir 以外的副作用） */
+export const layerArtifactsRootPath = (layerId) => {
+  const lid = String(layerId || '').trim();
+  if (!lid) throw new Error('layer_id required');
+  return path.join(runtimeDir(), 'layer_artifacts', lid);
+};
+
+export const layerArtifactsDir = (layerId) => {
+  const d = layerArtifactsRootPath(layerId);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+};
+
+export const jobLogsTaeJsonPath = (jobId) => {
+  const jid = String(jobId || '').trim();
+  if (!jid) throw new Error('job_id required');
+  return path.join(runtimeDir(), 'job_logs', 'trae_agent_json', jid);
+};
+
+export const jobLogsTaeJsonDir = (jobId) => {
+  const d = jobLogsTaeJsonPath(jobId);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+};
+
 export const reqLogsDir = () => {
   const d = path.join(stateRoot(), 'reqLogs');
   fs.mkdirSync(d, { recursive: true });

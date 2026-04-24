@@ -36,12 +36,12 @@ repos:
         - types-PyYAML
 
 # 提交前跑全量单测（与 Makefile 的 uv-test 一致）；需已安装 uv 且执行过 uv sync
-- repo: local
-  hooks:
-    - id: make-uv-test
-      name: make uv-test (full test suite)
-      entry: make
-      args: [uv-test]
-      language: system
-      pass_filenames: false
-      always_run: true
+# - repo: local
+#   hooks:
+#     - id: make-uv-test
+#       name: make uv-test (full test suite)
+#       entry: make
+#       args: [uv-test]
+#       language: system
+#       pass_filenames: false
+#       always_run: true

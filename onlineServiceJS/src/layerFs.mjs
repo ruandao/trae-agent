@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'node:child_process';
-import { layersRoot } from './paths.mjs';
+import { layersRoot, stateRoot, layerArtifactsRootPath } from './paths.mjs';
 
 export const LAYER_ID_RE = /^(\d{8}_\d{6})_([0-9a-fA-F]+)$/;
 
@@ -179,7 +179,28 @@ function copyEntry(src, dest) {
   }
 }
 
-export function createStackedLayer(childId, parentLayerId) {
+function useOverlayStack() {
+  return String(process.env.TRAE_USE_OVERLAY_STACK || '').trim() === '1';
+}
+
+function mountStackedOverlay(childDir, parentDir, childId) {
+  const base = path.join(stateRoot(), 'overlay_stack', childId);
+  const upper = path.join(base, 'upper');
+  const work = path.join(base, 'work');
+  fs.mkdirSync(upper, { recursive: true });
+  fs.mkdirSync(work, { recursive: true });
+  const opts = `lowerdir=${parentDir},upperdir=${upper},workdir=${work}`;
+  const r = spawnSync('mount', ['-t', 'overlay', 'overlay', '-o', opts, childDir], {
+    encoding: 'utf8',
+    env: process.env,
+  });
+  if (r.status !== 0) {
+    const msg = (r.stderr || r.stdout || r.error?.message || '').trim() || `exit ${r.status}`;
+    throw new Error(`overlay mount failed: ${msg}`);
+  }
+}
+
+function createStackedLayerCopy(childId, parentLayerId) {
   const parentDir = layerPath(parentLayerId);
   const childDir = layerPath(childId);
   if (!fs.existsSync(parentDir)) throw new Error(`parent layer not found: ${parentLayerId}`);
@@ -204,6 +225,42 @@ export function createStackedLayer(childId, parentLayerId) {
   return childDir;
 }
 
+function createStackedLayerOverlay(childId, parentLayerId) {
+  const parentDir = layerPath(parentLayerId);
+  const childDir = layerPath(childId);
+  if (!fs.existsSync(parentDir)) throw new Error(`parent layer not found: ${parentLayerId}`);
+  deleteLayerTree(childId);
+  fs.mkdirSync(childDir, { recursive: true });
+  const base = path.join(stateRoot(), 'overlay_stack', childId);
+  fs.rmSync(base, { recursive: true, force: true });
+  fs.mkdirSync(path.join(base, 'upper'), { recursive: true });
+  fs.mkdirSync(path.join(base, 'work'), { recursive: true });
+  mountStackedOverlay(childDir, parentDir, childId);
+  writeLayerMeta(childId, 'job', parentLayerId);
+  return childDir;
+}
+
+export function createStackedLayer(childId, parentLayerId) {
+  if (!useOverlayStack()) {
+    return createStackedLayerCopy(childId, parentLayerId);
+  }
+  try {
+    return createStackedLayerOverlay(childId, parentLayerId);
+  } catch (e) {
+    const msg = e && e.message ? String(e.message) : String(e);
+    console.warn(
+      '[layerFs] overlay 叠层失败，已回退为目录拷贝（常见于 Docker bind 卷/部分内核）。原因:',
+      (msg.split('\n').find((s) => s.trim()) || msg).trim(),
+    );
+    try {
+      deleteLayerTree(childId);
+    } catch {
+      /* ignore */
+    }
+    return createStackedLayerCopy(childId, parentLayerId);
+  }
+}
+
 export function directChildLayerIds(baseLayerId) {
   const out = [];
   for (const row of listLayerRows()) {
@@ -216,7 +273,28 @@ export function directChildLayerIds(baseLayerId) {
 
 export function deleteLayerTree(layerId) {
   const p = layerPath(layerId);
-  if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+  if (fs.existsSync(p)) {
+    spawnSync('umount', [p], { stdio: 'ignore', env: process.env });
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+  const ob = path.join(stateRoot(), 'overlay_stack', layerId);
+  if (fs.existsSync(ob)) {
+    try {
+      fs.rmSync(ob, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    const art = layerArtifactsRootPath(layerId);
+    if (fs.existsSync(art)) fs.rmSync(art, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
 }
 
 export function repoDirNameFromUrl(url) {

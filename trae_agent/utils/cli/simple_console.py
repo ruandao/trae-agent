@@ -26,7 +26,7 @@ from trae_agent.utils.cli.cli_console import (
 )
 from trae_agent.utils.config import LakeviewConfig
 
-# 与 onlineService 子进程默认一致：Rich 无「无限宽」，用大整数近似不折行。
+# 与在线服务子进程默认一致：Rich 无「无限宽」，用大整数近似不折行。
 _WIDE_CONSOLE_FALLBACK = 999_999
 
 

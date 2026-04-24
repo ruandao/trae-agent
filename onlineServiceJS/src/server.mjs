@@ -44,9 +44,13 @@ import {
   deleteJob,
   registerBootstrapCloneJob,
   buildLayersSnapshot,
+  sweepDanglingLayerDirs,
+  enqueueLayerQueueItem,
+  removeLayerQueue,
 } from './jobsRuntime.mjs';
 import { getJobStepsForLayer } from './jobSteps.mjs';
 import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParentDiff.mjs';
+import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -72,8 +76,17 @@ function gitSshCommandFromIdentityFile(resolvedPath) {
   return `ssh -i ${resolvedPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
 }
 
+function useGitCloneForceIpv4() {
+  return String(process.env.TRAE_GIT_CLONE_ALLOW_IPV6 || '').trim() !== '1';
+}
+
 function buildGitCloneArgs(cloneUrl, { branch, depth }) {
-  const args = ['clone', '--progress'];
+  const args = [...gitCloneConfigArgs(), 'clone'];
+  // Docker/部分网络下对 github.com 等优先走 IPv6 会连不上，强制 -4 可稳定 HTTPS/SSH 克隆
+  if (useGitCloneForceIpv4()) {
+    args.push('-4');
+  }
+  args.push('--progress');
   if (depth != null && Number.isFinite(depth) && depth > 0) {
     args.push('--depth', String(Math.floor(depth)));
   }
@@ -88,7 +101,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 
 async function gitExec(args, cwd, env = {}) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('git', args, { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' } });
+    const proc = spawn(gitCmd(), args, { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' } });
     let out = '';
     let err = '';
     proc.stdout?.on('data', (c) => {
@@ -249,7 +262,7 @@ api.get('/jobs/:job_id', (req, res) => {
 api.get('/jobs/:job_id/steps', (req, res) => {
   const j = getJob(req.params.job_id);
   if (!j) return res.status(404).json({ detail: 'not found' });
-  const payload = getJobStepsForLayer(j.layer_id);
+  const payload = getJobStepsForLayer(j.layer_id, j.id);
   res.json(payload);
 });
 
@@ -518,10 +531,21 @@ api.post('/repos/reclone', async (req, res) => {
 api.delete('/layers/:layer_id', (req, res) => {
   const lid = req.params.layer_id;
   for (const cid of directChildLayerIds(lid)) {
+    removeLayerQueue(cid);
     deleteLayerTree(cid);
   }
+  removeLayerQueue(lid);
   deleteLayerTree(lid);
   res.json({ ok: true });
+});
+
+api.post('/layers/:layer_id/queue', (req, res) => {
+  try {
+    const out = enqueueLayerQueueItem(req.params.layer_id, req.body || {});
+    res.status(201).json(out);
+  } catch (e) {
+    res.status(400).json({ detail: String(e.message || e) });
+  }
 });
 
 api.get('/layers/:layer_id/files', (req, res) => {
@@ -691,6 +715,11 @@ async function main() {
     if (strict) process.exit(1);
   }
   ensureStartupEmptyLayer();
+  try {
+    sweepDanglingLayerDirs();
+  } catch (e) {
+    console.error('[onlineServiceJS] layer dir sweep error:', e);
+  }
 
   app.listen(port, host, () => {
     console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);

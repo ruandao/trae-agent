@@ -21,6 +21,7 @@ import {
   getExecStreamFullText,
   completeExecStream,
 } from './execStream.mjs';
+import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
 
 export let bootstrapCloneLayerId = null;
 export let startupEmptyLayerId = null;
@@ -198,7 +199,7 @@ function collectRepoUrls(taskDetail) {
 
 function runGitClone(args, env, cwd) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('git', args, { env: { ...process.env, ...env }, cwd: cwd || undefined });
+    const proc = spawn(gitCmd(), args, { env: { ...process.env, ...env }, cwd: cwd || undefined });
     let err = '';
     proc.stderr?.on('data', (c) => {
       err += c.toString();
@@ -269,7 +270,10 @@ async function cloneReposIntoSharedLayer(urls, credRoot, cloudPrefix, accessToke
     let keyPath = null;
     try {
       const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-      const args = ['clone', '--progress', cloneRemote, repoDir];
+      const useV4 = String(process.env.TRAE_GIT_CLONE_ALLOW_IPV6 || '').trim() !== '1';
+      const args = useV4
+        ? [...gitCloneConfigArgs(), 'clone', '-4', '--progress', cloneRemote, repoDir]
+        : [...gitCloneConfigArgs(), 'clone', '--progress', cloneRemote, repoDir];
       if (pem) {
         keyPath = writeTempSshKey(pem);
         const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;

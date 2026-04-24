@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Trae onlineService 的 Node.js 实现：与 Python onlineService HTTP 契约对齐，供容器与 SaaS 转发对接。",
+  "description": "Trae 在线业务服务（Node.js / Express）：HTTP API 供容器与 SaaS 转发对接。",
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",

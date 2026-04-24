@@ -1,5 +1,0 @@
-# 依赖已合并到仓库根目录 pyproject.toml 的 [project.optional-dependencies] online。
-# 本地安装：在 trae-agent 根目录执行
-#   uv pip install -e ".[online]"
-#   或 pip install -e ".[online]"
--e ..[online]

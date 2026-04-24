@@ -40,12 +40,6 @@ evaluation = [
     "datasets>=3.6.0",
     "unidiff>=0.7.5",
 ]
-# onlineService（FastAPI / uvicorn）：与 onlineService/requirements.txt 同步，便于 Docker 单次安装、减少构建时重复访问 PyPI
-online = [
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.32.0",
-    "python-multipart>=0.0.9",
-]
 
 [project.scripts]
 trae-cli = "trae_agent.cli:main"
@@ -68,7 +62,7 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
-    "skip_reset: onlineService e2e: skip autouse reset (navigate and prepare page yourself)",
+    "skip_reset: onlineServiceJS e2e: skip autouse reset (navigate and prepare page yourself)",
 ]
 
 [tool.coverage.run]
@@ -104,7 +98,6 @@ select = [
 
 # 容器 userdata 注入的 env 名与云平台约定一致（camelCase），不可改为全大写
 [tool.ruff.lint.per-file-ignores]
-"onlineService/app/task_api_bootstrap.py" = ["SIM112"]
 "trae_agent_online/task_cloud_bootstrap.py" = ["SIM112"]
 
 [dependency-groups]

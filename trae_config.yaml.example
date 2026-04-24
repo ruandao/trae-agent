@@ -9,7 +9,7 @@
 #   MiniMax-M2.5          -> minimax/minimax-m2.5
 #   kimi-k2.5             -> moonshotai/kimi-k2.5
 #
-# --- 内置工具名（与代码 trae_agent.tools.tools_registry 一致；onlineService 的 service_config.yaml 同结构）---
+# --- 内置工具名（与代码 trae_agent.tools.tools_registry 一致；onlineServiceJS 写入的 service_config.yaml 同结构）---
 # 合法 id：bash, edit_file, edit_json, sequential_thinking, complete_task, code_knowledge_search
 # 配置方式二选一（不要同时写 tools 与 tools_blacklist）：
 #   - 省略二者：默认启用全部内置工具

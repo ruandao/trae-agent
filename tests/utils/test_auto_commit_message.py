@@ -13,9 +13,7 @@ import pytest
 def _load_auto_commit_message():
     root = Path(__file__).resolve().parents[2]
     path = root / "trae_agent" / "utils" / "auto_commit_message.py"
-    spec = importlib.util.spec_from_file_location(
-        "trae_agent.utils.auto_commit_message", path
-    )
+    spec = importlib.util.spec_from_file_location("trae_agent.utils.auto_commit_message", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -61,18 +59,22 @@ def test_build_includes_final_result_and_steps():
     assert "http_client.py" in msg
 
 
-def test_load_latest_trajectory_data_picks_newest(tmp_path: Path):
+def test_load_latest_trajectory_data_picks_newest(tmp_path: Path, monkeypatch):
     import time
 
-    d = tmp_path / ".trajectories"
-    d.mkdir()
+    state = tmp_path / "state"
+    layer_root = tmp_path / "my_layer"
+    layer_root.mkdir()
+    d = state / "runtime" / "layer_artifacts" / "my_layer" / ".trajectories"
+    d.mkdir(parents=True)
+    monkeypatch.setenv("ONLINE_PROJECT_STATE_ROOT", str(state))
     old = d / "trajectory_20000101_000000.json"
     new = d / "trajectory_20990101_000000.json"
     old.write_text(json.dumps({"task": "old"}), encoding="utf-8")
     time.sleep(0.05)
     new.write_text(json.dumps({"task": "newest"}), encoding="utf-8")
 
-    data = load_latest_trajectory_data(tmp_path)
+    data = load_latest_trajectory_data(layer_root)
     assert data is not None
     assert data.get("task") == "newest"
 
@@ -92,6 +94,4 @@ def test_infer_commit_type(hint: str, expect_type: str):
         shortstat="1 file changed",
         files=["a.py"],
     )
-    assert msg.split("\n", 1)[0].startswith(f"{expect_type}(") or msg.startswith(
-        f"{expect_type}:"
-    )
+    assert msg.split("\n", 1)[0].startswith(f"{expect_type}(") or msg.startswith(f"{expect_type}:")

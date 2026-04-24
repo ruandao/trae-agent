@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +20,15 @@ _MAX_FILES_IN_BODY = 50
 
 
 def load_latest_trajectory_data(layer_root: Path) -> dict[str, Any] | None:
-    """Load the newest ``.trajectories/trajectory_*.json`` under ``layer_root``, if any."""
-    traj_dir = layer_root / ".trajectories"
-    if not traj_dir.is_dir():
+    """从 ``ONLINE_PROJECT_STATE_ROOT/runtime/layer_artifacts/{layer_id}/.trajectories`` 取最新 ``trajectory_*.json``。"""
+    layer_id = layer_root.name
+    state_root = (os.environ.get("ONLINE_PROJECT_STATE_ROOT") or "").strip()
+    if not state_root or not layer_id:
         return None
-    candidates = [f for f in traj_dir.glob("trajectory_*.json") if f.is_file()]
+    st = Path(state_root) / "runtime" / "layer_artifacts" / layer_id / ".trajectories"
+    if not st.is_dir():
+        return None
+    candidates = [f for f in st.glob("trajectory_*.json") if f.is_file()]
     if not candidates:
         return None
     latest = max(candidates, key=lambda f: f.stat().st_mtime)
@@ -59,7 +64,8 @@ def _infer_scope(files: list[str]) -> str | None:
         tops[top] = tops.get(top, 0) + 1
     if not tops:
         return None
-    return max(tops, key=tops.get)
+    # 使用items()来避免mypy类型检查错误
+    return max(tops.items(), key=lambda item: item[1])[0]
 
 
 def _infer_commit_type(task: str, files: list[str]) -> str:
@@ -140,7 +146,7 @@ def _step_bullets(agent_steps: list[Any]) -> list[str]:
         if line:
             out.append(line)
     if len(out) > _MAX_STEP_BULLETS:
-        out = out[-_MAX_STEP_BULLETS :]
+        out = out[-_MAX_STEP_BULLETS:]
     return out
 
 

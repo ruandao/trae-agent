@@ -271,7 +271,27 @@
       background: #64748b;
     }
     .st-branch-col.st-zt-virtual .st-branch-node {
-      background: var(--text);
+      background: #94a3b8;
+      border-style: dashed;
+    }
+    /* 运行中任务：色轨圆点转圈 */
+    .layer-serial-row-wrap.st-row-running .st-branch-node {
+      background: transparent !important;
+      border: 2px solid rgba(240, 193, 75, 0.32);
+      border-top-color: var(--warn);
+      animation: st-node-spin 0.78s linear infinite;
+    }
+    @keyframes st-node-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+    /* 队列中（尚未落层）：虚线边框「占位可写层」 */
+    .layer-serial-row-wrap.is-layer-queue button.layer-serial-row {
+      border-style: dashed;
+      border-color: rgba(148, 163, 184, 0.9);
+      background: rgba(15, 20, 25, 0.55);
+      color: var(--muted);
     }
     .st-branch-col.st-zt-cycle .st-branch-node {
       background: var(--err);
@@ -871,6 +891,8 @@
     }
 
     let lastJobs = [];
+    /** 串行图当前选中的 mind 节点 id（加入队列 / 全量刷新后用于重建下方工具栏） */
+    let lastLayerRelationMindNodeId = null;
     const layerCommitExecLogs = new Map();
     function isJobStatusActive(status) {
       return status === 'pending' || status === 'running';
@@ -889,6 +911,7 @@
           l.mind_state = layerIdHasActiveJob(l.layer_id) ? 'running' : 'idle_done';
         }
         if (typeof l.queue_depth !== 'number') l.queue_depth = 0;
+        if (!Array.isArray(l.queue_items)) l.queue_items = [];
       }
     }
     const MAX_CLONE_LOG_CHARS = 480000;
@@ -2213,9 +2236,18 @@
           o.type === 'job_redone' ||
           o.type === 'job_continued' ||
           o.type === 'job_deleted' ||
-          o.type === 'layer_deleted'
+          o.type === 'layer_deleted' ||
+          o.type === 'layer_queue_enqueued' ||
+          o.type === 'layer_queue_moved' ||
+          o.type === 'layer_queue_drain_failed'
         ) {
-          if (o.type === 'job_deleted' || o.type === 'layer_deleted') {
+          if (
+            o.type === 'job_deleted' ||
+            o.type === 'layer_deleted' ||
+            o.type === 'layer_queue_enqueued' ||
+            o.type === 'layer_queue_moved' ||
+            o.type === 'layer_queue_drain_failed'
+          ) {
             markSseFullList({ refreshLayers: true });
           } else {
             markSseFullList({});
@@ -2888,6 +2920,12 @@
           const sel = document.getElementById('layerSelect');
           await loadLayers(sel && sel.value ? sel.value : null);
           await reloadLayerTree();
+          const rid = lastLayerRelationMindNodeId;
+          if (rid) {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => updateLayerRelationToolbar(rid));
+            });
+          }
         }
         return;
       }
@@ -3175,8 +3213,30 @@
 
     const LAYER_GRAPH_ROOT_ID = '__layer_graph_root__';
     const LAYER_TREE_NODE_PREFIX = '__layer__:';
+    const LAYER_QUEUE_NODE_PREFIX = '__lq__:';
     function layerNodeId(layerId) {
       return LAYER_TREE_NODE_PREFIX + layerId;
+    }
+    /** 串行图中「待执行队列」占位节点 id（非真实可写层，选中时映射到父层）。 */
+    function layerQueueNodeId(layerId, index) {
+      return LAYER_QUEUE_NODE_PREFIX + encodeURIComponent(layerId) + ':' + index;
+    }
+    function parseLayerQueueNodeId(nid) {
+      const s = String(nid || '');
+      if (s.indexOf(LAYER_QUEUE_NODE_PREFIX) !== 0) return null;
+      const rest = s.slice(LAYER_QUEUE_NODE_PREFIX.length);
+      const idx = rest.lastIndexOf(':');
+      if (idx <= 0) return null;
+      const enc = rest.slice(0, idx);
+      const n = parseInt(rest.slice(idx + 1), 10);
+      let layerId;
+      try {
+        layerId = decodeURIComponent(enc);
+      } catch (_e) {
+        return null;
+      }
+      if (!layerId || !Number.isFinite(n) || n < 0) return null;
+      return { layerId, index: n };
     }
     function parseLayerTreeNodeId(nid) {
       if (nid == null || nid === LAYER_GRAPH_ROOT_ID) return null;
@@ -3191,6 +3251,13 @@
         return;
       }
       if (String(nid).indexOf('cycle_') === 0) {
+        return;
+      }
+      const qPick = parseLayerQueueNodeId(nid);
+      if (qPick) {
+        selectLayerFromGraph(qPick.layerId);
+        void loadLayerParentDiff(qPick.layerId);
+        updateLayerRelationToolbar(nid);
         return;
       }
       const layerOnlyId = parseLayerTreeNodeId(nid);
@@ -3373,6 +3440,22 @@
             });
           }
         }
+        const qItems = Array.isArray(layer.queue_items) ? layer.queue_items : [];
+        for (let qi = 0; qi < qItems.length; qi++) {
+          const ent = qItems[qi] || {};
+          const qid = layerQueueNodeId(layer.layer_id, qi);
+          const preview = String(ent.command_preview || ent.command || '').trim();
+          const kind = String(ent.command_kind || 'trae').trim() || 'trae';
+          const pv = preview.length > 52 ? preview.slice(0, 52) + '…' : preview || '（无摘要）';
+          const topic = '队列 · 待执行 #' + (qi + 1) + ' · ' + kind + '\n' + pv;
+          rows.push({
+            id: qid,
+            name: topic.split('\n').join(' · '),
+            title: topic,
+            nodeKind: 'layer_queue',
+            ztStyle: 'virtual',
+          });
+        }
       }
       return rows;
     }
@@ -3460,6 +3543,7 @@
       const layers = window.__layersForMind;
 
       if (!selectedMindNodeId || selectedMindNodeId === LAYER_GRAPH_ROOT_ID) {
+        lastLayerRelationMindNodeId = null;
         const hint = document.createElement('span');
         hint.className = 'meta';
         hint.textContent = '（在串行列表中点选可写层或任务行以查看差异与管理队列）';
@@ -3468,29 +3552,51 @@
       }
       if (String(selectedMindNodeId).indexOf('cycle_') === 0) return;
 
+      const qParsed = parseLayerQueueNodeId(selectedMindNodeId);
       const layerOnlyId = parseLayerTreeNodeId(selectedMindNodeId);
-      const isLayerNode = !!layerOnlyId;
-      const layerId = layerOnlyId || '';
+      const isLayerNode = !!layerOnlyId || !!qParsed;
+      const layerId = layerOnlyId || (qParsed ? qParsed.layerId : '');
       const layerJobs = isLayerNode
         ? (lastJobs || [])
             .filter((j) => j.layer_id === layerId)
             .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
         : [];
+      const nonCloneJobs = layerJobs.filter((j) => j.command_kind !== 'clone');
       const representativeJob =
-        layerJobs.length > 0 ? layerJobs[layerJobs.length - 1] : null;
-      const job = isLayerNode
-        ? representativeJob
-        : lastJobs.find((j) => j.id === selectedMindNodeId) || null;
+        nonCloneJobs.length > 0 ? nonCloneJobs[nonCloneJobs.length - 1] : null;
+      let job = null;
+      if (!isLayerNode) {
+        job = lastJobs.find((j) => j.id === selectedMindNodeId) || null;
+      } else if (qParsed) {
+        job =
+          nonCloneJobs.find((j) => isJobStatusActive(j.status)) || representativeJob || null;
+      } else {
+        job = representativeJob;
+      }
       const layer = layers &&
         layers.find((l) => l.layer_id === (isLayerNode ? layerId : (job ? job.layer_id : '')));
       if (!layer) return;
+
+      lastLayerRelationMindNodeId = String(selectedMindNodeId || '');
 
       const mindRunning = job ? isJobStatusActive(job.status) : false;
 
       const label = document.createElement('span');
       label.className = 'meta';
       label.style.marginRight = '0.35rem';
-      if (isLayerNode) {
+      if (qParsed) {
+        const items = Array.isArray(layer.queue_items) ? layer.queue_items : [];
+        const ent = items[qParsed.index] || {};
+        const prev = String(ent.command_preview || ent.command || '').trim() || '（无摘要）';
+        const pv = prev.length > 56 ? prev.slice(0, 56) + '…' : prev;
+        label.textContent =
+          '选中队列任务 #' +
+          (qParsed.index + 1) +
+          '（待执行）· 父层 ' +
+          layer.layer_id +
+          ' · ' +
+          pv;
+      } else if (isLayerNode) {
         label.textContent =
           '选中可写层：' +
           layer.layer_id +
@@ -3503,7 +3609,9 @@
       const stEl = document.createElement('span');
       stEl.className = 'meta';
       stEl.style.marginRight = '0.5rem';
-      stEl.textContent = '状态：' + (job ? (job.status || '—') : '无任务');
+      stEl.textContent = qParsed
+        ? '状态：queued（尚未创建子层）'
+        : '状态：' + (job ? job.status || '—' : '无任务');
       bar.appendChild(stEl);
 
       const delBtn = document.createElement('button');
@@ -3540,7 +3648,9 @@
           { busyText: '删除中…' },
         );
       }, BTN_DEBOUNCE_MS);
-      bar.appendChild(delBtn);
+      if (!qParsed) {
+        bar.appendChild(delBtn);
+      }
 
       if (mindRunning) {
         const qWrap = document.createElement('div');
@@ -3553,6 +3663,30 @@
           (typeof layer.queue_depth === 'number' ? '（' + layer.queue_depth + ' 条）' : '') +
           '：';
         qWrap.appendChild(qLab);
+        const qItems = Array.isArray(layer.queue_items) ? layer.queue_items : [];
+        if (qItems.length) {
+          const qList = document.createElement('ul');
+          qList.setAttribute('data-testid', 'layer-pending-queue-list');
+          qList.className = 'meta';
+          qList.style.cssText =
+            'margin:0.25rem 0 0.35rem;width:100%;padding-left:1.1rem;line-height:1.45;list-style:disc;color:var(--muted);font-family:ui-monospace,monospace;font-size:0.72rem;';
+          for (let qi = 0; qi < qItems.length; qi++) {
+            const ent = qItems[qi] || {};
+            const pv = String(ent.command_preview || ent.command || '').trim() || '（无摘要）';
+            const pvShort = pv.length > 120 ? pv.slice(0, 120) + '…' : pv;
+            const li = document.createElement('li');
+            li.textContent = '#' + (qi + 1) + ' · ' + (ent.command_kind || 'trae') + ' · ' + pvShort;
+            qList.appendChild(li);
+          }
+          qWrap.appendChild(qList);
+        } else if (typeof layer.queue_depth === 'number' && layer.queue_depth > 0) {
+          const qHint = document.createElement('div');
+          qHint.className = 'meta';
+          qHint.style.marginTop = '0.2rem';
+          qHint.textContent =
+            '（后端已报 ' + layer.queue_depth + ' 条队列，详情未返回；请刷新页面或升级服务）';
+          qWrap.appendChild(qHint);
+        }
         const ta = document.createElement('textarea');
         ta.rows = 2;
         ta.style.minWidth = '220px';
@@ -3607,6 +3741,12 @@
               await loadJobs();
               const sel = document.getElementById('layerSelect');
               await loadLayers(sel && sel.value ? sel.value : null);
+              const resumeId = lastLayerRelationMindNodeId || layerNodeId(layer.layer_id);
+              requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                  if (resumeId) updateLayerRelationToolbar(resumeId);
+                });
+              });
             },
             { busyText: '提交中…' },
           );
@@ -3951,6 +4091,7 @@
       graphEl.appendChild(banner);
 
       function clickSerialMind(mindId) {
+        lastLayerRelationMindNodeId = String(mindId || '');
         const btn = Array.from(graphEl.querySelectorAll('button.layer-serial-row')).find(
           (b) => b.getAttribute('data-mind-node-id') === String(mindId),
         );
@@ -3968,6 +4109,9 @@
         if (row.nodeKind === 'job') {
           const j = jobs.find((x) => x.id === row.id);
           lane = j ? layerToLane.get(j.layer_id) ?? 0 : 0;
+        } else if (row.nodeKind === 'layer_queue') {
+          const qp = parseLayerQueueNodeId(row.id);
+          lane = qp ? layerToLane.get(qp.layerId) ?? 0 : 0;
         } else {
           const lid = parseLayerTreeNodeId(row.id);
           lane = lid ? layerToLane.get(lid) ?? 0 : 0;
@@ -3978,8 +4122,18 @@
         wrap.setAttribute('data-testid', 'layer-serial-row-wrap');
         if (row.nodeKind === 'job') {
           wrap.classList.add('is-job', 'st-job');
+        } else if (row.nodeKind === 'layer_queue') {
+          wrap.classList.add('is-job', 'st-job', 'is-layer-queue');
+          wrap.setAttribute('data-layer-serial-kind', 'queue');
         } else {
           wrap.classList.add('st-layer');
+        }
+        if (
+          row.ztStyle === 'active' &&
+          (row.nodeKind === 'layer_merged' || row.nodeKind === 'job' || row.nodeKind === 'layer')
+        ) {
+          wrap.classList.add('st-row-running');
+          wrap.setAttribute('data-layer-serial-kind', 'running');
         }
         wrap.style.setProperty('--st-rail', 'hsl(' + railHueForLane(lane) + ' 52% 46%)');
 
@@ -3995,7 +4149,9 @@
 
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'layer-serial-row' + (row.nodeKind === 'job' ? ' layer-serial-job' : '');
+        btn.className =
+          'layer-serial-row' +
+          (row.nodeKind === 'job' || row.nodeKind === 'layer_queue' ? ' layer-serial-job' : '');
         btn.classList.add(serialRowZtClass(row.ztStyle));
         btn.setAttribute('data-mind-node-id', row.id);
         btn.title = row.title || row.name || '';

@@ -37,11 +37,14 @@ fix-format:
 	ruff format .
 	ruff check --fix .
 
+# 与 pyproject requires-python / .python-version 一致（需 3.12+，避免 match 等语法在收集阶段失败）
+UV_PY := 3.12
+
 # Testing commands
 uv-test:
-	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run python -m pytest tests/ -v --tb=short --continue-on-collection-errors
+	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run --python $(UV_PY) python -m pytest tests/ -v --tb=short --continue-on-collection-errors
 test:
-	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run python -m pytest
+	SKIP_OLLAMA_TEST=true SKIP_OPENROUTER_TEST=true SKIP_GOOGLE_TEST=true uv run --python $(UV_PY) python -m pytest
 
 # Clean up
 clean:

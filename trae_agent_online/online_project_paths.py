@@ -1,4 +1,4 @@
-"""与 ``onlineService`` / ``onlineServiceJS`` 共用的运行时目录布局（默认相对 trae-agent 仓库根）。"""
+"""与 ``onlineServiceJS`` 共用的运行时目录布局（默认相对 trae-agent 仓库根）。"""
 
 from __future__ import annotations
 
@@ -48,6 +48,14 @@ def job_agent_json_root(job_id: str, *, ensure: bool = True) -> Path:
 
 def job_trajectory_dir(job_id: str, *, ensure: bool = True) -> Path:
     d = runtime_job_logs_root(ensure=ensure) / "trajectories" / str(job_id)
+    if ensure:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def layer_artifacts_root(layer_id: str, *, ensure: bool = True) -> Path:
+    """可写层在 state 根下的侧车数据根（.trajectories 等，不在 onlineProject/layers 下）。"""
+    d = runtime_dir() / "layer_artifacts" / str(layer_id).strip()
     if ensure:
         d.mkdir(parents=True, exist_ok=True)
     return d

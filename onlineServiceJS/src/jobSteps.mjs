@@ -1,9 +1,10 @@
 /**
- * 从任务可写层工作区读取 Trae agent 步骤（轨迹 JSON 或 file_log），供 GET /api/jobs/:id/steps。
+ * 从 ONLINE_PROJECT_STATE_ROOT 读取 Trae agent 步骤，供 GET /api/jobs/:id/steps。
+ * 仅支持 runtime/layer_artifacts 与 runtime/job_logs/trae_agent_json，不读层工作区目录。
  */
 import fs from 'fs';
 import path from 'path';
-import { layerPath, layerPrimaryGitWorkdir } from './layerFs.mjs';
+import { stateRoot, layerArtifactsRootPath, jobLogsTaeJsonPath } from './paths.mjs';
 
 function safeReadJson(p) {
   try {
@@ -35,28 +36,6 @@ function newestMtimeFile(dir, predicate) {
   return best;
 }
 
-function newestMtimeDir(dir, predicate) {
-  if (!fs.existsSync(dir)) return null;
-  let best = null;
-  let bestT = -1;
-  for (const name of fs.readdirSync(dir)) {
-    if (!predicate(name)) continue;
-    const fp = path.join(dir, name);
-    let st;
-    try {
-      st = fs.statSync(fp);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    if (st.mtimeMs >= bestT) {
-      bestT = st.mtimeMs;
-      best = fp;
-    }
-  }
-  return best;
-}
-
 function lakeviewSummaryFromFile(stepDir) {
   const lv = safeReadJson(path.join(stepDir, 'lakeview_step.json'));
   if (!lv || typeof lv !== 'object') return null;
@@ -66,7 +45,6 @@ function lakeviewSummaryFromFile(stepDir) {
   return parts.length ? parts.join('\n') : null;
 }
 
-/** 统一 tool_results 条目字段，供前端按 call_id 关联 */
 function normalizeToolResults(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.map((r) => {
@@ -79,9 +57,6 @@ function normalizeToolResults(rows) {
   });
 }
 
-/**
- * 补全 agent_step_full 中与轨迹 agent_steps 略有差异的字段。
- */
 function normalizeAgentStep(step) {
   if (!step || typeof step !== 'object') return step;
   const s = { ...step };
@@ -92,8 +67,7 @@ function normalizeAgentStep(step) {
   return s;
 }
 
-function loadStepsFromTrajectories(workDir) {
-  const trajDir = path.join(workDir, '.trajectories');
+function loadStepsFromTrajectoriesInDir(trajDir, relBase) {
   const trajFile = newestMtimeFile(
     trajDir,
     (n) => n.startsWith('trajectory_') && n.endsWith('.json'),
@@ -102,7 +76,7 @@ function loadStepsFromTrajectories(workDir) {
   const raw = safeReadJson(trajFile);
   if (!raw || typeof raw !== 'object') return null;
   const steps = Array.isArray(raw.agent_steps) ? raw.agent_steps.map(normalizeAgentStep) : [];
-  const rel = path.relative(workDir, trajFile).split(path.sep).join('/');
+  const rel = path.relative(relBase, trajFile).split(path.sep).join('/');
   return {
     steps,
     trajectory_file: rel,
@@ -113,19 +87,15 @@ function loadStepsFromTrajectories(workDir) {
 
 const STEP_DIR_RE = /^step_(\d+)$/;
 
-function loadStepsFromFileLog(workDir) {
-  const logRoot = path.join(workDir, '.trae_agent_file_log');
-  const runDir = newestMtimeDir(logRoot, (n) => n.startsWith('run_'));
-  if (!runDir) return null;
-
+function loadStepsFromTaeJsonOutputDir(outputRoot) {
+  if (!outputRoot || !fs.existsSync(outputRoot)) return null;
   const stepDirs = [];
-  for (const name of fs.readdirSync(runDir)) {
+  for (const name of fs.readdirSync(outputRoot)) {
     const m = name.match(STEP_DIR_RE);
     if (!m) continue;
-    stepDirs.push({ num: parseInt(m[1], 10), dir: path.join(runDir, name) });
+    stepDirs.push({ num: parseInt(m[1], 10), dir: path.join(outputRoot, name) });
   }
   stepDirs.sort((a, b) => a.num - b.num);
-
   const steps = [];
   for (const { num, dir } of stepDirs) {
     let fullPath = path.join(dir, 'agent_step_full.json');
@@ -139,9 +109,8 @@ function loadStepsFromFileLog(workDir) {
     if (merged.step_number == null) merged.step_number = num;
     steps.push(merged);
   }
-
   if (!steps.length) return null;
-  const rel = path.relative(workDir, runDir).split(path.sep).join('/');
+  const rel = path.relative(stateRoot(), outputRoot).split(path.sep).join('/');
   return {
     steps,
     trajectory_file: rel,
@@ -152,9 +121,10 @@ function loadStepsFromFileLog(workDir) {
 
 /**
  * @param {string} layerId
+ * @param {string} [jobId]
  * @returns {{ steps: object[], note: string | null, trajectory_file: string | null, task: string | null }}
  */
-export function getJobStepsForLayer(layerId) {
+export function getJobStepsForLayer(layerId, jobId) {
   const lid = String(layerId || '').trim();
   if (!lid) {
     return {
@@ -164,42 +134,53 @@ export function getJobStepsForLayer(layerId) {
       task: null,
     };
   }
-  const workDir = layerPrimaryGitWorkdir(lid) || layerPath(lid);
-  if (!workDir || !fs.existsSync(workDir)) {
-    return {
-      steps: [],
-      note: '任务层工作目录不存在',
-      trajectory_file: null,
-      task: null,
-    };
+  const sr = stateRoot();
+  const jid = jobId != null && String(jobId).trim() ? String(jobId).trim() : '';
+
+  if (jid) {
+    const exactTraj = path.join(layerArtifactsRootPath(lid), '.trajectories', `trajectory_${jid}.json`);
+    if (fs.existsSync(exactTraj)) {
+      const raw = safeReadJson(exactTraj);
+      if (raw && typeof raw === 'object') {
+        const steps = Array.isArray(raw.agent_steps) ? raw.agent_steps.map(normalizeAgentStep) : [];
+        if (steps.length) {
+          return {
+            steps,
+            note: null,
+            trajectory_file: path.relative(sr, exactTraj).split(path.sep).join('/'),
+            task: raw.task != null ? String(raw.task) : null,
+          };
+        }
+      }
+    }
+    const fromTae = loadStepsFromTaeJsonOutputDir(jobLogsTaeJsonPath(jid));
+    if (fromTae && fromTae.steps.length) {
+      return {
+        steps: fromTae.steps,
+        note: fromTae.note,
+        trajectory_file: fromTae.trajectory_file,
+        task: fromTae.task,
+      };
+    }
   }
 
-  const fromTraj = loadStepsFromTrajectories(workDir);
-  if (fromTraj && fromTraj.steps.length) {
-    return {
-      steps: fromTraj.steps,
-      note: fromTraj.note,
-      trajectory_file: fromTraj.trajectory_file,
-      task: fromTraj.task,
-    };
-  }
-
-  const fromLog = loadStepsFromFileLog(workDir);
-  if (fromLog && fromLog.steps.length) {
-    return {
-      steps: fromLog.steps,
-      note: fromLog.note,
-      trajectory_file: fromLog.trajectory_file,
-      task: fromLog.task,
-    };
+  const stateTrajDir = path.join(layerArtifactsRootPath(lid), '.trajectories');
+  if (fs.existsSync(stateTrajDir)) {
+    const fromState = loadStepsFromTrajectoriesInDir(stateTrajDir, sr);
+    if (fromState && fromState.steps.length) {
+      return {
+        steps: fromState.steps,
+        note: fromState.note,
+        trajectory_file: fromState.trajectory_file,
+        task: fromState.task,
+      };
+    }
   }
 
   return {
     steps: [],
-    note:
-      fromTraj?.note ||
-      '未找到步骤：请确认工作区内存在 .trajectories/trajectory_*.json（含 agent_steps）或 .trae_agent_file_log/run_*/step_*',
-    trajectory_file: fromTraj?.trajectory_file || null,
-    task: fromTraj?.task || null,
+    note: '未找到步骤：请确认 onlineProject_state 下存在 runtime/layer_artifacts 或 runtime/job_logs/trae_agent_json 数据',
+    trajectory_file: null,
+    task: null,
   };
 }

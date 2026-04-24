@@ -4,7 +4,16 @@ import path from 'path';
 import crypto from 'crypto';
 
 import { bootstrapCloneLayerId } from './bootstrap.mjs';
-import { jobsStatePath, configFilePath, repoRoot, layersRoot } from './paths.mjs';
+import {
+  jobsStatePath,
+  configFilePath,
+  repoRoot,
+  layersRoot,
+  layerArtifactsDir,
+  jobLogsTaeJsonDir,
+  jobLogsTaeJsonPath,
+} from './paths.mjs';
+import { getCloneOpStatus } from './cloneQueue.mjs';
 import {
   createStackedLayer,
   directChildLayerIds,
@@ -17,6 +26,7 @@ import {
   resolvedParentLayerId,
   newLayerId,
   gitWorktreeDirty,
+  layerRootOrChildHasGit,
 } from './layerFs.mjs';
 import { broadcast } from './sseHub.mjs';
 import { resetExecStream, appendExecStream, completeExecStream } from './execStream.mjs';
@@ -26,6 +36,10 @@ const jobs = new Map();
 /** @type {Map<string, import('child_process').ChildProcess>} */
 const running = new Map();
 
+/** 某层上「当前任务结束后」按顺序执行的指令（与 UI 加入队列一致）；键为层 id，值为待执行项 */
+/** @type {Record<string, Array<{ command: string, command_kind: string, env?: object | null }>>} */
+let layerQueues = {};
+
 function newJobId() {
   return crypto.randomUUID();
 }
@@ -33,7 +47,7 @@ function newJobId() {
 function saveState() {
   const payload = {
     jobs: [...jobs.values()].map((j) => ({ ...j })),
-    layer_queues: {},
+    layer_queues: { ...layerQueues },
   };
   const p = jobsStatePath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -50,6 +64,21 @@ function loadState() {
       if (row.status === 'running') row.status = 'interrupted';
       jobs.set(row.id, row);
     }
+    const lq = data.layer_queues;
+    if (lq && typeof lq === 'object' && !Array.isArray(lq)) {
+      layerQueues = {};
+      for (const [k, v] of Object.entries(lq)) {
+        if (!k || !Array.isArray(v)) continue;
+        const cleaned = v
+          .filter((x) => x && String(x.command || '').trim())
+          .map((x) => ({
+            command: String(x.command).trim(),
+            command_kind: String(x.command_kind || 'trae').toLowerCase(),
+            env: x.env && typeof x.env === 'object' ? x.env : null,
+          }));
+        if (cleaned.length) layerQueues[k] = cleaned;
+      }
+    }
   } catch {
     /* ignore */
   }
@@ -64,27 +93,48 @@ function venvTraePaths() {
   };
 }
 
-function buildTraeCmd(workDir, cmdText) {
+function buildTraeCmd(workDir, cmdText, opts = {}) {
+  const { trajectoryFile } = opts;
   const custom = String(process.env.TRAE_CLI || '').trim();
   if (custom) {
-    return { cmd: custom, args: [cmdText, `--working-dir=${workDir}`], shell: true };
+    const args = [cmdText, `--working-dir=${workDir}`];
+    if (trajectoryFile) args.push(`--trajectory-file=${trajectoryFile}`);
+    return { cmd: custom, args, shell: true };
   }
   const { traeCli, py, py3 } = venvTraePaths();
   const cfg = configFilePath();
   if (fs.existsSync(traeCli)) {
-    return { cmd: traeCli, args: ['run', cmdText, `--config-file=${cfg}`, `--working-dir=${workDir}`], shell: false };
+    const a = ['run', cmdText, `--config-file=${cfg}`, `--working-dir=${workDir}`];
+    if (trajectoryFile) a.push(`--trajectory-file=${trajectoryFile}`);
+    return { cmd: traeCli, args: a, shell: false };
   }
   if (fs.existsSync(py)) {
     return {
       cmd: py,
-      args: ['-m', 'trae_agent.cli', 'run', cmdText, `--config-file=${cfg}`, `--working-dir=${workDir}`],
+      args: [
+        '-m',
+        'trae_agent.cli',
+        'run',
+        cmdText,
+        `--config-file=${cfg}`,
+        `--working-dir=${workDir}`,
+        ...(trajectoryFile ? [`--trajectory-file=${trajectoryFile}`] : []),
+      ],
       shell: false,
     };
   }
   if (fs.existsSync(py3)) {
     return {
       cmd: py3,
-      args: ['-m', 'trae_agent.cli', 'run', cmdText, `--config-file=${cfg}`, `--working-dir=${workDir}`],
+      args: [
+        '-m',
+        'trae_agent.cli',
+        'run',
+        cmdText,
+        `--config-file=${cfg}`,
+        `--working-dir=${workDir}`,
+        ...(trajectoryFile ? [`--trajectory-file=${trajectoryFile}`] : []),
+      ],
       shell: false,
     };
   }
@@ -153,6 +203,7 @@ function obliterateLayer(layerId) {
       /* job 可能已删 */
     }
   }
+  delete layerQueues[lid];
   if (fs.existsSync(layerPath(lid))) {
     try {
       deleteLayerTree(lid);
@@ -237,9 +288,79 @@ export async function createJob(body) {
   return rec;
 }
 
+/**
+ * UI：运行中任务所在层上「加入队列」。当前任务正常结束（非用户中断）后，按顺序以该层为父叠建新层并执行。
+ * @returns {{ ok: true, layer_id: string, queue_position: number, queue_depth: number }}
+ */
+export function removeLayerQueue(layerId) {
+  const lid = String(layerId || '').trim();
+  if (!lid || !layerQueues[lid]) return;
+  delete layerQueues[lid];
+  saveState();
+}
+
+export function enqueueLayerQueueItem(layerId, body) {
+  const lid = String(layerId || '').trim();
+  if (!lid) throw new Error('layer_id 无效');
+  if (!fs.existsSync(layerPath(lid))) throw new Error(`layer not found: ${lid}`);
+  const command = String(body?.command || '').trim();
+  if (!command) throw new Error('command 不能为空');
+  const command_kind = String(body?.command_kind || 'trae').toLowerCase();
+  if (!['trae', 'shell'].includes(command_kind)) throw new Error('invalid command_kind');
+  if (!anyLayerHasGitRepo()) throw new Error('请先完成「克隆仓库」后再创建任务。');
+  if (command_kind === 'trae' && !fs.existsSync(configFilePath())) {
+    throw new Error(`Config missing: ${configFilePath()}`);
+  }
+  const env = body?.env && typeof body.env === 'object' ? body.env : null;
+  if (!layerQueues[lid]) layerQueues[lid] = [];
+  layerQueues[lid].push({ command, command_kind, env });
+  const depth = layerQueues[lid].length;
+  saveState();
+  broadcast({ type: 'layer_queue_enqueued', layer_id: lid, queue_depth: depth });
+  return { ok: true, layer_id: lid, queue_position: depth - 1, queue_depth: depth };
+}
+
+async function drainQueuedJobsForLayer(completedLayerId) {
+  const lid = String(completedLayerId || '').trim();
+  if (!lid) return;
+  const q = layerQueues[lid];
+  if (!q || !q.length) return;
+  const next = q[0];
+  const rest = q.slice(1);
+  delete layerQueues[lid];
+  saveState();
+  try {
+    const rec = await createJob({
+      repo_layer_id: lid,
+      command: next.command,
+      command_kind: next.command_kind,
+      ...(next.env ? { env: next.env } : {}),
+    });
+    if (rest.length) {
+      layerQueues[rec.layer_id] = rest;
+      saveState();
+      broadcast({ type: 'layer_queue_moved', from_layer_id: lid, to_layer_id: rec.layer_id, queue_depth: rest.length });
+    }
+  } catch (e) {
+    console.error(`[jobsRuntime] drain queue failed for layer ${lid}:`, e);
+    broadcast({
+      type: 'layer_queue_drain_failed',
+      layer_id: lid,
+      detail: String(e.message || e),
+    });
+  }
+}
+
 function runJobAsync(rec, workDir) {
   resetExecStream('job', rec.id);
   const env = { ...process.env, PYTHONUNBUFFERED: '1' };
+  let trajectoryFile;
+  if (rec.command_kind === 'trae') {
+    const trajDir = path.join(layerArtifactsDir(rec.layer_id), '.trajectories');
+    fs.mkdirSync(trajDir, { recursive: true });
+    trajectoryFile = path.join(trajDir, `trajectory_${rec.id}.json`);
+    env.TRAE_AGENT_JSON_OUTPUT_DIR = jobLogsTaeJsonDir(rec.id);
+  }
   if (rec.command_env && typeof rec.command_env === 'object') {
     for (const [k, v] of Object.entries(rec.command_env)) {
       if (v != null) env[String(k)] = String(v);
@@ -249,7 +370,7 @@ function runJobAsync(rec, workDir) {
   if (rec.command_kind === 'shell') {
     proc = spawn('bash', ['-lc', rec.command], { cwd: workDir, env });
   } else {
-    const trae = buildTraeCmd(workDir, rec.command);
+    const trae = buildTraeCmd(workDir, rec.command, { trajectoryFile });
     if (trae) {
       proc = spawn(trae.cmd, trae.args, { cwd: workDir, env, shell: trae.shell || false });
     } else {
@@ -257,7 +378,7 @@ function runJobAsync(rec, workDir) {
         'bash',
         [
           '-lc',
-          `echo "[onlineServiceJS] trae stub (no .venv trae-cli): ${rec.command.replace(/'/g, "'\\''")}"; exit 0`,
+          `echo "[onlineServiceJS] 未找到 trae-cli（请确认镜像已安装 /app/.venv，或设置 TRAE_CLI / TRAE_VENV）。占位未执行指令: ${rec.command.replace(/'/g, "'\\''")}" >&2; exit 1`,
         ],
         { cwd: workDir, env }
       );
@@ -284,10 +405,16 @@ function runJobAsync(rec, workDir) {
   proc.on('close', (code) => {
     running.delete(rec.id);
     rec.exit_code = code;
-    rec.status = code === 0 ? 'completed' : 'failed';
+    const wasInterrupted = rec.status === 'interrupted';
+    if (!wasInterrupted) {
+      rec.status = code === 0 ? 'completed' : 'failed';
+    }
     completeExecStream('job', rec.id);
     saveState();
     broadcast({ type: 'job_finished', job_id: rec.id, status: rec.status, exit_code: code });
+    if (!wasInterrupted) {
+      void drainQueuedJobsForLayer(rec.layer_id);
+    }
   });
   proc.on('error', (e) => {
     running.delete(rec.id);
@@ -298,6 +425,7 @@ function runJobAsync(rec, workDir) {
     completeExecStream('job', rec.id);
     saveState();
     broadcast({ type: 'job_finished', job_id: rec.id, status: 'failed' });
+    void drainQueuedJobsForLayer(rec.layer_id);
   });
 }
 
@@ -317,10 +445,62 @@ export function deleteJob(jobId) {
   const rec = jobs.get(jobId);
   if (!rec) throw new Error('job not found');
   interruptJob(jobId);
+  try {
+    fs.rmSync(jobLogsTaeJsonPath(rec.id), { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+  delete layerQueues[rec.layer_id];
   deleteLayerTree(rec.layer_id);
   jobs.delete(jobId);
   saveState();
   return { ok: true };
+}
+
+/**
+ * 只把「有合法 meta、克隆进行中、或已有仓库内容」的目录计为可写层。
+ * 避免残留空目录名符合 layer id 时混入 GET /api/layers，在图上多出一个与 clone 同级的伪节点。
+ */
+export function layerIdQualifiesForSnapshot(layerId) {
+  const lid = String(layerId || '').trim();
+  if (!lid) return false;
+  const p = layerPath(lid);
+  let stDir;
+  try {
+    stDir = fs.existsSync(p) ? fs.statSync(p) : null;
+  } catch {
+    return false;
+  }
+  if (!stDir || !stDir.isDirectory()) return false;
+  const m = readLayerMeta(lid);
+  if (m && m.kind) return true;
+  const op = getCloneOpStatus(lid);
+  if (op && (op.status === 'queued' || op.status === 'running')) return true;
+  try {
+    if (fs.existsSync(path.join(p, 'base'))) return true;
+  } catch {
+    /* ignore */
+  }
+  if (layerRootOrChildHasGit(p)) return true;
+  return false;
+}
+
+/**
+ * 启动时移除非「可写层」的残留 layer 子目录，避免与真实克隆层在 UI 上重复出现。
+ */
+export function sweepDanglingLayerDirs() {
+  const all = listLayerRows();
+  for (const row of all) {
+    const lid = row.layer_id;
+    if (layerIdQualifiesForSnapshot(lid)) continue;
+    const op = getCloneOpStatus(lid);
+    if (op && (op.status === 'queued' || op.status === 'running')) continue;
+    try {
+      deleteLayerTree(lid);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export function registerBootstrapCloneJob(layerId) {
@@ -346,7 +526,7 @@ export function registerBootstrapCloneJob(layerId) {
 }
 
 export function buildLayersSnapshot(bootstrapLayerId) {
-  const rows = listLayerRows();
+  const rows = listLayerRows().filter((r) => layerIdQualifiesForSnapshot(r.layer_id));
   const known = new Set(rows.map((r) => r.layer_id));
   const jobsList = listJobs();
   const cmdByLayer = {};
@@ -380,6 +560,16 @@ export function buildLayersSnapshot(bootstrapLayerId) {
     if (!displayCmd && cloneCmdByLayer[lid]) {
       displayCmd = cloneCmdByLayer[lid];
     }
+    const qArr = Array.isArray(layerQueues[lid]) ? layerQueues[lid] : [];
+    const queue_items = qArr.map((entry, position) => {
+      const cmd = String(entry.command || '');
+      const command_preview = cmd.length > 72 ? cmd.slice(0, 72) + '…' : cmd;
+      return {
+        position,
+        command_kind: entry.command_kind || 'trae',
+        command_preview,
+      };
+    });
     const item = {
       layer_id: lid,
       created_at: row.created_at,
@@ -387,11 +577,12 @@ export function buildLayersSnapshot(bootstrapLayerId) {
       parent_layer_id: resolvedParentLayerId(lid, known, jobsList),
       job_id: jobByLayer[lid]?.id || null,
       job_status: jobByLayer[lid]?.status || null,
-      queue_depth: 0,
+      queue_depth: qArr.length,
+      queue_items,
       mind_state: jobByLayer[lid]?.status === 'running' || jobByLayer[lid]?.status === 'pending' ? 'running' : 'idle_done',
       git_worktree_dirty: gitWorktreeDirty(lid),
       git_remote: {},
-      meta_kind: meta?.kind || 'clone',
+      meta_kind: meta?.kind || null,
     };
     layers.push(item);
   }
