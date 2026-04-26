@@ -15,6 +15,10 @@
 | `TRAE_CLI` | 可选。若设置，则 **`command_kind=trae`** 时直接以该可执行文件运行，参数形如：`<命令文本> --working-dir=<层目录>`（不再拼接 `--config-file`，由可执行文件自身或环境决定）。 |
 | `ONLINE_PROJECT_LAYERS` | 可选。可写层根目录，默认 `{REPO_ROOT}/onlineProject_state/layers`。 |
 | `PORT` | 可选。HTTP 监听端口，默认 **8765**。 |
+| `CODE_SERVER_ENABLED` | 可选。设为 `1`/`true` 时在容器内后台启动 **code-server**（VS Code Web），监听 **8888**；工作目录见 `CODE_SERVER_WORKDIR`（默认 `/app`）。模拟启动时 `docker run` 会映射 `8888`→宿主机动态端口，日志中给出 `http://127.0.0.1:<端口>/`。`--auth none`，仅适合本机 mock。 |
+| `CODE_SERVER_WORKDIR` | 可选。code-server 打开的根目录，默认 `/app`（含 `trae_agent` 与 `onlineServiceJS`）。 |
+
+Dockerfile 基于 **ubuntu:24.04**（多阶段构建 Python venv；主软件源见 `onlineServiceJS/Dockerfile` 头部注释）。系统 Python 为 3.12，业务 venv 为 `/app/.venv`。构建参数 `ENABLE_CODE_SERVER=0` 可跳过 code-server 以缩短构建时间。
 
 容器换票、引导克隆等仍可使用：`TaskApiEndPoint`、`BusinessApiEndPoint`、`BUSINESS_API_ENDPOINT`、`tenantId`、`workspaceId`、`taskId`、`ACCESS_TOKEN`（与任务云约定一致）。**启动就绪日志**：标准输出含 **`[onlineServiceJS] server listening on http://0.0.0.0:<PORT>`**，供编排检测。
 

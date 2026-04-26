@@ -12,7 +12,9 @@
 #   TRAE_GIT_PATH       可设为绝对路径（如 /usr/bin/git），当 PATH 上 git 为不兼容包装脚本时避免克隆失败
 #   NODEJS_WATCH      默认开启：node --watch，改动 src/*.mjs 等依赖树会自动重启。
 #                     设为 0 / false 则单次运行（与生产行为一致）。
-#   若 PORT 已被监听，本脚本会先 kill -9 占用该端口的进程再启动（本地开发约定）。
+#   若 PORT 已被监听（本地 Node 模式），本脚本会先 kill -9 占用该端口的进程再启动。
+#   Docker 模式：自动使用随机可用主机端口映射到容器 PORT，避免端口冲突。
+#                映射端口记录在 ${STATE_ROOT}/runtime/.docker_mapped_port。
 #
 # Docker（默认开启；构建上下文须为 trae-agent 根目录）：
 #   ./run.sh
@@ -137,11 +139,20 @@ if [[ "${TRAE_ONLINE_JS_DOCKER:-1}" != "0" && "${TRAE_ONLINE_JS_DOCKER:-1}" != "
     _docker_overlay_default=0
   fi
 
-  _docker_cid_file="${TMPDIR:-/tmp}/onlineServiceJS.docker.$$.$RANDOM.cid"
-  rm -f "$_docker_cid_file"
-  _docker_cleanup_done=0
-  _docker_run_pid=''
-  _docker_cleanup() {
+  # Generate random port for Docker mapping to avoid conflicts
+_random_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind((\"\", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || \
+    awk -v start=32768 -v end=60999 'BEGIN{srand(); print int(start+rand()*(end-start))}'
+}
+
+HOST_PORT="$(_random_port)"
+export HOST_PORT
+
+_docker_cid_file="${TMPDIR:-/tmp}/onlineServiceJS.docker.$$.$RANDOM.cid"
+rm -f "$_docker_cid_file"
+_docker_cleanup_done=0
+_docker_run_pid=''
+_docker_cleanup() {
     [[ "$_docker_cleanup_done" == 1 ]] && return
     _docker_cleanup_done=1
     local cid=""
@@ -151,30 +162,33 @@ if [[ "${TRAE_ONLINE_JS_DOCKER:-1}" != "0" && "${TRAE_ONLINE_JS_DOCKER:-1}" != "
     if [[ -n "$cid" ]]; then
       docker stop -t 10 "$cid" >/dev/null 2>&1 || docker kill "$cid" >/dev/null 2>&1 || true
     fi
-    # 主进程是 docker 客户端时，stop 后通常已退出；若仍存活则再发信号，避免挂住占用端口/任务。
     if [[ -n "${_docker_run_pid}" ]] && kill -0 "$_docker_run_pid" 2>/dev/null; then
       kill -TERM "$_docker_run_pid" 2>/dev/null || true
     fi
     rm -f "$_docker_cid_file"
-  }
-  trap '_docker_cleanup' EXIT INT TERM HUP
+}
+trap '_docker_cleanup' EXIT INT TERM HUP
 
-  # 勿使用 exec。前台 `docker run` 时 SIGINT 常只交给 docker 子进程，bash 的 INT trap 不执行、EXIT 在 hung 时也不触发；
-  # 子进程在后台、父 shell 前台 wait 时，同一会话上 Ctrl+C 会先到本 shell，trap 可可靠 stop 容器。后台 run 无法分配 pty，故不传 --tty。
-  docker run --rm -i --privileged \
-    --cidfile "$_docker_cid_file" \
-    -p "${PORT}:${PORT}" \
-    -v "${STATE_ROOT}:/app/onlineProject_state" \
-    -v "${ONLINE_PROJ_HOST}:/app/onlineProject" \
-    -e "ACCESS_TOKEN=${ACCESS_TOKEN}" \
-    -e "PORT=${PORT}" \
-    -e "REPO_ROOT=/app" \
-    -e "ONLINE_PROJECT_STATE_ROOT=/app/onlineProject_state" \
-    -e "ONLINE_PROJECT_LAYERS=${_layers_in_container}" \
-    -e "TRAE_USE_OVERLAY_STACK=${TRAE_USE_OVERLAY_STACK:-$_docker_overlay_default}" \
-    -e "BusinessApiEndPoint=${BusinessApiEndPoint}" \
-    -e "GIT_HTTP_IPV4=${GIT_HTTP_IPV4:-1}" \
-    "${IMAGE}" &
+_docker_port_file="${STATE_ROOT}/runtime/.docker_mapped_port"
+echo -n "$HOST_PORT" > "$_docker_port_file"
+echo "[run.sh] Docker 随机映射端口: localhost:${HOST_PORT} -> 容器:${PORT}" >&2
+echo "[run.sh] 映射端口记录在: ${_docker_port_file}" >&2
+echo "[run.sh] 控制台: http://127.0.0.1:${HOST_PORT}/ui/${ACCESS_TOKEN}" >&2
+
+docker run --rm -i --privileged \
+  --cidfile "$_docker_cid_file" \
+  -p "127.0.0.1:${HOST_PORT}:${PORT}" \
+  -v "${STATE_ROOT}:/app/onlineProject_state" \
+  -v "${ONLINE_PROJ_HOST}:/app/onlineProject" \
+  -e "ACCESS_TOKEN=${ACCESS_TOKEN}" \
+  -e "PORT=${PORT}" \
+  -e "REPO_ROOT=/app" \
+  -e "ONLINE_PROJECT_STATE_ROOT=/app/onlineProject_state" \
+  -e "ONLINE_PROJECT_LAYERS=${_layers_in_container}" \
+  -e "TRAE_USE_OVERLAY_STACK=${TRAE_USE_OVERLAY_STACK:-$_docker_overlay_default}" \
+  -e "BusinessApiEndPoint=http://127.0.0.1:${HOST_PORT}/api" \
+  -e "GIT_HTTP_IPV4=${GIT_HTTP_IPV4:-1}" \
+  "${IMAGE}" &
   _docker_run_pid=$!
   set +e
   wait "$_docker_run_pid"

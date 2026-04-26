@@ -11,6 +11,7 @@ import {
   createEmptyLayer,
   layerPath,
   readLayerMeta,
+  writeLayerMeta,
   LAYER_ID_RE,
   repoDirNameFromUrl,
 } from './layerFs.mjs';
@@ -24,6 +25,8 @@ import {
 import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
 
 export let bootstrapCloneLayerId = null;
+/** 为 true 时 server 须在引导结束后调用 registerBootstrapCloneJob（仅「任务详情已含仓库并完成引导克隆」） */
+export let bootstrapRegisterCloneJob = false;
 export let startupEmptyLayerId = null;
 
 /** 克隆日志走通用 exec-stream（分片 + SSE）；与 GET /api/exec-streams/clone/:id/* 同源 */
@@ -235,8 +238,10 @@ async function cloneReposIntoSharedLayer(urls, credRoot, cloudPrefix, accessToke
   const layerId = newLayerId();
   createRootLayer(layerId);
   clearCloneLayerLog(layerId);
-  appendCloneLayerLog(layerId, '【容器启动引导】正在克隆任务关联仓库…\n\n');
-  await postCloneProgress(cloudPrefix, accessToken, 0, '【容器启动引导】开始克隆任务关联仓库…');
+  /** 须在首条日志写入前赋值：克隆可能持续数分钟，期间 GET /api/repos/bootstrap-clone-log 与 /api/project/active 依赖此 id。 */
+  bootstrapCloneLayerId = layerId;
+  appendCloneLayerLog(layerId, '【项目克隆】正在克隆任务关联仓库（任务详情已拉取）…\n\n');
+  await postCloneProgress(cloudPrefix, accessToken, 0, '【项目克隆】开始克隆任务关联仓库…');
 
   const layerDir = layerPath(layerId);
   const n = urls.length;
@@ -276,12 +281,16 @@ async function cloneReposIntoSharedLayer(urls, credRoot, cloudPrefix, accessToke
         : [...gitCloneConfigArgs(), 'clone', '--progress', cloneRemote, repoDir];
       if (pem) {
         keyPath = writeTempSshKey(pem);
-        const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+        const sshTimeout = Math.max(
+          5,
+          Math.min(120, parseInt(String(process.env.TRAE_GIT_SSH_CONNECT_TIMEOUT_SEC || '30'), 10) || 30)
+        );
+        const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${sshTimeout}`;
         gitEnv.GIT_SSH_COMMAND = ssh;
       }
       await runGitClone(args, gitEnv);
       const pct = Math.min(99, Math.floor(((i + 1) / n) * 100));
-      await postCloneProgress(cloudPrefix, accessToken, pct, `容器克隆 (${i + 1}/${n}) 完成 ${path.basename(repoDir)}`);
+      await postCloneProgress(cloudPrefix, accessToken, pct, `项目克隆 (${i + 1}/${n}) 完成 ${path.basename(repoDir)}`);
     } finally {
       if (keyPath) {
         try {
@@ -292,9 +301,22 @@ async function cloneReposIntoSharedLayer(urls, credRoot, cloudPrefix, accessToke
       }
     }
   }
-  appendCloneLayerLog(layerId, '\n【容器启动引导】克隆完成。\n');
+  appendCloneLayerLog(layerId, '\n【项目克隆】克隆完成。\n');
   finalizeCloneLayerLog(layerId);
-  await postCloneProgress(cloudPrefix, accessToken, 100, '【容器启动引导】仓库克隆已完成');
+  await postCloneProgress(cloudPrefix, accessToken, 100, '【项目克隆】仓库克隆已完成');
+  return layerId;
+}
+
+/**
+ * 任务详情中无关联仓库时创建空可写层（无 .git）：`layer_meta.kind=clone` 仅用于纳入快照；
+ * 首个仓库由后续 `POST /api/repos/clone`（或等价 git clone）写入。
+ */
+function createInitialWorkspaceLayer() {
+  const layerId = newLayerId();
+  createRootLayer(layerId);
+  writeLayerMeta(layerId, 'clone', null);
+  logOutbound(`bootstrap: initial writable layer (no git, await clone) ${layerId}`);
+  console.log(`[onlineServiceJS] 已创建初始可写层（无 git，待首次克隆）: ${layerId}`);
   return layerId;
 }
 
@@ -311,16 +333,21 @@ function logOutbound(line) {
   }
 }
 
-export async function runBootstrap() {
+/**
+ * HTTP 监听前：解析 TaskApi 前缀并完成换票（若需要）。
+ * 任务详情拉取、仓库克隆、service_config.yaml 写入在 {@link runBootstrapAfterListen}。
+ */
+export async function runBootstrapTokenExchangeOnly() {
   bootstrapCloneLayerId = null;
+  bootstrapRegisterCloneJob = false;
   let prefix;
   try {
     prefix = taskApiPrefix();
   } catch (e) {
     logOutbound(`bootstrap skip: ${e.message}`);
-    return;
+    return { skipped: true };
   }
-  if (!prefix) return;
+  if (!prefix) return { skipped: true };
 
   const timeout = Math.max(1, parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '5') || 5);
   const business = businessApiEndpoint();
@@ -348,10 +375,27 @@ export async function runBootstrap() {
     logOutbound('bootstrap: skip exchange (local business API)');
   }
 
+  return { skipped: false, prefix, newAccess, timeout };
+}
+
+/**
+ * 容器已监听端口后：拉取任务详情 → 克隆关联仓库 → 拉取并写入 feature YAML。
+ */
+export async function runBootstrapAfterListen(ctx) {
+  if (!ctx || ctx.skipped) {
+    logOutbound('bootstrap post-listen: skip (no task API prefix)');
+    return;
+  }
+  const { prefix, newAccess, timeout } = ctx;
+  const timeoutSec = timeout;
+
+  console.log('[onlineServiceJS] 容器已启动，开始拉取任务详情…');
+  logOutbound('bootstrap post-listen: task-detail');
+
   const detail = await postJson(
     `${prefix}/server-container-token/task-detail/`,
     { access_token: newAccess },
-    timeout
+    timeoutSec
   );
   const urls = collectRepoUrls(detail);
   let credRoot = {};
@@ -359,15 +403,19 @@ export async function runBootstrap() {
     credRoot = detail.repo_clone_credentials;
   }
   if (urls.length) {
+    console.log('[onlineServiceJS] 任务详情已就绪，开始项目克隆…');
     bootstrapCloneLayerId = await cloneReposIntoSharedLayer(urls, credRoot, prefix, newAccess);
+    bootstrapRegisterCloneJob = true;
   } else {
     logOutbound('bootstrap: no repo urls in task-detail');
+    bootstrapCloneLayerId = createInitialWorkspaceLayer();
+    bootstrapRegisterCloneJob = false;
   }
 
   const y = await postJson(
     `${prefix}/server-container-token/feature-params-yaml/`,
     { access_token: newAccess },
-    timeout
+    timeoutSec
   );
   const yamlText = y.yaml;
   if (yamlText == null || typeof yamlText !== 'string') {
@@ -378,6 +426,14 @@ export async function runBootstrap() {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.writeFileSync(dest, yamlText, 'utf8');
   logOutbound(`bootstrap: wrote ${dest}`);
+  console.log('[onlineServiceJS] 任务引导完成（详情已拉取、克隆与配置已就绪）。');
+}
+
+/** 顺序执行换票 + 详情/克隆/配置（单测或无需分离 listen 的场景）。 */
+export async function runBootstrap() {
+  const ctx = await runBootstrapTokenExchangeOnly();
+  if (ctx.skipped) return;
+  await runBootstrapAfterListen(ctx);
 }
 
 export function ensureStartupEmptyLayer() {

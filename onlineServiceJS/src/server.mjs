@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import multer from 'multer';
@@ -11,8 +12,10 @@ import { getAgentRenderHints } from './agentRenderHints.mjs';
 import { serviceRoot, configFilePath, repoRoot, logsDir } from './paths.mjs';
 import { ssePingLoop, addSseClient, broadcast } from './sseHub.mjs';
 import {
-  runBootstrap,
+  runBootstrapTokenExchangeOnly,
+  runBootstrapAfterListen,
   bootstrapCloneLayerId,
+  bootstrapRegisterCloneJob,
   ensureStartupEmptyLayer,
   getCloneLayerLogText,
   clearCloneLayerLog,
@@ -34,6 +37,7 @@ import {
   deleteLayerTree,
   directChildLayerIds,
   repoDirNameFromUrl,
+  writeLayerMeta,
 } from './layerFs.mjs';
 import {
   createJob,
@@ -407,8 +411,9 @@ api.post('/repos/clone', (req, res) => {
   const root = layerPath(lid);
   let ephemeralKeyDir = null;
   try {
+    // 在克隆开始前先创建层级节点，建立可写层
+    writeLayerMeta(lid, 'clone', parent_layer_id || null);
     fs.mkdirSync(root, { recursive: true });
-    // 与 Python git_clone 一致：克隆到 base/，layer_meta.json 在后台成功后写入层根
     const cloneCwd = path.join(root, 'base');
     fs.mkdirSync(cloneCwd, { recursive: true });
     clearCloneLayerLog(lid);
@@ -417,7 +422,7 @@ api.post('/repos/clone', (req, res) => {
     const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
     if (usePem) {
       cloneUrl = url.toLowerCase().startsWith('https://') ? gitSshFromHttps(url) : url;
-      const dir = fs.mkdtempSync(path.join(path.tmpdir(), 'ui_clone_'));
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ui_clone_'));
       ephemeralKeyDir = dir;
       const keyPath = path.join(dir, 'k');
       let c = pem;
@@ -506,7 +511,7 @@ api.post('/repos/reclone', async (req, res) => {
   try {
     if (usePem) {
       cloneUrl = repoUrl.toLowerCase().startsWith('https://') ? gitSshFromHttps(repoUrl) : repoUrl;
-      const dir = fs.mkdtempSync(path.join(path.tmpdir(), 'reclone_'));
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reclone_'));
       keyPath = path.join(dir, 'k');
       let c = pem;
       if (!c.endsWith('\n')) c += '\n';
@@ -586,17 +591,81 @@ api.get('/layers/:layer_id/files/*', (req, res) => {
 
 api.get('/layers/:layer_id/children', (req, res) => {
   const work = layerPrimaryGitWorkdir(req.params.layer_id);
-  if (!work) return res.json({ entries: [] });
-  const dir = path.join(work, (req.query.dir || '.').toString());
-  const entries = [];
-  try {
-    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-      entries.push({ name: ent.name, is_dir: ent.isDirectory() });
-    }
-  } catch {
-    /* ignore */
+  if (!work) {
+    return res.json({ entries: [], total: 0, next_offset: 0, truncated: false });
   }
-  res.json({ entries });
+  const workResolved = path.resolve(work);
+  const dirRaw = (req.query.dir ?? '').toString().trim();
+  const dirRel = dirRaw.replace(/\\/g, '/').replace(/^\/+/, '');
+  const absDir = path.resolve(path.join(work, dirRel || '.'));
+  if (absDir !== workResolved && !absDir.startsWith(workResolved + path.sep)) {
+    return res.status(400).json({ detail: 'invalid dir' });
+  }
+  const prefixRaw = (req.query.prefix ?? '').toString().replace(/\\/g, '/');
+  const offset = Math.max(0, parseInt(req.query.offset ?? '0', 10) || 0);
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit ?? '200', 10) || 200), 2000);
+
+  let dirents = [];
+  try {
+    dirents = fs.readdirSync(absDir, { withFileTypes: true });
+  } catch (e) {
+    return res.status(400).json({ detail: String(e.message || e) });
+  }
+
+  function entryMatchesPrefix(relPosix, baseName) {
+    if (!prefixRaw) return true;
+    if (relPosix.startsWith(prefixRaw)) return true;
+    if (baseName.startsWith(prefixRaw)) return true;
+    const noTrail = prefixRaw.endsWith('/') ? prefixRaw.slice(0, -1) : prefixRaw;
+    if (noTrail && (baseName === noTrail || relPosix === noTrail)) return true;
+    return false;
+  }
+
+  const rows = [];
+  for (const ent of dirents) {
+    if (ent.name === '.git') continue;
+    const relPosix = dirRel ? `${dirRel}/${ent.name}` : ent.name;
+    if (!entryMatchesPrefix(relPosix, ent.name)) continue;
+
+    let isDir = ent.isDirectory();
+    if (ent.isSymbolicLink()) {
+      try {
+        const st = fs.statSync(path.join(absDir, ent.name));
+        isDir = st.isDirectory();
+      } catch {
+        continue;
+      }
+    }
+
+    let size = 0;
+    if (!isDir) {
+      try {
+        size = fs.statSync(path.join(absDir, ent.name)).size;
+      } catch {
+        /* ignore */
+      }
+    }
+    rows.push({
+      type: isDir ? 'dir' : 'file',
+      path: relPosix,
+      size,
+    });
+  }
+
+  rows.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+    return String(a.path).localeCompare(String(b.path));
+  });
+
+  const total = rows.length;
+  const page = rows.slice(offset, offset + limit);
+  const truncated = offset + page.length < total;
+  res.json({
+    entries: page,
+    total,
+    next_offset: offset + page.length,
+    truncated,
+  });
 });
 
 api.get('/layers/:layer_id/diff/parent/files', (req, res) => {
@@ -642,7 +711,7 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
   let keyPath = null;
   try {
     if (pem) {
-      const dir = fs.mkdtempSync(path.join(path.tmpdir(), 'push_'));
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push_'));
       keyPath = path.join(dir, 'k');
       let c = pem;
       if (!c.endsWith('\n')) c += '\n';
@@ -705,14 +774,13 @@ async function main() {
   const strict = ['1', 'true', 'yes', 'on'].includes(
     String(process.env.TASK_API_BOOTSTRAP_STRICT_STARTUP || '').toLowerCase()
   );
+  let bootstrapCtx;
   try {
-    await runBootstrap();
-    if (bootstrapCloneLayerId) {
-      registerBootstrapCloneJob(bootstrapCloneLayerId);
-    }
+    bootstrapCtx = await runBootstrapTokenExchangeOnly();
   } catch (e) {
-    console.error('[onlineServiceJS] bootstrap error:', e);
+    console.error('[onlineServiceJS] bootstrap (token) error:', e);
     if (strict) process.exit(1);
+    bootstrapCtx = { skipped: true };
   }
   ensureStartupEmptyLayer();
   try {
@@ -721,9 +789,25 @@ async function main() {
     console.error('[onlineServiceJS] layer dir sweep error:', e);
   }
 
-  app.listen(port, host, () => {
-    console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);
-    broadcast({ type: 'service_ready', port });
+  await new Promise((resolve, reject) => {
+    try {
+      app.listen(port, host, async () => {
+        console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);
+        broadcast({ type: 'service_ready', port });
+        try {
+          await runBootstrapAfterListen(bootstrapCtx);
+          if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
+            registerBootstrapCloneJob(bootstrapCloneLayerId);
+          }
+        } catch (e) {
+          console.error('[onlineServiceJS] bootstrap (post-listen) error:', e);
+          if (strict) process.exit(1);
+        }
+        resolve();
+      });
+    } catch (e) {
+      reject(e);
+    }
   });
 }
 

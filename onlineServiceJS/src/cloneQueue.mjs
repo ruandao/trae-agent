@@ -138,17 +138,16 @@ function executeCloneTask(task) {
         cleanupEphemeral(ephemeralKeyDir);
         if (code === 0) {
           try {
-            const metaPayload = {
-              version: 1,
-              kind: 'clone',
-              parent_layer_id: parentLayerId || null,
-            };
-            if (titleUrl) metaPayload.clone_url = String(titleUrl).trim();
-            fs.writeFileSync(
-              path.join(root, 'layer_meta.json'),
-              JSON.stringify(metaPayload, null, 2),
-              'utf8'
-            );
+            // 已经在克隆开始前创建了 layer_meta.json，这里只需要更新 clone_url（如果有）
+            if (titleUrl) {
+              const existingMeta = JSON.parse(fs.readFileSync(path.join(root, 'layer_meta.json'), 'utf8'));
+              existingMeta.clone_url = String(titleUrl).trim();
+              fs.writeFileSync(
+                path.join(root, 'layer_meta.json'),
+                JSON.stringify(existingMeta, null, 2),
+                'utf8'
+              );
+            }
           } catch {
             /* ignore */
           }

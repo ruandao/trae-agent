@@ -959,7 +959,7 @@
           parts.push('<pre class="plain-chunk">' + escapeHtmlPlain(normalizeCloneLogText(f.text)) + '</pre>');
         }
       }
-      const body = parts.length ? parts.join('') : '<pre class="plain-chunk"> </pre>';
+      const body = parts.length ? parts.join('') : '<pre class="plain-chunk"></pre>';
       return (
         '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' +
         css +
@@ -3652,6 +3652,34 @@
         bar.appendChild(delBtn);
       }
 
+      const copyLayerStructBtn = document.createElement('button');
+      copyLayerStructBtn.type = 'button';
+      copyLayerStructBtn.className = 'secondary';
+      copyLayerStructBtn.textContent = '复制层级结构';
+      copyLayerStructBtn.title = '复制层级结构 JSON 到剪贴板，方便 debug';
+      copyLayerStructBtn.onclick = debounceClick(() => {
+        const layers = window.__layersForMind || [];
+        const jobs = lastJobs || [];
+        const structure = {
+          layers: layers,
+          jobs: jobs,
+          selectedLayerId: layerId,
+          timestamp: new Date().toISOString()
+        };
+        const jsonStr = JSON.stringify(structure, null, 2);
+        navigator.clipboard.writeText(jsonStr).then(() => {
+          const toast = document.createElement('div');
+          toast.className = 'meta';
+          toast.style.cssText = 'color:var(--ok,#0a0);margin-top:0.35rem;';
+          toast.textContent = '✅ 层级结构已复制到剪贴板（共 ' + layers.length + ' 个层，' + jobs.length + ' 个任务）';
+          bar.appendChild(toast);
+          setTimeout(() => toast.remove(), 3000);
+        }).catch((err) => {
+          alert('复制失败：' + (err && err.message ? err.message : String(err)));
+        });
+      }, BTN_DEBOUNCE_MS);
+      bar.appendChild(copyLayerStructBtn);
+
       if (mindRunning) {
         const qWrap = document.createElement('div');
         qWrap.style.cssText =
@@ -4572,26 +4600,31 @@
         await applyTaskGate();
       } catch (_) {}
       const layersBoot = (async () => {
+        let didHydrateBootstrapLayers = false;
+        const deadline = Date.now() + 180000;
         try {
-          const r = await api('/api/repos/bootstrap-clone-log');
-          if (r.ok) {
-            const j = await r.json();
-            if (
-              j &&
-              j.layer_id &&
-              j.text != null &&
-              String(j.text).trim() &&
-              !getCloneSnapshotPlain().trim()
-            ) {
-              clearCloneHostVisual();
-              setCloneFrameFromPlainLog(j.text);
-              await loadLayers(j.layer_id);
-              const sel = document.getElementById('layerSelect');
-              if (sel && j.layer_id) sel.value = j.layer_id;
-              updateLayerCommandMeta();
-              void reloadLayerTree();
-              return;
-            }
+          while (Date.now() < deadline) {
+            try {
+              const r = await api('/api/repos/bootstrap-clone-log');
+              if (r.ok) {
+                const j = await r.json();
+                const t = j && j.text != null ? String(j.text) : '';
+                if (j && j.layer_id && t.trim()) {
+                  if (!didHydrateBootstrapLayers) {
+                    clearCloneHostVisual();
+                    didHydrateBootstrapLayers = true;
+                    await loadLayers(j.layer_id);
+                    const sel = document.getElementById('layerSelect');
+                    if (sel && j.layer_id) sel.value = j.layer_id;
+                    updateLayerCommandMeta();
+                    void reloadLayerTree();
+                  }
+                  setCloneFrameFromPlainLog(t);
+                  if (t.includes('克隆完成')) return;
+                }
+              }
+            } catch (_) {}
+            await new Promise((resolve) => setTimeout(resolve, 400));
           }
         } catch (_) {}
         await loadLayers(__persistedClone && __persistedClone.layer_id);
