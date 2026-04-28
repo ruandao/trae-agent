@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
+    "test:unit": "node --test src/layerFlatFiles.test.mjs",
     "test:e2e": "playwright test --project=api",
     "test:e2e:browser": "playwright test --project=chromium",
     "test:e2e:cdp": "playwright test --project=cdp9222"

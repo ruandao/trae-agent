@@ -1,7 +1,6 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawn } from 'child_process';
 import YAML from 'yaml';
 
 import { configFilePath, reqLogsDir } from './paths.mjs';
@@ -23,18 +22,72 @@ import {
   completeExecStream,
 } from './execStream.mjs';
 import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
+import {
+  postJson,
+  rewriteDockerInternal,
+  taskApiPrefix,
+  postCloneProgress,
+  latestGitProgressPercent,
+  parseGitCloneProgressPhases,
+  normalizeGitProgressChunkForLog,
+  runGitCloneWithProgress,
+} from './saasTaskCloud.mjs';
 
 export let bootstrapCloneLayerId = null;
 /** 为 true 时 server 须在引导结束后调用 registerBootstrapCloneJob（仅「任务详情已含仓库并完成引导克隆」） */
 export let bootstrapRegisterCloneJob = false;
 export let startupEmptyLayerId = null;
 
+/**
+ * 多仓引导克隆期间：各仓 stderr 并行写入此结构，GET /api/repos/bootstrap-clone-log 再拼成 text 并返回 segments。
+ * 引导结束并写入 exec-stream 后清空。
+ * @type {{
+ *   layerId: string,
+ *   preamble: string,
+ *   jobs: { raw: string, repoDir: string, index: number }[],
+ *   bufs: Map<string, { header: string, body: string, failNote?: string }>,
+ * } | null}
+ */
+let bootstrapRepoLogState = null;
+
 /** 克隆日志走通用 exec-stream（分片 + SSE）；与 GET /api/exec-streams/clone/:id/* 同源 */
 export function appendCloneLayerLog(layerId, text) {
   appendExecStream('clone', layerId, text);
 }
 
+function rebuildBootstrapParallelLogText() {
+  if (!bootstrapRepoLogState) return '';
+  const { preamble, jobs, bufs } = bootstrapRepoLogState;
+  const parts = [preamble];
+  for (const job of jobs) {
+    const e = bufs.get(job.raw);
+    if (!e) continue;
+    parts.push(e.header + e.body + (e.failNote || ''));
+  }
+  return parts.join('\n\n');
+}
+
+/**
+ * 引导多仓并行克隆进行中时供 GET /api/repos/bootstrap-clone-log 返回 `segments`（按任务详情仓库顺序）。
+ * @param {string} layerId
+ * @returns {{ repo_url: string, text: string }[] | null}
+ */
+export function getBootstrapCloneLogSegmentsForApi(layerId) {
+  if (!bootstrapRepoLogState || bootstrapRepoLogState.layerId !== layerId) {
+    return null;
+  }
+  const { jobs, bufs } = bootstrapRepoLogState;
+  return jobs.map((job) => {
+    const e = bufs.get(job.raw);
+    const text = e ? e.header + e.body + (e.failNote || '') : '';
+    return { repo_url: job.raw, text };
+  });
+}
+
 export function getCloneLayerLogText(layerId) {
+  if (bootstrapRepoLogState && bootstrapRepoLogState.layerId === layerId) {
+    return rebuildBootstrapParallelLogText();
+  }
   return getExecStreamFullText('clone', layerId);
 }
 
@@ -45,66 +98,6 @@ export function clearCloneLayerLog(layerId) {
 /** 引导克隆结束：封包并推送 exec_stream_complete（与 UI 克隆队列一致） */
 export function finalizeCloneLayerLog(layerId) {
   completeExecStream('clone', layerId);
-}
-
-function traceHeaders() {
-  const tid = String(process.env.TRACE_ID || '').trim();
-  const h = { 'Content-Type': 'application/json' };
-  if (tid) h['X-Trace-Id'] = tid;
-  return h;
-}
-
-async function postJson(url, body, timeoutSec = 8) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutSec * 1000);
-  try {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: traceHeaders(),
-      body: JSON.stringify(body),
-      signal: ac.signal,
-    });
-    const text = await r.text();
-    let data = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      throw new Error(`Invalid JSON from ${url}: ${text.slice(0, 200)}`);
-    }
-    if (!r.ok) {
-      throw new Error(`HTTP ${r.status} ${url}: ${JSON.stringify(data).slice(0, 500)}`);
-    }
-    return data;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function rewriteDockerInternal(url) {
-  const u = String(url || '').trim();
-  if (!u) return u;
-  try {
-    const x = new URL(u);
-    if (x.hostname.toLowerCase() !== 'host.docker.internal') return u;
-    const ip = String(process.env.DOCKER_HOST_GATEWAY_IP || '').trim();
-    if (!ip) return u;
-    x.hostname = ip;
-    return x.toString();
-  } catch {
-    return u;
-  }
-}
-
-function taskApiPrefix() {
-  const endpoint = rewriteDockerInternal(String(process.env.TaskApiEndPoint || '').trim());
-  if (!endpoint) return null;
-  const tenant = String(process.env.tenantId || '').trim();
-  const workspace = String(process.env.workspaceId || '').trim();
-  const task = String(process.env.taskId || '').trim();
-  if (!tenant || !workspace || !task) {
-    throw new Error('TaskApiEndPoint set but tenantId/workspaceId/taskId missing');
-  }
-  return `${endpoint.replace(/\/$/, '')}/api/tenant/${tenant}/workspace/${workspace}/task/${task}/cloud`;
 }
 
 function businessApiEndpoint() {
@@ -200,123 +193,234 @@ function collectRepoUrls(taskDetail) {
   return out;
 }
 
-function runGitClone(args, env, cwd) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(gitCmd(), args, { env: { ...process.env, ...env }, cwd: cwd || undefined });
-    let err = '';
-    proc.stderr?.on('data', (c) => {
-      err += c.toString();
-    });
-    proc.on('error', reject);
-    proc.on('close', (code) => {
-      if (code === 0) resolve(err);
-      else reject(new Error(`git exit ${code}: ${err.slice(-1500)}`));
-    });
-  });
-}
+/**
+ * 并行发起单仓 git clone；stderr 写入 {@link bootstrapRepoLogState} 中对应仓库的 body（与其它仓并行追加）。
+ * @returns {Promise<{ ok: boolean, err?: Error }>}
+ */
+async function runOneBootstrapClone({
+  job,
+  n,
+  credRoot,
+  cloudPrefix,
+  accessToken,
+}) {
+  const { raw, repoDir, index: i } = job;
+  const cred = credRoot[raw] || credRoot[raw.replace(/\/$/, '')];
+  const pem = cred && typeof cred === 'object' ? String(cred.ephemeral_ssh_private_key || '').trim() : '';
+  const useSsh =
+    !!pem ||
+    String(process.env.GIT_CLONE_USE_SSH_URL || '')
+      .trim()
+      .toLowerCase() === '1' ||
+    ['true', 'yes'].includes(String(process.env.GIT_CLONE_USE_SSH_URL || '').trim().toLowerCase());
+  let cloneRemote = raw;
+  if (pem || (useSsh && raw.toLowerCase().startsWith('https://'))) {
+    cloneRemote = gitCloneRemoteForSshPem(raw);
+    if (cloneRemote !== raw) {
+      const ent = bootstrapRepoLogState?.bufs.get(raw);
+      if (ent) ent.body += `[bootstrap-clone] HTTPS → SSH: ${cloneRemote}\n`;
+    }
+  }
 
-async function postCloneProgress(cloudPrefix, accessToken, progress, message) {
-  const url = `${cloudPrefix.replace(/\/$/, '')}/server-container-token/git-clone-progress/`;
+  let keyPath = null;
   try {
-    await postJson(
-      url,
-      {
-        access_token: accessToken,
-        progress: Math.max(0, Math.min(100, progress)),
-        message: String(message || '').slice(0, 2000),
-      },
-      10
+    const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+    const useV4 = String(process.env.TRAE_GIT_CLONE_ALLOW_IPV6 || '').trim() !== '1';
+    const args = useV4
+      ? [...gitCloneConfigArgs(), 'clone', '-4', '--progress', cloneRemote, repoDir]
+      : [...gitCloneConfigArgs(), 'clone', '--progress', cloneRemote, repoDir];
+    if (pem) {
+      keyPath = writeTempSshKey(pem);
+      const sshTimeout = Math.max(
+        5,
+        Math.min(120, parseInt(String(process.env.TRAE_GIT_SSH_CONNECT_TIMEOUT_SEC || '30'), 10) || 30)
+      );
+      const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${sshTimeout}`;
+      gitEnv.GIT_SSH_COMMAND = ssh;
+    }
+    let lastPosted = 0;
+    let lastPct = -1;
+    await runGitCloneWithProgress(args, gitEnv, undefined, (chunk, errAll) => {
+      if (chunk) {
+        const ent = bootstrapRepoLogState?.bufs.get(raw);
+        if (ent) ent.body += normalizeGitProgressChunkForLog(chunk);
+      }
+      const g = latestGitProgressPercent(errAll);
+      if (g < 0) return;
+      const now = Date.now();
+      if (g === lastPct && now - lastPosted < 2000) return;
+      if (now - lastPosted < 400 && g <= lastPct) return;
+      lastPct = g;
+      lastPosted = now;
+      const phases = parseGitCloneProgressPhases(errAll);
+      const seg = { phase: 'bootstrap', index: i + 1, total: n };
+      if (phases.recv != null) seg.recv_progress = phases.recv;
+      if (phases.unpack != null) seg.unpack_progress = phases.unpack;
+      void postCloneProgress(
+        cloudPrefix,
+        accessToken,
+        g,
+        `【项目克隆】(${i + 1}/${n}) ${path.basename(repoDir)} … ${g}%`,
+        raw,
+        seg
+      );
+    });
+    await postCloneProgress(
+      cloudPrefix,
+      accessToken,
+      100,
+      `项目克隆 (${i + 1}/${n}) 完成 ${path.basename(repoDir)}`,
+      raw,
+      { phase: 'bootstrap', index: i + 1, total: n, recv_progress: 100, unpack_progress: 100 }
     );
-  } catch {
-    /* optional */
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, err: err instanceof Error ? err : new Error(String(err)) };
+  } finally {
+    if (keyPath) {
+      try {
+        fs.rmSync(path.dirname(keyPath), { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }
 
 async function cloneReposIntoSharedLayer(urls, credRoot, cloudPrefix, accessToken) {
-  if (!urls.length) return null;
-  const gitBin = 'git';
-  const layerId = newLayerId();
+  const trimmed = urls.map((u) => String(u || '').trim()).filter(Boolean);
+  if (!trimmed.length) return null;
+
+  /** 与 `ensureStartupEmptyLayer()` 同 id，避免引导克隆层与空层锚点目录并列。 */
+  const layerId = startupEmptyLayerId || newLayerId();
   createRootLayer(layerId);
+  writeLayerMeta(layerId, 'clone', null);
   clearCloneLayerLog(layerId);
   /** 须在首条日志写入前赋值：克隆可能持续数分钟，期间 GET /api/repos/bootstrap-clone-log 与 /api/project/active 依赖此 id。 */
   bootstrapCloneLayerId = layerId;
-  appendCloneLayerLog(layerId, '【项目克隆】正在克隆任务关联仓库（任务详情已拉取）…\n\n');
-  await postCloneProgress(cloudPrefix, accessToken, 0, '【项目克隆】开始克隆任务关联仓库…');
 
   const layerDir = layerPath(layerId);
-  const n = urls.length;
-  for (let i = 0; i < urls.length; i++) {
-    const raw = urls[i].trim();
-    if (!raw) continue;
+  const n = trimmed.length;
+  /** @type {{ raw: string, repoDir: string, index: number }[]} */
+  const jobs = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    const raw = trimmed[i];
     let repoDir = path.join(layerDir, repoDirNameFromUrl(raw));
     let suf = 2;
     while (fs.existsSync(repoDir)) {
       repoDir = path.join(layerDir, `${path.basename(repoDir)}_${suf}`);
       suf += 1;
     }
-    appendCloneLayerLog(layerId, `━━ (${i + 1}/${n}) ${raw}\n→ ${path.basename(repoDir)}\n`);
-
-    const cred = credRoot[raw] || credRoot[raw.replace(/\/$/, '')];
-    const pem = cred && typeof cred === 'object' ? String(cred.ephemeral_ssh_private_key || '').trim() : '';
-    const useSsh =
-      !!pem ||
-      String(process.env.GIT_CLONE_USE_SSH_URL || '')
-        .trim()
-        .toLowerCase() === '1' ||
-      ['true', 'yes'].includes(String(process.env.GIT_CLONE_USE_SSH_URL || '').trim().toLowerCase());
-    let cloneRemote = raw;
-    if (pem || (useSsh && raw.toLowerCase().startsWith('https://'))) {
-      cloneRemote = gitCloneRemoteForSshPem(raw);
-      if (cloneRemote !== raw) {
-        appendCloneLayerLog(layerId, `[bootstrap-clone] HTTPS → SSH: ${cloneRemote}\n`);
-      }
-    }
-
-    let keyPath = null;
-    try {
-      const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-      const useV4 = String(process.env.TRAE_GIT_CLONE_ALLOW_IPV6 || '').trim() !== '1';
-      const args = useV4
-        ? [...gitCloneConfigArgs(), 'clone', '-4', '--progress', cloneRemote, repoDir]
-        : [...gitCloneConfigArgs(), 'clone', '--progress', cloneRemote, repoDir];
-      if (pem) {
-        keyPath = writeTempSshKey(pem);
-        const sshTimeout = Math.max(
-          5,
-          Math.min(120, parseInt(String(process.env.TRAE_GIT_SSH_CONNECT_TIMEOUT_SEC || '30'), 10) || 30)
-        );
-        const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${sshTimeout}`;
-        gitEnv.GIT_SSH_COMMAND = ssh;
-      }
-      await runGitClone(args, gitEnv);
-      const pct = Math.min(99, Math.floor(((i + 1) / n) * 100));
-      await postCloneProgress(cloudPrefix, accessToken, pct, `项目克隆 (${i + 1}/${n}) 完成 ${path.basename(repoDir)}`);
-    } finally {
-      if (keyPath) {
-        try {
-          fs.rmSync(path.dirname(keyPath), { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
-      }
-    }
+    jobs.push({ raw, repoDir, index: i });
   }
-  appendCloneLayerLog(layerId, '\n【项目克隆】克隆完成。\n');
-  finalizeCloneLayerLog(layerId);
-  await postCloneProgress(cloudPrefix, accessToken, 100, '【项目克隆】仓库克隆已完成');
-  return layerId;
+
+  try {
+    bootstrapRepoLogState = {
+      layerId,
+      preamble: '【项目克隆】正在并行克隆任务关联仓库（任务详情已拉取）…\n\n',
+      jobs: jobs.slice(),
+      bufs: new Map(),
+    };
+    for (const job of jobs) {
+      bootstrapRepoLogState.bufs.set(job.raw, {
+        header: `━━ (${job.index + 1}/${n}) ${job.raw}\n→ ${path.basename(job.repoDir)}\n`,
+        body: '',
+      });
+    }
+
+    await postCloneProgress(cloudPrefix, accessToken, 0, '【项目克隆】开始并行克隆任务关联仓库…', null, {
+      kind: 'global',
+      phase: 'bootstrap',
+    });
+
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
+      await postCloneProgress(
+        cloudPrefix,
+        accessToken,
+        0,
+        `【项目克隆】(${i + 1}/${n}) 准备克隆 ${path.basename(job.repoDir)}…`,
+        job.raw,
+        { phase: 'bootstrap', index: i + 1, total: n }
+      );
+    }
+
+    const clonePromises = jobs.map((job) =>
+      runOneBootstrapClone({
+        job,
+        n,
+        credRoot,
+        cloudPrefix,
+        accessToken,
+      })
+    );
+
+    const outcomes = await Promise.all(clonePromises);
+    const errors = [];
+    for (let idx = 0; idx < jobs.length; idx++) {
+      const o = outcomes[idx];
+      if (o.ok) continue;
+      errors.push(o.err);
+      const job = jobs[idx];
+      const msg = o.err?.message || String(o.err);
+      const ent = bootstrapRepoLogState.bufs.get(job.raw);
+      if (ent) {
+        ent.failNote = `\n[bootstrap-clone] 克隆失败: ${msg}\n`;
+      }
+      await postCloneProgress(
+        cloudPrefix,
+        accessToken,
+        0,
+        `【项目克隆】(${idx + 1}/${n}) 失败: ${msg.slice(0, 500)}`,
+        job.raw,
+        { phase: 'bootstrap', index: idx + 1, total: n }
+      );
+    }
+
+    const footer = errors.length ? '\n【项目克隆】已结束（存在失败）。\n' : '\n【项目克隆】克隆完成。\n';
+    const full = rebuildBootstrapParallelLogText() + footer;
+    clearCloneLayerLog(layerId);
+    appendCloneLayerLog(layerId, full);
+    finalizeCloneLayerLog(layerId);
+    bootstrapRepoLogState = null;
+
+    if (errors.length) {
+      const head = errors[0];
+      const msg = head?.message || String(head);
+      await postCloneProgress(
+        cloudPrefix,
+        accessToken,
+        0,
+        `【项目克隆】未完成：${msg}`.slice(0, 2000),
+        null,
+        { kind: 'global', phase: 'bootstrap' }
+      );
+      throw head;
+    }
+    await postCloneProgress(cloudPrefix, accessToken, 100, '【项目克隆】仓库克隆已完成', null, {
+      kind: 'global',
+      phase: 'bootstrap',
+    });
+    return layerId;
+  } catch (e) {
+    if (bootstrapRepoLogState && bootstrapRepoLogState.layerId === layerId) {
+      bootstrapRepoLogState = null;
+    }
+    throw e;
+  }
 }
 
 /**
- * 任务详情中无关联仓库时创建空可写层（无 .git）：`layer_meta.kind=clone` 仅用于纳入快照；
- * 首个仓库由后续 `POST /api/repos/clone`（或等价 git clone）写入。
+ * 任务详情中无关联仓库时：复用 `ensureStartupEmptyLayer()` 已创建的空层锚点目录，写入 `kind=clone`，
+ * 与 `GET /api/layers/empty-root` 为同一 `layer_id`，避免与空锚点并行的多余可写层。
+ * 首个仓库由后续 `POST /api/repos/clone`（或等价 git clone）写入子层，父层为上述 id。
  */
 function createInitialWorkspaceLayer() {
-  const layerId = newLayerId();
+  const layerId = startupEmptyLayerId || ensureStartupEmptyLayer();
   createRootLayer(layerId);
   writeLayerMeta(layerId, 'clone', null);
-  logOutbound(`bootstrap: initial writable layer (no git, await clone) ${layerId}`);
-  console.log(`[onlineServiceJS] 已创建初始可写层（无 git，待首次克隆）: ${layerId}`);
+  logOutbound(`bootstrap: initial writable layer (reuse empty-root, no git, await clone) ${layerId}`);
+  console.log(`[onlineServiceJS] 已复用空层锚点为初始可写层（无 git，待首次克隆）: ${layerId}`);
   return layerId;
 }
 
@@ -339,6 +443,7 @@ function logOutbound(line) {
  */
 export async function runBootstrapTokenExchangeOnly() {
   bootstrapCloneLayerId = null;
+  bootstrapRepoLogState = null;
   bootstrapRegisterCloneJob = false;
   let prefix;
   try {

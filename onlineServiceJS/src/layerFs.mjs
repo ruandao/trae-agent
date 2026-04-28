@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'node:child_process';
 import { layersRoot, stateRoot, layerArtifactsRootPath } from './paths.mjs';
+import { gitCmd } from './gitCmd.mjs';
 
 export const LAYER_ID_RE = /^(\d{8}_\d{6})_([0-9a-fA-F]+)$/;
 
@@ -91,6 +92,160 @@ export function layerPrimaryGitWorkdir(layerId) {
 }
 
 /**
+ * 扁平文件列表 API 用的工作区根：一层内多仓并列时返回多个根，相对路径带仓库目录名前缀；
+ * 与 {@link layerPrimaryGitWorkdir} 不同，后者只选一个「主」目录供 git 状态/提交。
+ * @returns {{ workdir: string, relPrefix: string }[]}
+ */
+export function layerGitWorkdirRootsForFileListing(layerId) {
+  const lid = String(layerId || '').trim();
+  if (!lid) return [];
+  const root = layerPath(lid);
+  if (!fs.existsSync(root)) return [];
+
+  if (dirHasGit(root)) {
+    return [{ workdir: root, relPrefix: '' }];
+  }
+  const base = path.join(root, 'base');
+  if (fs.existsSync(base) && dirHasGit(base)) {
+    return [{ workdir: base, relPrefix: '' }];
+  }
+
+  const out = [];
+  try {
+    const subs = fs.readdirSync(root, { withFileTypes: true });
+    const names = [];
+    for (const ent of subs) {
+      if (!ent.isDirectory() || SKIP_NAMES.has(ent.name)) continue;
+      const c = path.join(root, ent.name);
+      if (dirHasGit(c)) names.push(ent.name);
+    }
+    names.sort();
+    for (const name of names) {
+      out.push({ workdir: path.join(root, name), relPrefix: name });
+    }
+  } catch {
+    /* ignore */
+  }
+
+  if (!out.length) {
+    return [{ workdir: root, relPrefix: '' }];
+  }
+  return out;
+}
+
+/**
+ * 项目文件树点击目录拉取 git log 时，解析应执行 `git log` 的工作目录与 pathspec，与
+ * {@link layerGitWorkdirRootsForFileListing} 多仓前缀语义一致，避免只使用 {@link layerPrimaryGitWorkdir} 在「第一个仓」上误跑其它仓的路径。
+ * @param {string} layerId
+ * @param {string} rawPath - 与 flat files 相同，如 `goPractice/README.md` 或 `goPractice`
+ * @returns {{ work: string, pathspec: string | null } | null}
+ */
+export function resolveLayerGitLogContext(layerId, rawPath) {
+  const lid = String(layerId || '').trim();
+  if (!lid) return null;
+  const norm = String(rawPath || '').trim().replace(/\\/g, '/');
+  const segs = norm ? norm.split('/').filter((x) => x.length) : [];
+  for (const seg of segs) {
+    if (seg === '..' || seg === '.') return null;
+  }
+  const roots = layerGitWorkdirRootsForFileListing(lid);
+  if (!roots.length) return null;
+  if (segs.length === 0) {
+    const w = layerPrimaryGitWorkdir(lid);
+    return w ? { work: w, pathspec: null } : null;
+  }
+  if (roots.length === 1 && !roots[0].relPrefix) {
+    return { work: roots[0].workdir, pathspec: segs.join('/') };
+  }
+  for (const { workdir, relPrefix } of roots) {
+    if (!relPrefix) continue;
+    if (segs[0] !== relPrefix) continue;
+    const rest = segs.slice(1);
+    return { work: workdir, pathspec: rest.length ? rest.join('/') : null };
+  }
+  const w = layerPrimaryGitWorkdir(lid);
+  if (w) return { work: w, pathspec: segs.join('/') };
+  return null;
+}
+
+function walkRepoRelativeFiles(absBase, relPrefix, files, maxFiles) {
+  function walk(d, rel) {
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      if (ent.name === '.git') continue;
+      const p = path.join(d, ent.name);
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) walk(p, r);
+      else {
+        const listed = relPrefix ? `${relPrefix}/${r}` : r;
+        files.push(listed);
+      }
+      if (files.length >= maxFiles) return;
+    }
+  }
+  try {
+    walk(absBase, '');
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 遍历层内（含多并列克隆仓）相对路径列表，供 GET /api/layers/:id/files 与单测使用。
+ * @param {string} layerId
+ * @param {number} [maxFiles]
+ * @returns {string[]}
+ */
+export function listFlatRelativeFilesForLayer(layerId, maxFiles = 2000) {
+  const cap = Math.max(1, Math.min(5000, Number(maxFiles) || 2000));
+  const roots = layerGitWorkdirRootsForFileListing(layerId);
+  if (!roots.length) return [];
+  const files = [];
+  for (const { workdir, relPrefix } of roots) {
+    walkRepoRelativeFiles(workdir, relPrefix, files, cap);
+    if (files.length >= cap) break;
+  }
+  return files;
+}
+
+/**
+ * 将 ``GET /api/layers/:id/files`` 返回的相对路径解析为绝对路径，与 {@link listFlatRelativeFilesForLayer} 一致。
+ * 克隆在子目录时列表为「仓库目录名/…」，而 {@link layerPrimaryGitWorkdir} 已落在该子目录内，若再拼接整段 ``rel`` 会得到 ``…/goPractice/goPractice/README.md`` 并 404。
+ * @param {string} layerId
+ * @param {string} rel - 与列表 API 相同，用 / 分隔
+ * @returns {string | null}
+ */
+export function resolveAbsolutePathForLayerListedFile(layerId, rel) {
+  const relNorm = String(rel || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!relNorm) return null;
+  const parts = relNorm.split('/').filter((p) => p.length);
+  if (!parts.length || parts.some((p) => p === '.' || p === '..')) return null;
+
+  const roots = layerGitWorkdirRootsForFileListing(layerId);
+  if (!roots.length) return null;
+
+  for (const { workdir, relPrefix } of roots) {
+    const wResolved = path.resolve(workdir);
+    try {
+      if (relPrefix) {
+        if (parts[0] !== relPrefix) continue;
+        const insideParts = parts.slice(1);
+        if (!insideParts.length) continue;
+        const candidate = path.resolve(path.join(workdir, ...insideParts));
+        if (candidate !== wResolved && !candidate.startsWith(wResolved + path.sep)) continue;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      } else {
+        const candidate = path.resolve(path.join(workdir, ...parts));
+        if (candidate !== wResolved && !candidate.startsWith(wResolved + path.sep)) continue;
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
  * true：存在未提交/未暂存变更；false：工作区干净；null：非 git 或检测失败（与 Python layer_git.git_worktree_dirty 对齐）。
  */
 export function gitWorktreeDirty(layerId) {
@@ -98,7 +253,7 @@ export function gitWorktreeDirty(layerId) {
   const work = layerPrimaryGitWorkdir(layerId);
   if (!work) return null;
   try {
-    const r = spawnSync('git', ['status', '--porcelain'], {
+    const r = spawnSync(gitCmd(), ['status', '--porcelain'], {
       cwd: work,
       encoding: 'utf8',
       maxBuffer: 10 * 1024 * 1024,
@@ -110,6 +265,46 @@ export function gitWorktreeDirty(layerId) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 与层快照 `git_remote`、前端「推送」旁提交数一致；目录与 `layerPrimaryGitWorkdir` / `POST .../git/push` 相同。
+ * @returns {{ is_git: boolean, ahead: number | null, no_upstream: boolean, upstream: string }}
+ */
+export function layerGitRemoteSnapshot(layerId) {
+  const empty = { is_git: false, ahead: null, no_upstream: true, upstream: '' };
+  const lid = String(layerId || '').trim();
+  if (!lid || !LAYER_ID_RE.test(lid)) return empty;
+  const work = layerPrimaryGitWorkdir(lid);
+  if (!work || !dirHasGit(work)) return empty;
+
+  const run = (args) =>
+    spawnSync(gitCmd(), args, {
+      cwd: work,
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      timeout: 30_000,
+    });
+
+  const tree = run(['rev-parse', '--is-inside-work-tree']);
+  if (tree.status !== 0 || String(tree.stdout || '').trim() !== 'true') {
+    return empty;
+  }
+
+  const upRef = run(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  const upstream = String(upRef.stdout || '').trim();
+  if (upRef.status !== 0 || !upstream) {
+    return { is_git: true, ahead: null, no_upstream: true, upstream: '' };
+  }
+
+  const count = run(['rev-list', '--count', '@{u}..HEAD']);
+  if (count.status !== 0) {
+    return { is_git: true, ahead: null, no_upstream: false, upstream };
+  }
+  const n = parseInt(String(count.stdout || '').trim(), 10);
+  const ahead = Number.isFinite(n) && n >= 0 ? n : 0;
+  return { is_git: true, ahead, no_upstream: false, upstream };
 }
 
 export function layerRootOrChildHasGit(layerDir) {

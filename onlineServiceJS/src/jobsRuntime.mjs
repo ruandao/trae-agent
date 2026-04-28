@@ -27,6 +27,7 @@ import {
   newLayerId,
   gitWorktreeDirty,
   layerRootOrChildHasGit,
+  layerGitRemoteSnapshot,
 } from './layerFs.mjs';
 import { broadcast } from './sseHub.mjs';
 import { resetExecStream, appendExecStream, completeExecStream } from './execStream.mjs';
@@ -581,7 +582,7 @@ export function buildLayersSnapshot(bootstrapLayerId) {
       queue_items,
       mind_state: jobByLayer[lid]?.status === 'running' || jobByLayer[lid]?.status === 'pending' ? 'running' : 'idle_done',
       git_worktree_dirty: gitWorktreeDirty(lid),
-      git_remote: {},
+      git_remote: layerGitRemoteSnapshot(lid),
       meta_kind: meta?.kind || null,
     };
     layers.push(item);

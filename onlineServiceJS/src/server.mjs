@@ -18,9 +18,19 @@ import {
   bootstrapRegisterCloneJob,
   ensureStartupEmptyLayer,
   getCloneLayerLogText,
+  getBootstrapCloneLogSegmentsForApi,
   clearCloneLayerLog,
   startupEmptyLayerId,
+  appendCloneLayerLog,
 } from './bootstrap.mjs';
+import {
+  taskApiPrefix,
+  postCloneProgress,
+  latestGitProgressPercent,
+  parseGitCloneProgressPhases,
+  normalizeGitProgressChunkForLog,
+  runGitCloneWithProgress,
+} from './saasTaskCloud.mjs';
 import {
   getExecStreamManifest,
   getExecStreamSegment,
@@ -34,6 +44,9 @@ import {
   anyLayerHasGitRepo,
   listLayerRows,
   layerPrimaryGitWorkdir,
+  listFlatRelativeFilesForLayer,
+  resolveLayerGitLogContext,
+  resolveAbsolutePathForLayerListedFile,
   deleteLayerTree,
   directChildLayerIds,
   repoDirNameFromUrl,
@@ -55,6 +68,7 @@ import {
 import { getJobStepsForLayer } from './jobSteps.mjs';
 import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParentDiff.mjs';
 import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
+import { suggestStagedCommitMessage } from './stagedCommitSuggest.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -120,6 +134,20 @@ async function gitExec(args, cwd, env = {}) {
       else reject(new Error((err || out || `git exit ${code}`).slice(-4000)));
     });
   });
+}
+
+/** 将仓内相对路径规范为安全 pathspec（防 .. 与越界），失败返回 null */
+function safeRepoRelativePathForGitAdd(work, relPath) {
+  const relNorm = String(relPath || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+  if (!relNorm) return null;
+  const parts = relNorm.split('/').filter((p) => p.length);
+  if (!parts.length || parts.some((p) => p === '.' || p === '..')) return null;
+  const candidate = path.resolve(path.join(work, ...parts));
+  const w = path.resolve(work);
+  if (candidate !== w && !candidate.startsWith(w + path.sep)) return null;
+  return relNorm;
 }
 
 const app = express();
@@ -368,10 +396,13 @@ api.get('/repos/clone-status/:layer_id', (req, res) => {
 
 api.get('/repos/bootstrap-clone-log', (req, res) => {
   const lid = bootstrapCloneLayerId;
-  res.json({
-    layer_id: lid,
-    text: lid ? getCloneLayerLogText(lid) : '',
-  });
+  const text = lid ? getCloneLayerLogText(lid) : '';
+  const segments = lid ? getBootstrapCloneLogSegmentsForApi(lid) : null;
+  const payload = { layer_id: lid, text };
+  if (segments && segments.length) {
+    payload.segments = segments;
+  }
+  res.json(payload);
 });
 
 api.post('/repos/clone', (req, res) => {
@@ -505,32 +536,142 @@ api.post('/repos/reclone', async (req, res) => {
   let target = path.join(layerPath(layerId), name);
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
   fs.mkdirSync(target, { recursive: true });
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-  let keyPath = null;
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_HTTP_IPV4: String(process.env.GIT_HTTP_IPV4 || '1'),
+  };
   let cloneUrl = repoUrl;
+  let ephemeralKeyDir = null;
   try {
     if (usePem) {
       cloneUrl = repoUrl.toLowerCase().startsWith('https://') ? gitSshFromHttps(repoUrl) : repoUrl;
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reclone_'));
-      keyPath = path.join(dir, 'k');
+      ephemeralKeyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reclone_'));
+      const keyPath = path.join(ephemeralKeyDir, 'k');
       let c = pem;
       if (!c.endsWith('\n')) c += '\n';
       fs.writeFileSync(keyPath, c, { mode: 0o600 });
       env.GIT_SSH_COMMAND = gitSshCommandFromIdentityFile(keyPath);
     }
-    await gitExec(buildGitCloneArgs(cloneUrl, { branch: '', depth: null }), target, env);
-    res.json({ layer_id: layerId, output: 'ok' });
   } catch (e) {
-    res.status(400).json({ detail: String(e.message || e) });
-  } finally {
-    if (keyPath) {
+    if (ephemeralKeyDir) {
       try {
-        fs.rmSync(path.dirname(keyPath), { recursive: true, force: true });
+        fs.rmSync(ephemeralKeyDir, { recursive: true, force: true });
       } catch {
         /* ignore */
       }
     }
+    return res.status(400).json({ detail: String(e.message || e) });
   }
+
+  const gitArgs = buildGitCloneArgs(cloneUrl, { branch: '', depth: null });
+  let prefix = null;
+  try {
+    prefix = taskApiPrefix();
+  } catch {
+    prefix = null;
+  }
+  const accessToken = String(process.env.ACCESS_TOKEN || '').trim();
+
+  const runRecloneInBackground = () => {
+    void (async () => {
+      try {
+        if (prefix && accessToken) {
+          await postCloneProgress(prefix, accessToken, 0, `【重新克隆】开始 ${name}…`, repoUrl, {
+            phase: 'reclone',
+          });
+        }
+        try {
+          appendCloneLayerLog(layerId, `\n━━ 重新克隆 ${repoUrl}\n→ ${name}\n`);
+        } catch {
+          /* ignore */
+        }
+        let lastPosted = 0;
+        let lastPct = -1;
+        await runGitCloneWithProgress(gitArgs, env, target, (chunk, errAll) => {
+          if (chunk) {
+            try {
+              appendCloneLayerLog(layerId, normalizeGitProgressChunkForLog(chunk));
+            } catch {
+              /* ignore */
+            }
+          }
+          if (!prefix || !accessToken) return;
+          const g = latestGitProgressPercent(errAll);
+          if (g < 0) return;
+          const now = Date.now();
+          if (g === lastPct && now - lastPosted < 2000) return;
+          if (now - lastPosted < 400 && g <= lastPct) return;
+          lastPct = g;
+          lastPosted = now;
+          const phases = parseGitCloneProgressPhases(errAll);
+          const seg = { phase: 'reclone' };
+          if (phases.recv != null) seg.recv_progress = phases.recv;
+          if (phases.unpack != null) seg.unpack_progress = phases.unpack;
+          void postCloneProgress(prefix, accessToken, g, `【重新克隆】${name} … ${g}%`, repoUrl, seg);
+        });
+        try {
+          const metaPath = path.join(layerPath(layerId), 'layer_meta.json');
+          const existingMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          existingMeta.clone_url = String(repoUrl).trim();
+          fs.writeFileSync(metaPath, JSON.stringify(existingMeta, null, 2), 'utf8');
+        } catch {
+          /* ignore */
+        }
+        if (prefix && accessToken) {
+          await postCloneProgress(prefix, accessToken, 100, `【重新克隆】完成 ${name}`, repoUrl, {
+            phase: 'reclone',
+            recv_progress: 100,
+            unpack_progress: 100,
+          });
+        }
+        try {
+          appendCloneLayerLog(layerId, `\n[重新克隆] 完成 ${name}\n`);
+        } catch {
+          /* ignore */
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        try {
+          appendCloneLayerLog(layerId, `\n[重新克隆] 失败: ${msg}\n`);
+        } catch {
+          /* ignore */
+        }
+        if (prefix && accessToken) {
+          await postCloneProgress(
+            prefix,
+            accessToken,
+            0,
+            `【重新克隆】失败: ${msg.slice(0, 500)}`,
+            repoUrl,
+            { phase: 'reclone' }
+          );
+        }
+        try {
+          fs.rmSync(target, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      } finally {
+        if (ephemeralKeyDir) {
+          try {
+            fs.rmSync(ephemeralKeyDir, { recursive: true, force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    })();
+  };
+
+  res.status(202).json({
+    accepted: true,
+    status: 'started',
+    layer_id: layerId,
+    repo_url: repoUrl,
+    message: '重新克隆已在后台进行，进度经任务 SSE 推送',
+  });
+  setImmediate(runRecloneInBackground);
 });
 
 api.delete('/layers/:layer_id', (req, res) => {
@@ -554,35 +695,16 @@ api.post('/layers/:layer_id/queue', (req, res) => {
 });
 
 api.get('/layers/:layer_id/files', (req, res) => {
-  const work = layerPrimaryGitWorkdir(req.params.layer_id);
-  if (!work) return res.json({ files: [] });
-  const files = [];
-  function walk(d, rel) {
-    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
-      if (ent.name === '.git') continue;
-      const p = path.join(d, ent.name);
-      const r = rel ? `${rel}/${ent.name}` : ent.name;
-      if (ent.isDirectory()) walk(p, r);
-      else files.push(r);
-      if (files.length >= 2000) return;
-    }
-  }
-  try {
-    walk(work, '');
-  } catch {
-    /* ignore */
-  }
+  const maxCap = Math.min(Math.max(1, parseInt(req.query.max_files || '2000', 10) || 2000), 5000);
+  const files = listFlatRelativeFilesForLayer(req.params.layer_id, maxCap);
   res.json({ files });
 });
 
 api.get('/layers/:layer_id/files/*', (req, res) => {
   const lid = req.params.layer_id;
   const rel = req.params[0] || '';
-  const work = layerPrimaryGitWorkdir(lid);
-  if (!work) return res.status(404).json({ detail: 'not found' });
-  const fp = path.resolve(path.join(work, rel));
-  if (!fp.startsWith(path.resolve(work))) return res.status(400).json({ detail: 'invalid path' });
-  if (!fs.existsSync(fp) || !fs.statSync(fp).isFile()) return res.status(404).json({ detail: 'not found' });
+  const fp = resolveAbsolutePathForLayerListedFile(lid, rel);
+  if (!fp) return res.status(404).json({ detail: 'not found' });
   const max = Math.min(parseInt(req.query.max_bytes || '2000000', 10) || 2000000, 20_000_000);
   const buf = fs.readFileSync(fp).subarray(0, max);
   const text = buf.toString('utf8');
@@ -690,12 +812,103 @@ api.get('/layers/:layer_id/git/commit/latest-log', async (req, res) => {
   }
 });
 
+/** 与 Django ``forward_container_layer_git_log`` 及文件树侧栏一致：``text``、可选空列表 ``commits``。 */
+api.get('/layers/:layer_id/git/log', async (req, res) => {
+  const layerId = String(req.params.layer_id || '');
+  let limit = 20;
+  if (req.query.limit != null && String(req.query.limit).trim() !== '') {
+    const n = parseInt(String(req.query.limit), 10);
+    if (Number.isNaN(n)) return res.status(400).json({ detail: 'limit 必须为整数' });
+    limit = Math.max(1, Math.min(100, n));
+  }
+  const rawPath = (req.query.path ?? '').toString().trim();
+  const ctx = resolveLayerGitLogContext(layerId, rawPath);
+  if (!ctx) {
+    if (!layerPrimaryGitWorkdir(layerId)) return res.status(400).json({ detail: 'no git' });
+    return res.status(400).json({ detail: 'path 不合法' });
+  }
+  const { work, pathspec } = ctx;
+  const args = [
+    'log',
+    `-${limit}`,
+    '--date=short',
+    '--pretty=format:%h %ad %s',
+  ];
+  if (pathspec) args.push('--', pathspec);
+  try {
+    const t = (await gitExec(args, work)).replace(/\s+$/, '');
+    if (!t) {
+      return res.json({ text: '', commits: [] });
+    }
+    return res.json({ text: t, commits: [] });
+  } catch (e) {
+    res.status(400).json({ detail: String(e.message || e) });
+  }
+});
+
+api.post('/layers/:layer_id/git/add', async (req, res) => {
+  const layerId = String(req.params.layer_id || '');
+  const rawPath = (req.body?.path ?? '').toString().trim();
+  if (!rawPath) return res.status(400).json({ detail: 'path 必填' });
+  if (!layerPrimaryGitWorkdir(layerId)) return res.status(400).json({ detail: 'no git' });
+  const ctx = resolveLayerGitLogContext(layerId, rawPath);
+  if (!ctx) return res.status(400).json({ detail: 'path 不合法' });
+  const { work, pathspec } = ctx;
+  try {
+    if (!pathspec) {
+      await gitExec(['add', '.'], work);
+    } else {
+      const rel = safeRepoRelativePathForGitAdd(work, pathspec);
+      if (!rel) return res.status(400).json({ detail: 'path 不合法' });
+      await gitExec(['add', '--', rel], work);
+    }
+    let suggested_commit_message = '';
+    try {
+      suggested_commit_message = await suggestStagedCommitMessage(gitExec, work);
+    } catch (e) {
+      console.error('[onlineServiceJS] suggestStagedCommitMessage:', e);
+    }
+    res.json({
+      ok: true,
+      ...(suggested_commit_message ? { suggested_commit_message } : {}),
+    });
+  } catch (e) {
+    res.status(400).json({ detail: String(e.message || e) });
+  }
+});
+
+api.post('/layers/:layer_id/git/unstage', async (req, res) => {
+  const layerId = String(req.params.layer_id || '');
+  const rawPath = (req.body?.path ?? '').toString().trim();
+  if (!rawPath) return res.status(400).json({ detail: 'path 必填' });
+  if (!layerPrimaryGitWorkdir(layerId)) return res.status(400).json({ detail: 'no git' });
+  const ctx = resolveLayerGitLogContext(layerId, rawPath);
+  if (!ctx) return res.status(400).json({ detail: 'path 不合法' });
+  const { work, pathspec } = ctx;
+  try {
+    if (!pathspec) {
+      await gitExec(['reset', 'HEAD', '.'], work);
+    } else {
+      const rel = safeRepoRelativePathForGitAdd(work, pathspec);
+      if (!rel) return res.status(400).json({ detail: 'path 不合法' });
+      await gitExec(['reset', 'HEAD', '--', rel], work);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ detail: String(e.message || e) });
+  }
+});
+
 api.post('/layers/:layer_id/git/commit', async (req, res) => {
   const work = layerPrimaryGitWorkdir(req.params.layer_id);
   if (!work) return res.status(400).json({ detail: 'no git' });
   const msg = (req.body?.message || 'commit').toString();
+  const sa = req.body?.stage_all;
+  const doStageAll = sa === undefined || sa === true;
   try {
-    await gitExec(['add', '-A'], work);
+    if (doStageAll) {
+      await gitExec(['add', '-A'], work);
+    }
     await gitExec(['commit', '-m', msg], work);
     res.json({ ok: true });
   } catch (e) {
@@ -720,11 +933,25 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
     }
     const branch = (req.body?.target_branch || '').toString().trim();
     const args = ['push'];
-    if (branch) args.push('origin', branch);
-    else args.push('origin', 'HEAD');
+    // `git push origin <name>` 要求本地存在同名的 *本地 ref*。任务里传入的 `target_branch` 往往是
+    // 要在远端建立的工作分支名，而 clone 后所在分支可能是 main，并无该本地分支，会报
+    // "src refspec does not match any"。用 HEAD:<dst> 将当前工作区提交推送到远端分支。
+    if (branch) {
+      const dst = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
+      args.push('origin', `HEAD:${dst}`);
+    } else {
+      args.push('origin', 'HEAD');
+    }
     await gitExec(args, work, env);
+    const pushedRef = branch
+      ? branch.startsWith('refs/')
+        ? branch
+        : `refs/heads/${branch}`
+      : 'origin HEAD';
+    console.log('[LayerGitPush] ok layer_id=%s ref=%s', req.params.layer_id, pushedRef);
     res.json({ ok: true });
   } catch (e) {
+    console.warn('[LayerGitPush] fail layer_id=%s err=%s', req.params.layer_id, String(e.message || e));
     res.status(400).json({ detail: String(e.message || e) });
   } finally {
     if (keyPath) {
