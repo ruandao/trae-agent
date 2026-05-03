@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import express from 'express';
 import multer from 'multer';
 import YAML from 'yaml';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 
 import { authMiddleware, accessTokenExpected } from './auth.mjs';
 import { getAgentRenderHints } from './agentRenderHints.mjs';
@@ -734,6 +734,47 @@ api.get('/layers/:layer_id/children', (req, res) => {
     return res.status(400).json({ detail: String(e.message || e) });
   }
 
+  function normalizeRel(p) {
+    return String(p || '')
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '');
+  }
+
+  function gitStatusPathSets(workDir) {
+    const cwd = String(workDir || '').trim();
+    if (!cwd) return { staged: new Set(), unstaged: new Set(), deleted: new Set() };
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+
+    // 获取 git status --porcelain 来检查哪些是已删除的
+    const statusPorcelain = (() => {
+      try {
+        const out = spawnSync(gitCmd(), ['status', '--porcelain'], {
+          cwd,
+          encoding: 'utf8',
+          env,
+          maxBuffer: 32 * 1024 * 1024,
+        });
+        return String(out.stdout || '');
+      } catch {
+        return '';
+      }
+    })();
+
+    const deleted = new Set();
+    for (const line of statusPorcelain.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const status = trimmed.slice(0, 2);
+      const pathPart = trimmed.slice(3);
+      const normalizedPath = normalizeRel(pathPart);
+      if (normalizedPath && (status.startsWith('D') || status.includes('D'))) {
+        deleted.add(normalizedPath);
+      }
+    }
+
+    return { staged: new Set(), unstaged: new Set(), deleted };
+  }
+
   function entryMatchesPrefix(relPosix, baseName) {
     if (!prefixRaw) return true;
     if (relPosix.startsWith(prefixRaw)) return true;
@@ -742,6 +783,9 @@ api.get('/layers/:layer_id/children', (req, res) => {
     if (noTrail && (baseName === noTrail || relPosix === noTrail)) return true;
     return false;
   }
+
+  // Get deleted files for this workdir
+  const { deleted: deletedInner } = gitStatusPathSets(work);
 
   const rows = [];
   for (const ent of dirents) {
@@ -758,6 +802,9 @@ api.get('/layers/:layer_id/children', (req, res) => {
         continue;
       }
     }
+
+    // Skip if this file is marked as deleted in git
+    if (!isDir && deletedInner.has(normalizeRel(relPosix))) continue;
 
     let size = 0;
     if (!isDir) {

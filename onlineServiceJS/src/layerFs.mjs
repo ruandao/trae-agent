@@ -5,6 +5,65 @@ import { spawnSync } from 'node:child_process';
 import { layersRoot, stateRoot, layerArtifactsRootPath } from './paths.mjs';
 import { gitCmd } from './gitCmd.mjs';
 
+function normalizeRel(p) {
+  return String(p || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+|\/+$/g, '');
+}
+
+function gitStatusPathSets(work) {
+  const cwd = String(work || '').trim();
+  if (!cwd) return { staged: new Set(), unstaged: new Set() };
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  const runZ = (args) => {
+    try {
+      const out = spawnSync(gitCmd(), args, {
+        cwd,
+        encoding: 'utf8',
+        env,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      return String(out.stdout || '')
+        .split('\0')
+        .map((s) => normalizeRel(s))
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+  const staged = new Set(runZ(['diff', '--cached', '--name-only', '-z']));
+  const unstaged = new Set(runZ(['diff', '--name-only', '-z']));
+
+  // 获取 git status --porcelain 来检查哪些是已删除的
+  const statusPorcelain = (() => {
+    try {
+      const out = spawnSync(gitCmd(), ['status', '--porcelain'], {
+        cwd,
+        encoding: 'utf8',
+        env,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      return String(out.stdout || '');
+    } catch {
+      return '';
+    }
+  })();
+
+  const deleted = new Set();
+  for (const line of statusPorcelain.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const status = trimmed.slice(0, 2);
+    const pathPart = trimmed.slice(3);
+    const normalizedPath = normalizeRel(pathPart);
+    if (normalizedPath && (status === 'D ' || status === ' D' || status === 'D ' || status === ' D' || status === 'DD')) {
+      deleted.add(normalizedPath);
+    }
+  }
+
+  return { staged, unstaged, deleted };
+}
+
 export const LAYER_ID_RE = /^(\d{8}_\d{6})_([0-9a-fA-F]+)$/;
 
 const SKIP_NAMES = new Set(['__pycache__', '.DS_Store', '.git']);
@@ -168,7 +227,7 @@ export function resolveLayerGitLogContext(layerId, rawPath) {
   return null;
 }
 
-function walkRepoRelativeFiles(absBase, relPrefix, files, maxFiles) {
+function walkRepoRelativeFiles(absBase, relPrefix, files, maxFiles, deletedInner = new Set()) {
   function walk(d, rel) {
     for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
       if (ent.name === '.git') continue;
@@ -176,6 +235,8 @@ function walkRepoRelativeFiles(absBase, relPrefix, files, maxFiles) {
       const r = rel ? `${rel}/${ent.name}` : ent.name;
       if (ent.isDirectory()) walk(p, r);
       else {
+        // Check if this file is marked as deleted in git
+        if (deletedInner.has(normalizeRel(r))) continue;
         const listed = relPrefix ? `${relPrefix}/${r}` : r;
         files.push(listed);
       }
@@ -201,7 +262,9 @@ export function listFlatRelativeFilesForLayer(layerId, maxFiles = 2000) {
   if (!roots.length) return [];
   const files = [];
   for (const { workdir, relPrefix } of roots) {
-    walkRepoRelativeFiles(workdir, relPrefix, files, cap);
+    // Get deleted files for this workdir
+    const { deleted: deletedInner } = gitStatusPathSets(workdir);
+    walkRepoRelativeFiles(workdir, relPrefix, files, cap, deletedInner);
     if (files.length >= cap) break;
   }
   return files;
