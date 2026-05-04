@@ -969,6 +969,49 @@
       );
     }
 
+    /** 原始控制台 / 克隆输出 iframe：仅在用户原本贴在底部时追加内容后才自动滚到底，避免打断向上翻阅 */
+    const IFRAME_LOG_STICK_BOTTOM_PX = 48;
+
+    function iframeLogScrollingEl(doc) {
+      if (!doc) return null;
+      return doc.scrollingElement || doc.documentElement || doc.body;
+    }
+
+    function iframeLogNearBottom(doc) {
+      try {
+        const el = iframeLogScrollingEl(doc);
+        if (!el) return true;
+        return el.scrollHeight - el.clientHeight - el.scrollTop < IFRAME_LOG_STICK_BOTTOM_PX;
+      } catch (_) {
+        return true;
+      }
+    }
+
+    function iframeLogScrollToBottom(doc) {
+      try {
+        const el = iframeLogScrollingEl(doc);
+        if (el) el.scrollTop = el.scrollHeight;
+      } catch (_) {}
+    }
+
+    function setExecRichIframeSrcdocSticky(fr, srcdocHtml) {
+      let stickToBottom = true;
+      try {
+        stickToBottom = iframeLogNearBottom(fr.contentDocument);
+      } catch (_) {}
+      fr.srcdoc = srcdocHtml;
+      try {
+        if (stickToBottom) iframeLogScrollToBottom(fr.contentDocument);
+      } catch (_) {}
+    }
+
+    try {
+      window.__onlineServiceUiTest = {
+        setExecRichIframeSrcdocSticky,
+        iframeLogNearBottom,
+      };
+    } catch (_) {}
+
     function getCloneSnapshotPlain() {
       const ban = document.getElementById('cloneOutBanner');
       const b = ban ? normalizeCloneLogText(ban.textContent || '') : '';
@@ -1352,13 +1395,7 @@
       const frags = keys.map((k) => execStreamUi.cloneParts.get(k));
       const fr = document.getElementById('cloneOutFrame');
       if (!fr) return;
-      fr.srcdoc = buildExecRichSrcdoc(frags);
-      try {
-        const doc = fr.contentDocument;
-        if (doc && doc.body) {
-          doc.body.scrollTop = doc.body.scrollHeight;
-        }
-      } catch (_) {}
+      setExecRichIframeSrcdocSticky(fr, buildExecRichSrcdoc(frags));
     }
 
     function ingestExecStreamSegment(kind, resourceId, seq, text, contentType) {
@@ -1389,13 +1426,7 @@
       if (!fr) return;
       const keys = [...parts.keys()].sort((a, b) => a - b);
       const frags = keys.map((k) => parts.get(k));
-      fr.srcdoc = buildExecRichSrcdoc(frags);
-      try {
-        const doc = fr.contentDocument;
-        if (doc && doc.body) {
-          doc.body.scrollTop = doc.body.scrollHeight;
-        }
-      } catch (_) {}
+      setExecRichIframeSrcdocSticky(fr, buildExecRichSrcdoc(frags));
     }
 
     function renderJobRawLogIframe(job) {
@@ -1436,7 +1467,7 @@
       if (!fr) return;
       const keys = [...parts.keys()].sort((a, b) => a - b);
       const frags = keys.map((k) => parts.get(k));
-      fr.srcdoc = buildExecRichSrcdoc(frags);
+      setExecRichIframeSrcdocSticky(fr, buildExecRichSrcdoc(frags));
     }
 
     async function syncCloneStreamFromManifest(_reason) {
@@ -4021,15 +4052,73 @@
 
       const logsWrap = document.createElement('div');
       logsWrap.style.cssText = 'margin-top:0.55rem;width:100%;';
-      const execTitle = document.createElement('div');
-      execTitle.className = 'meta';
-      execTitle.textContent = '提交执行日志（本次会话）';
-      logsWrap.appendChild(execTitle);
+
       const execPre = document.createElement('pre');
       execPre.id = 'layerCommitExecLogPre';
       execPre.className = 'out';
       execPre.style.cssText = 'max-height:140px;margin-top:0.25rem;';
       execPre.textContent = '（当前会话暂无提交执行日志）';
+
+      const execTitleRow = document.createElement('div');
+      execTitleRow.style.display = 'flex';
+      execTitleRow.style.alignItems = 'center';
+      execTitleRow.style.gap = '0.5rem';
+
+      const execTitle = document.createElement('div');
+      execTitle.className = 'meta';
+      execTitle.textContent = '提交执行日志（本次会话）';
+      execTitleRow.appendChild(execTitle);
+
+      const generateDiffLogBtn = document.createElement('button');
+      generateDiffLogBtn.type = 'button';
+      generateDiffLogBtn.className = 'secondary';
+      generateDiffLogBtn.style.marginTop = '0';
+      generateDiffLogBtn.textContent = '生成提交日志';
+      generateDiffLogBtn.title = '生成与上层可写层差异文件的 AI 总结';
+      generateDiffLogBtn.onclick = debounceClick(() => {
+        void runAsyncButton(
+          generateDiffLogBtn,
+          async () => {
+            execPre.textContent = '生成中…';
+            try {
+              const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/diff/parent/files');
+              if (!r.ok) {
+                execPre.textContent = '获取差异文件列表失败：HTTP ' + r.status;
+                return;
+              }
+              const diffFiles = await r.json();
+              const changes = diffFiles.changes || [];
+              const files = changes.map(c => c.path).filter(p => p && !p.startsWith('.git/'));
+              if (!files.length) {
+                execPre.textContent = '未找到与上层可写层有差异的文件';
+                return;
+              }
+              const diffR = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/diff-log', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ files }),
+              });
+              const diffRaw = await diffR.text();
+              let diffJ = null;
+              try {
+                diffJ = JSON.parse(diffRaw);
+              } catch (_) {}
+              if (!diffR.ok) {
+                const msg = diffJ && diffJ.detail ? (typeof diffJ.detail === 'string' ? diffJ.detail : JSON.stringify(diffJ.detail)) : diffRaw;
+                execPre.textContent = '生成失败：' + msg;
+                return;
+              }
+              execPre.textContent = diffJ && typeof diffJ.summary === 'string' ? diffJ.summary.trim() || '未检测到变更' : '生成失败：无返回总结';
+            } catch (e) {
+              execPre.textContent = '生成失败：' + String(e && e.message ? e.message : e);
+            }
+          },
+          { busyText: '生成中…' },
+        );
+      }, BTN_DEBOUNCE_MS);
+      execTitleRow.appendChild(generateDiffLogBtn);
+      logsWrap.appendChild(execTitleRow);
+
       logsWrap.appendChild(execPre);
 
       const latestTitle = document.createElement('div');

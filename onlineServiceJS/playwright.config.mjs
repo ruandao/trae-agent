@@ -30,6 +30,7 @@ export default {
         '**/clone-ui-queue.spec.mjs',
         '**/writable-changes-ui.spec.mjs',
         '**/layer-queue-visual.spec.mjs',
+        '**/job-raw-log-scroll.spec.mjs',
       ],
       /* 优先本机 Chrome，避免 CI/弱网无法下载 Chromium bundle */
       use: { channel: 'chrome' },

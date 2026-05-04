@@ -51,7 +51,12 @@ import {
   directChildLayerIds,
   repoDirNameFromUrl,
   writeLayerMeta,
+  readLayerMeta,
+  resolvedParentLayerId,
+  layerGitWorkdirRootsForFileListing,
+  createStackedLayer,
 } from './layerFs.mjs';
+
 import {
   createJob,
   listJobs,
@@ -61,9 +66,11 @@ import {
   deleteJob,
   registerBootstrapCloneJob,
   buildLayersSnapshot,
+  mirrorLayerGraphToTaskCloudSSE,
   sweepDanglingLayerDirs,
   enqueueLayerQueueItem,
   removeLayerQueue,
+  getJobEvents,
 } from './jobsRuntime.mjs';
 import { getJobStepsForLayer } from './jobSteps.mjs';
 import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParentDiff.mjs';
@@ -281,6 +288,53 @@ api.get('/layers', (req, res) => {
   });
 });
 
+api.post('/layers', async (req, res) => {
+  const parentLayerId = req.body?.parent_layer_id ? String(req.body.parent_layer_id).trim() : '';
+  if (!parentLayerId) {
+    return res.status(400).json({ detail: 'parent_layer_id 必填' });
+  }
+  const known = new Set(listLayerRows().map((r) => r.layer_id));
+  if (!known.has(parentLayerId)) {
+    return res.status(404).json({ detail: 'parent layer not found' });
+  }
+
+  const lid = newLayerId();
+  const root = layerPath(lid);
+
+  try {
+    createStackedLayer(lid, parentLayerId);
+
+    // 根据层类型和提交信息设置元数据
+    const layerKind = req.body?.layer_kind ? String(req.body.layer_kind).trim() : 'job';
+    const commitMessage = req.body?.commit_message ? String(req.body.commit_message).trim() : '';
+
+    // 如果是 git commit 类型，设置特殊的元数据
+    if (layerKind === 'git_commit' && commitMessage) {
+      const metaPath = path.join(root, 'layer_meta.json');
+      if (fs.existsSync(metaPath)) {
+        let meta = {};
+        try {
+          meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        } catch {
+          meta = {};
+        }
+        meta.kind = 'git_commit';
+        meta.commit_message = commitMessage;
+        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+      }
+    }
+    await mirrorLayerGraphToTaskCloudSSE();
+    res.status(201).json({
+      layer_id: lid,
+      layer_path: root,
+      parent_layer_id: parentLayerId,
+      kind: layerKind,
+    });
+  } catch (e) {
+    res.status(400).json({ detail: String(e.message || e) });
+  }
+});
+
 api.get('/jobs', (req, res) => {
   res.json({ jobs: listJobs().map(jobToApiDict) });
 });
@@ -296,6 +350,15 @@ api.get('/jobs/:job_id/steps', (req, res) => {
   if (!j) return res.status(404).json({ detail: 'not found' });
   const payload = getJobStepsForLayer(j.layer_id, j.id);
   res.json(payload);
+});
+
+api.get('/jobs/:job_id/events', (req, res) => {
+  const j = getJob(req.params.job_id);
+  if (!j) return res.status(404).json({ detail: 'not found' });
+  const offset = parseInt(req.query.offset || '0', 10) || 0;
+  const limit = parseInt(req.query.limit || '500', 10) || 500;
+  const result = getJobEvents(req.params.job_id, offset, limit);
+  res.json(result);
 });
 
 api.get('/jobs/:job_id/parent', (req, res) => {
@@ -339,7 +402,7 @@ api.post('/jobs/:job_id/continue', (req, res) => {
   res.status(501).json({ detail: 'onlineServiceJS: continue 尚未实现' });
 });
 
-api.post('/jobs/reset', (req, res) => {
+api.post('/jobs/reset', async (req, res) => {
   const layerIds = listLayerRows().map((r) => r.layer_id);
   for (const j of [...listJobs()]) {
     try {
@@ -355,6 +418,7 @@ api.post('/jobs/reset', (req, res) => {
       /* ignore */
     }
   }
+  await mirrorLayerGraphToTaskCloudSSE().catch(() => {});
   res.json({ jobs_cleared: true, layers_removed: layerIds });
 });
 
@@ -1009,6 +1073,332 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
       }
     }
   }
+});
+
+function findParentWorkdirForChildPrefix(rootsP, relPrefix) {
+  const key = relPrefix || '';
+  const hit = rootsP.find((x) => (x.relPrefix || '') === key);
+  if (hit) return hit.workdir;
+  if (rootsP.length === 1 && !rootsP[0].relPrefix) return rootsP[0].workdir;
+  return null;
+}
+
+const AI_SUMMARY_MAX_DIFF = 28000;
+const AI_SUMMARY_TIMEOUT_MS = 45000;
+
+function outboundLog(line) {
+  try {
+    const f = path.join(reqLogsDir(), 'outbound.log');
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.appendFileSync(f, `${new Date().toISOString()} | ${line}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
+function resolveLlmFromEnv() {
+  const baseUrl = String(process.env.TRAE_STAGED_COMMIT_LLM_BASE_URL || '')
+    .trim()
+    .replace(/\/$/, '');
+  const apiKey = String(process.env.TRAE_STAGED_COMMIT_LLM_API_KEY || '').trim();
+  const model = String(process.env.TRAE_STAGED_COMMIT_LLM_MODEL || '').trim();
+  if (baseUrl && apiKey && model) return { baseUrl, apiKey, model };
+  return null;
+}
+
+function resolveLlmFromYaml() {
+  const p = configFilePath();
+  if (!fs.existsSync(p)) return null;
+  let doc;
+  try {
+    doc = YAML.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!doc || typeof doc !== 'object') return null;
+  const agentKey = doc.agents?.trae_agent?.model;
+  if (!agentKey || typeof agentKey !== 'string') return null;
+  const mdef = doc.models?.[agentKey];
+  if (!mdef || typeof mdef !== 'object') return null;
+  const provKey = mdef.model_provider;
+  const modelId = mdef.model;
+  if (!provKey || !modelId) return null;
+  const prov = doc.model_providers?.[provKey];
+  if (!prov || typeof prov !== 'object') return null;
+  const apiKey = String(prov.api_key || '').trim();
+  if (!apiKey || apiKey.includes('your_')) return null;
+  let baseUrl = String(prov.base_url || '').trim().replace(/\/$/, '');
+  const provName = String(prov.provider || provKey || '').toLowerCase();
+  if (!baseUrl) {
+    if (provName === 'openai') baseUrl = 'https://api.openai.com/v1';
+    else if (provName === 'openrouter') baseUrl = 'https://openrouter.ai/api/v1';
+    else return null;
+  }
+  return { baseUrl, apiKey, model: String(modelId) };
+}
+
+async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent) {
+  const url = `${baseUrl}/chat/completions`;
+  outboundLog(`diff-log-summary POST ${url} model=${model}`);
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), AI_SUMMARY_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content: '你是一个代码变更总结助手。请根据用户提供的 git diff 内容，用简洁的中文总结用户做了什么修改。输出格式：1. 变更类型：描述；2. 涉及文件：文件名列表；3. 主要改动：简要说明。保持简洁明了。',
+          },
+          { role: 'user', content: userContent },
+        ],
+        max_tokens: 256,
+        temperature: 0.3,
+      }),
+      signal: ac.signal,
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      outboundLog(`diff-log-summary LLM HTTP ${r.status} ${text.slice(0, 240)}`);
+      return null;
+    }
+    let j;
+    try {
+      j = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    const c = j?.choices?.[0]?.message?.content;
+    return typeof c === 'string' ? c.trim() : null;
+  } catch (e) {
+    outboundLog(`diff-log-summary LLM error ${String(e?.message || e).slice(0, 320)}`);
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function heuristicSummary(diffLogs) {
+  const changed = diffLogs.filter(d => d.has_changes);
+  const removed = changed.filter(d => d.diff.includes('/dev/null')).map(d => d.file);
+  const added = changed.filter(d => d.diff.startsWith('--- /dev/null')).map(d => d.file);
+  const modified = changed.filter(d => !d.diff.includes('/dev/null') || !d.diff.startsWith('--- /dev/null')).map(d => d.file);
+
+  const parts = [];
+  if (removed.length > 0) {
+    parts.push(`删除文件：${removed.join(', ')}`);
+  }
+  if (added.length > 0) {
+    parts.push(`新增文件：${added.join(', ')}`);
+  }
+  if (modified.length > 0) {
+    parts.push(`修改文件：${modified.join(', ')}`);
+  }
+  if (parts.length === 0) {
+    return '未检测到变更';
+  }
+  return parts.join('；');
+}
+
+async function generateDiffSummary(diffLogs) {
+  if (String(process.env.TRAE_STAGED_COMMIT_LLM_DISABLE || '').trim() === '1') {
+    return heuristicSummary(diffLogs);
+  }
+
+  const changed = diffLogs.filter(d => d.has_changes);
+  if (changed.length === 0) {
+    return '未检测到变更';
+  }
+
+  const diffContent = changed.map(d => `=== ${d.file} ===\n${d.diff}`).join('\n\n');
+  const diffTrim = diffContent.slice(0, AI_SUMMARY_MAX_DIFF);
+
+  const creds = resolveLlmFromEnv() || resolveLlmFromYaml();
+  if (creds && diffTrim.trim()) {
+    const summary = await callOpenAiCompatibleChat(
+      creds,
+      `以下是 git diff 内容（可能被截断）：\n\n${diffTrim}`,
+    );
+    if (summary) return summary;
+  }
+
+  return heuristicSummary(diffLogs);
+}
+
+api.post('/layers/:layer_id/git/diff-log', async (req, res) => {
+  const lid = req.params.layer_id;
+  const rootsC = layerGitWorkdirRootsForFileListing(lid);
+  const meta = readLayerMeta(lid);
+  const known = new Set(listLayerRows().map((r) => r.layer_id));
+  let parentId = meta?.parent_layer_id && known.has(meta.parent_layer_id) ? meta.parent_layer_id : null;
+  if (!parentId) parentId = resolvedParentLayerId(lid, known, null);
+  const rootsP = parentId ? layerGitWorkdirRootsForFileListing(parentId) : [];
+
+  const files = Array.isArray(req.body?.files) ? req.body.files : [];
+  if (!files.length) {
+    return res.status(400).json({ detail: 'files array required' });
+  }
+
+  const sanitizedFiles = files
+    .map(f => String(f || '').trim())
+    .filter(f => f && !f.includes('..') && !f.startsWith('/'));
+
+  if (!sanitizedFiles.length) {
+    return res.status(400).json({ detail: 'no valid files provided' });
+  }
+
+  const diffLogs = [];
+  for (const filePath of sanitizedFiles) {
+    try {
+      let diff = '';
+      let hasChanges = false;
+
+      const norm = filePath.replace(/\\/g, '/');
+      const segs = norm ? norm.split('/').filter((x) => x.length) : [];
+
+      let workdirC = null;
+      let workdirP = null;
+      let innerPath = null;
+
+      for (const rootC of rootsC) {
+        if (!rootC.relPrefix) {
+          workdirC = rootC.workdir;
+          innerPath = filePath;
+          const rootP = findParentWorkdirForChildPrefix(rootsP, rootC.relPrefix);
+          if (rootP) workdirP = rootP;
+          break;
+        }
+        if (segs[0] === rootC.relPrefix) {
+          workdirC = rootC.workdir;
+          innerPath = segs.slice(1).join('/');
+          const rootP = findParentWorkdirForChildPrefix(rootsP, rootC.relPrefix);
+          if (rootP) workdirP = rootP;
+          break;
+        }
+      }
+
+      if (!workdirC) {
+        workdirC = layerPrimaryGitWorkdir(lid);
+        innerPath = filePath;
+        if (parentId) workdirP = layerPrimaryGitWorkdir(parentId);
+      }
+
+      if (!workdirC) {
+        diffLogs.push({ file: filePath, diff: '', has_changes: false, error: 'no git workdir found' });
+        continue;
+      }
+
+      try {
+        diff = await gitExec(['diff', 'HEAD', '--', innerPath], workdirC);
+        hasChanges = diff.trim().length > 0;
+      } catch (_) {}
+
+      if (!hasChanges) {
+        try {
+          const cachedDiff = await gitExec(['diff', '--cached', 'HEAD', '--', innerPath], workdirC);
+          if (cachedDiff.trim().length > 0) {
+            diff = cachedDiff;
+            hasChanges = true;
+          }
+        } catch (_) {}
+      }
+
+      if (!hasChanges) {
+        try {
+          const statusOut = await gitExec(['status', '--porcelain', '--', innerPath], workdirC);
+          const statusLines = statusOut.trim().split('\n').filter(Boolean);
+          for (const line of statusLines) {
+            const status = line.slice(0, 2).trim();
+            if (status === 'D' || status === 'D ' || status === ' D' || status.includes('D')) {
+              const showOut = await gitExec(['show', `HEAD:${innerPath}`], workdirC);
+              diff = `--- a/${filePath}\n+++ /dev/null\n-${showOut.trim().split('\n').map(l => l || '\\ No newline at end of file').join('\n-')}`;
+              hasChanges = true;
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (!hasChanges && workdirP) {
+        try {
+          const pathInCurrent = path.join(workdirC, innerPath);
+          const pathInParent = path.join(workdirP, innerPath);
+
+          const existsInCurrent = fs.existsSync(pathInCurrent);
+          const existsInParent = fs.existsSync(pathInParent);
+
+          if (!existsInCurrent && existsInParent) {
+            const parentContent = fs.readFileSync(pathInParent, 'utf8');
+            diff = `--- a/${filePath}\n+++ /dev/null\n-${parentContent.trim().split('\n').map(l => l).join('\n-')}`;
+            hasChanges = true;
+          } else if (existsInCurrent && !existsInParent) {
+            const currentContent = fs.readFileSync(pathInCurrent, 'utf8');
+            diff = `--- /dev/null\n+++ b/${filePath}\n+${currentContent.trim().split('\n').map(l => l).join('\n+')}`;
+            hasChanges = true;
+          } else if (existsInCurrent && existsInParent) {
+            const parentContent = fs.readFileSync(pathInParent, 'utf8');
+            const currentContent = fs.readFileSync(pathInCurrent, 'utf8');
+            if (parentContent !== currentContent) {
+              const parentLines = parentContent.trim().split('\n');
+              const currentLines = currentContent.trim().split('\n');
+              const parts = [];
+              parts.push(`--- a/${filePath}`);
+              parts.push(`+++ b/${filePath}`);
+              const maxLines = Math.max(parentLines.length, currentLines.length);
+              for (let i = 0; i < maxLines; i++) {
+                const parentLine = parentLines[i] || '';
+                const currentLine = currentLines[i] || '';
+                if (parentLine !== currentLine) {
+                  if (parentLine !== undefined) parts.push(`-${parentLine}`);
+                  if (currentLine !== undefined) parts.push(`+${currentLine}`);
+                } else {
+                  parts.push(` ${parentLine}`);
+                }
+              }
+              diff = parts.join('\n');
+              hasChanges = true;
+            }
+          }
+        } catch (e) {
+          console.error('File system diff error:', e);
+        }
+      }
+
+      diffLogs.push({
+        file: filePath,
+        diff: diff.trim(),
+        has_changes: hasChanges,
+      });
+    } catch (e) {
+      diffLogs.push({
+        file: filePath,
+        diff: '',
+        has_changes: false,
+        error: String(e.message || e),
+      });
+    }
+  }
+
+  const summary = await generateDiffSummary(diffLogs);
+
+  const logContent = diffLogs
+    .filter(d => d.has_changes)
+    .map(d => `=== ${d.file} ===\n${d.diff}\n`)
+    .join('\n');
+
+  res.json({
+    layer_id: req.params.layer_id,
+    files: diffLogs,
+    log: logContent,
+    summary: summary,
+    changed_files_count: diffLogs.filter(d => d.has_changes).length,
+  });
 });
 
 api.get('/git/identity', (req, res) => {

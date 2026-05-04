@@ -1,6 +1,7 @@
 /**
- * 任务云 TaskApi 前缀、JSON POST，以及克隆进度上报（git-clone-progress → SaaS SSE）。
- * 供 bootstrap、POST /api/repos/reclone 等共用。
+ * 任务云 TaskApi 前缀、JSON POST，克隆进度上报（git-clone-progress → SaaS SSE），
+ * 以及层级快照上报（layer-graph-push → SSE container_layer_graph，供任务详情 zTree）。
+ * 供 bootstrap、POST /api/repos/reclone、jobsRuntime 等共用。
  */
 import { spawn } from 'child_process';
 
@@ -131,6 +132,39 @@ export async function postCloneProgress(cloudPrefix, accessToken, progress, mess
   }
   try {
     await postJson(url, body, 10);
+  } catch {
+    /* optional */
+  }
+}
+
+/**
+ * 将当前层级快照上报至 SaaS `server-container-token/layer-graph-push/`，由 Django 推送到
+ * `server-startup-status-sse`（`status: container_layer_graph`），任务详情评论区 zTree 可即时刷新。
+ * 环境与 `taskApiPrefix()`、`ACCESS_TOKEN` 不全或请求失败时静默忽略。
+ * @param {null|{ layers?: unknown[], jobs?: unknown[], layers_root?: string, bootstrap_layer_id?: string|null }} snapshot
+ */
+export async function publishLayerGraphSnapshotToSaas(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  let cloudPrefix;
+  try {
+    cloudPrefix = taskApiPrefix();
+  } catch {
+    return;
+  }
+  const accessToken = String(process.env.ACCESS_TOKEN || '').trim();
+  if (!cloudPrefix || !accessToken) return;
+  const url = `${cloudPrefix.replace(/\/$/, '')}/server-container-token/layer-graph-push/`;
+  const body = {
+    access_token: accessToken,
+    layers: Array.isArray(snapshot.layers) ? snapshot.layers : [],
+    jobs: Array.isArray(snapshot.jobs) ? snapshot.jobs : [],
+  };
+  const lr = snapshot.layers_root;
+  if (typeof lr === 'string' && lr.trim()) body.layers_root = lr.trim();
+  const bs = snapshot.bootstrap_layer_id;
+  if (bs != null && String(bs).trim()) body.bootstrap_layer_id = String(bs).trim();
+  try {
+    await postJson(url, body, 15);
   } catch {
     /* optional */
   }
