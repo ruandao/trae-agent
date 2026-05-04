@@ -31,6 +31,7 @@ from trae_agent.utils.llm_clients.base_client import BaseLLMClient
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
 from trae_agent.utils.llm_clients.llm_logger import LLMLogger
 from trae_agent.utils.llm_clients.retry_utils import retry_with
+from trae_agent.utils.llm_clients.tool_call_json import parse_tool_call_arguments
 
 
 class ProviderConfig(ABC):
@@ -186,11 +187,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                         ToolCall(
                             name=tool_call.function.name,
                             call_id=tool_call.id,
-                            arguments=(
-                                json.loads(tool_call.function.arguments)
-                                if tool_call.function.arguments
-                                else {}
-                            ),
+                            arguments=parse_tool_call_arguments(tool_call.function.arguments),
                         )
                     )
 

@@ -23,6 +23,7 @@ from trae_agent.utils.llm_clients.base_client import BaseLLMClient
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
 from trae_agent.utils.llm_clients.llm_logger import LLMLogger
 from trae_agent.utils.llm_clients.retry_utils import retry_with
+from trae_agent.utils.llm_clients.tool_call_json import parse_tool_call_arguments
 
 
 class DeepSeekClient(BaseLLMClient):
@@ -296,11 +297,7 @@ class DeepSeekClient(BaseLLMClient):
                         ToolCall(
                             call_id=tool_call.id,
                             name=tool_call.function.name,
-                            arguments=(
-                                json.loads(tool_call.function.arguments)
-                                if tool_call.function.arguments
-                                else {}
-                            ),
+                            arguments=parse_tool_call_arguments(tool_call.function.arguments),
                         )
                     )
 

@@ -23,6 +23,7 @@ from trae_agent.utils.config import ModelConfig
 from trae_agent.utils.llm_clients.base_client import BaseLLMClient
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
 from trae_agent.utils.llm_clients.retry_utils import retry_with
+from trae_agent.utils.llm_clients.tool_call_json import parse_tool_call_arguments
 
 
 class OpenAIClient(BaseLLMClient):
@@ -112,9 +113,7 @@ class OpenAIClient(BaseLLMClient):
                     ToolCall(
                         call_id=output_block.call_id,
                         name=output_block.name,
-                        arguments=json.loads(output_block.arguments)
-                        if output_block.arguments
-                        else {},
+                        arguments=parse_tool_call_arguments(output_block.arguments),
                         id=output_block.id,
                     )
                 )
