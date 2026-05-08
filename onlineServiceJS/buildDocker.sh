@@ -57,6 +57,8 @@ IMAGE="${DOCKER_IMAGE:-${TRAE_ONLINE_JS_IMAGE:-trae-online-js:local}}"
 PLATFORMS="${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}"
 DOCKER_IMAGE_TAG_SCHEME="${DOCKER_IMAGE_TAG_SCHEME:-arch_timestamp}"
 DOCKER_REGISTRY_REPOSITORY="${DOCKER_REGISTRY_REPOSITORY:-registry.cn-qingdao.aliyuncs.com/ruandao/task2app-trae}"
+# 推送时默认强制双架构齐全，避免只推单架构导致线上拉取失败。
+REQUIRED_PUSH_PLATFORMS="${REQUIRED_PUSH_PLATFORMS:-linux/amd64,linux/arm64}"
 
 # Docker tag 允许的字符集为 [A-Za-z0-9_.-]，首字符须为 [A-Za-z0-9_]，长度 <=128。
 sanitize_docker_tag() {
@@ -82,8 +84,8 @@ compute_image_version() {
   sanitize_docker_tag "$desc"
 }
 
-# 查询或创建当前 commit 的 git tag。
-# - 当前 HEAD 已有任意 tag：返回首个。
+# 查询或创建当前 commit 的「按架构」git tag。
+# - 当前 HEAD 已有匹配该架构前缀（${arch}_）的 tag：复用首个匹配项。
 # - 否则按 "${arch}_%Y-%m-%d_%H-%M" 在 HEAD 上新建 git tag 并返回。
 # - 不在 git 仓库 / git 不可用：仅生成同形名字（不打 tag）。
 # 注：用户原指定格式为 "${Arch}_%Y-%m-%d %H:%M"，但空格与冒号在 git/docker tag 中均非法，
@@ -97,7 +99,7 @@ ensure_commit_git_tag() {
     printf '%s' "$candidate"
     return 0
   fi
-  existing="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | head -n 1 || true)"
+  existing="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | awk -v pfx="^${arch}_" '$0 ~ pfx { print; exit }' || true)"
   if [[ -n "$existing" ]]; then
     printf '%s' "$existing"
     return 0
@@ -137,6 +139,46 @@ trim_spaces() {
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf '%s' "$s"
+}
+
+csv_contains_platform() {
+  local csv="$1"
+  local target="$2"
+  local _oifs="$IFS"
+  IFS=','
+  for _entry in $csv; do
+    IFS="$_oifs"
+    if [[ "$(trim_spaces "$_entry")" == "$target" ]]; then
+      return 0
+    fi
+    IFS=','
+  done
+  IFS="$_oifs"
+  return 1
+}
+
+assert_required_push_platforms() {
+  local actual="$1"
+  local required_csv="$2"
+  local missing=()
+  local _oifs="$IFS"
+  IFS=','
+  for _entry in $required_csv; do
+    IFS="$_oifs"
+    req="$(trim_spaces "$_entry")"
+    [[ -z "$req" ]] && { IFS=','; continue; }
+    if ! csv_contains_platform "$actual" "$req"; then
+      missing+=("$req")
+    fi
+    IFS=','
+  done
+  IFS="$_oifs"
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo "[buildDocker.sh] 错误: 推送模式要求同时构建并推送以下架构: $required_csv" >&2
+    echo "[buildDocker.sh] 当前 DOCKER_PLATFORMS=$actual，缺失: ${missing[*]}" >&2
+    echo "[buildDocker.sh] 如需覆盖默认要求，请显式设置 REQUIRED_PUSH_PLATFORMS" >&2
+    exit 1
+  fi
 }
 
 platform_to_arch_slug() {
@@ -203,6 +245,8 @@ if [[ -n "${DOCKER_BUILDX_BUILDER:-}" ]]; then
 fi
 
 if [[ "$DO_PUSH" -eq 1 ]]; then
+  assert_required_push_platforms "$PLATFORMS" "$REQUIRED_PUSH_PLATFORMS"
+
   if [[ -n "${DOCKER_PUSH_IMAGE:-}" ]]; then
     PUSH_REF="$(resolve_push_ref)"
     echo "[buildDocker.sh] 构建上下文: $REPO_ROOT" >&2
