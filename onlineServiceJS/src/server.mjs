@@ -23,6 +23,7 @@ import {
   startupEmptyLayerId,
   appendCloneLayerLog,
 } from './bootstrap.mjs';
+import { registerReachabilityAfterBootstrap } from './reachability.mjs';
 import {
   taskApiPrefix,
   postCloneProgress,
@@ -1458,14 +1459,29 @@ async function main() {
       app.listen(port, host, async () => {
         console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);
         broadcast({ type: 'service_ready', port });
+        let afterListenOk = false;
         try {
           await runBootstrapAfterListen(bootstrapCtx);
-          if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
-            registerBootstrapCloneJob(bootstrapCloneLayerId);
-          }
+          afterListenOk = true;
         } catch (e) {
           console.error('[onlineServiceJS] bootstrap (post-listen) error:', e);
           if (strict) process.exit(1);
+        }
+        if (afterListenOk) {
+          try {
+            await registerReachabilityAfterBootstrap(bootstrapCtx);
+          } catch (e) {
+            console.error('[onlineServiceJS] reachability 失败（不会回退 127.0.0.1）:', e);
+            process.exit(1);
+          }
+          try {
+            if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
+              registerBootstrapCloneJob(bootstrapCloneLayerId);
+            }
+          } catch (e) {
+            console.error('[onlineServiceJS] bootstrap clone job 注册错误:', e);
+            if (strict) process.exit(1);
+          }
         }
         resolve();
       });

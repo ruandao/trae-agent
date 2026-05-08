@@ -182,6 +182,7 @@ docker run --rm -i --privileged \
   -v "${ONLINE_PROJ_HOST}:/app/onlineProject" \
   -e "ACCESS_TOKEN=${ACCESS_TOKEN}" \
   -e "PORT=${PORT}" \
+  -e "TRAE_HOST_HTTP_PORT=${HOST_PORT}" \
   -e "REPO_ROOT=/app" \
   -e "ONLINE_PROJECT_STATE_ROOT=/app/onlineProject_state" \
   -e "ONLINE_PROJECT_LAYERS=${_layers_in_container}" \
