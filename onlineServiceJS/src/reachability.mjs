@@ -100,7 +100,8 @@ async function resolveReachableIp() {
   );
 }
 
-function hostMappedHttpPort() {
+/** 宿主机可达 HTTP 端口：publish 映射优先 TRAE_HOST_HTTP_PORT，否则容器 PORT，默认与 server.listen 一致 8765 */
+export function hostMappedHttpPort() {
   const explicit = String(process.env.TRAE_HOST_HTTP_PORT || '').trim();
   if (explicit) {
     const n = parseInt(explicit, 10);

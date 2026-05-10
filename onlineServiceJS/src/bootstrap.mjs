@@ -32,6 +32,7 @@ import {
   normalizeGitProgressChunkForLog,
   runGitCloneWithProgress,
 } from './saasTaskCloud.mjs';
+import { hostMappedHttpPort } from './reachability.mjs';
 
 export let bootstrapCloneLayerId = null;
 /** 为 true 时 server 须在引导结束后调用 registerBootstrapCloneJob（仅「任务详情已含仓库并完成引导克隆」） */
@@ -103,7 +104,7 @@ export function finalizeCloneLayerLog(layerId) {
 /**
  * 规范化换票用的 business_api_endpoint：
  * - 编排模板常见错误 `http://<ip>:/api`（`${PORT}` 为空）在部分校验器下非法；WHATWG URL 会折叠为无端口 origin。
- * - 若折叠后仍无显式端口且 host 像可达 IP，则用 TRAE_HOST_HTTP_PORT / PORT 补全（避免 SaaS 误用默认 80）。
+ * - 若折叠后仍无显式端口且 host 像可达 IP/localhost：补全为 {@link hostMappedHttpPort}（与 listen / register-reachability 一致，含 PORT 未设时默认 8765）。
  */
 function normalizeBusinessApiEndpointUrl(raw) {
   let candidate = String(raw || '').trim();
@@ -121,13 +122,10 @@ function normalizeBusinessApiEndpointUrl(raw) {
     throw new Error('BusinessApiEndPoint must be http or https');
   }
   const host = u.hostname || '';
-  const envPortRaw =
-    String(process.env.TRAE_HOST_HTTP_PORT || '').trim() || String(process.env.PORT || '').trim();
-  const envPort = envPortRaw ? parseInt(envPortRaw, 10) : NaN;
   const looksLikeIp =
     /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host === 'localhost';
-  if (!u.port && Number.isFinite(envPort) && envPort > 0 && looksLikeIp) {
-    u.port = String(envPort);
+  if (!u.port && looksLikeIp) {
+    u.port = String(hostMappedHttpPort());
   }
   return u.href.replace(/\/$/, '');
 }
