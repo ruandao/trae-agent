@@ -76,10 +76,12 @@ function parseTenantWorkspaceTaskFromPath(pathname) {
 
 /**
  * 任务云回调前缀：`.../api/tenant/.../workspace/.../task/.../cloud`。
- * 优先读环境变量 tenantId / workspaceId / taskId；若缺失则从 TaskApiEndPoint 的 URL 路径解析（适用于 UserData 仅注入完整 API 根路径的场景）。
+ * 优先读环境变量 tenantId / workspaceId / taskId；若缺失则从 TaskApiEndPoint（或同义的 TASK_API_ENDPOINT）的 URL 路径解析（适用于 UserData 仅注入完整 API 根路径的场景）。
  */
 export function taskApiPrefix() {
-  const raw = rewriteDockerInternal(String(process.env.TaskApiEndPoint || '').trim());
+  const raw = rewriteDockerInternal(
+    String(process.env.TaskApiEndPoint || process.env.TASK_API_ENDPOINT || '').trim(),
+  );
   if (!raw) return null;
 
   let tenant = String(process.env.tenantId || '').trim();
@@ -101,7 +103,7 @@ export function taskApiPrefix() {
 
   if (!tenant || !workspace || !task) {
     throw new Error(
-      'TaskApiEndPoint set but tenantId/workspaceId/taskId missing (请在容器环境注入 tenantId/workspaceId/taskId，或使用可解析路径：/api/tenant/.../task/... 或 /api/.../task-detail/... 或浏览器任务页 /tenant/.../task-detail/...)'
+      'TaskApiEndPoint/TASK_API_ENDPOINT set but tenantId/workspaceId/taskId missing (请在容器环境注入 tenantId/workspaceId/taskId，或使用可解析路径：/api/tenant/.../task/... 或 /api/.../task-detail/... 或浏览器任务页 /tenant/.../task-detail/...)'
     );
   }
 
@@ -111,7 +113,7 @@ export function taskApiPrefix() {
     const u = new URL(base);
     origin = u.origin;
   } catch {
-    throw new Error('Invalid TaskApiEndPoint (expected absolute URL or origin)');
+    throw new Error('Invalid TaskApiEndPoint/TASK_API_ENDPOINT (expected absolute URL or origin)');
   }
 
   return `${origin.replace(/\/$/, '')}/api/tenant/${tenant}/workspace/${workspace}/task/${task}/cloud`;
