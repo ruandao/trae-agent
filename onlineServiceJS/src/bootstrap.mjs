@@ -100,12 +100,45 @@ export function finalizeCloneLayerLog(layerId) {
   completeExecStream('clone', layerId);
 }
 
+/**
+ * 规范化换票用的 business_api_endpoint：
+ * - 编排模板常见错误 `http://<ip>:/api`（`${PORT}` 为空）在部分校验器下非法；WHATWG URL 会折叠为无端口 origin。
+ * - 若折叠后仍无显式端口且 host 像可达 IP，则用 TRAE_HOST_HTTP_PORT / PORT 补全（避免 SaaS 误用默认 80）。
+ */
+function normalizeBusinessApiEndpointUrl(raw) {
+  let candidate = String(raw || '').trim();
+  if (!candidate) return candidate;
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(candidate)) {
+    candidate = `http://${candidate}`;
+  }
+  let u;
+  try {
+    u = new URL(candidate);
+  } catch {
+    throw new Error(`Invalid BusinessApiEndPoint/BUSINESS_API_ENDPOINT (not a valid URL): ${raw}`);
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error('BusinessApiEndPoint must be http or https');
+  }
+  const host = u.hostname || '';
+  const envPortRaw =
+    String(process.env.TRAE_HOST_HTTP_PORT || '').trim() || String(process.env.PORT || '').trim();
+  const envPort = envPortRaw ? parseInt(envPortRaw, 10) : NaN;
+  const looksLikeIp =
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host === 'localhost';
+  if (!u.port && Number.isFinite(envPort) && envPort > 0 && looksLikeIp) {
+    u.port = String(envPort);
+  }
+  return u.href.replace(/\/$/, '');
+}
+
 function businessApiEndpoint() {
   let raw = String(process.env.BusinessApiEndPoint || process.env.BUSINESS_API_ENDPOINT || '').trim();
   if (!raw) {
     throw new Error('BusinessApiEndPoint/BUSINESS_API_ENDPOINT empty');
   }
-  return rewriteDockerInternal(raw).replace(/\/$/, '');
+  raw = rewriteDockerInternal(raw);
+  return normalizeBusinessApiEndpointUrl(raw);
 }
 
 /** 仅当显式设置 TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE 时跳过换票（本地/unit 专用）。勿用语义启发式跳过：SSH 隧道把远端 SaaS 映射到 127.0.0.1 时会误判并导致 DB 中 container_refresh_token 永不写入。 */
@@ -478,7 +511,15 @@ export async function runBootstrapTokenExchangeOnly() {
   }
 
   const timeout = Math.max(1, parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '5') || 5);
-  const business = businessApiEndpoint();
+  let business;
+  try {
+    business = businessApiEndpoint();
+  } catch (e) {
+    const line = `bootstrap: business API endpoint: ${e && e.message ? String(e.message) : String(e)}`;
+    logOutbound(line);
+    appendTokenRefreshLog(line);
+    throw e;
+  }
   let newAccess = String(process.env.ACCESS_TOKEN || '').trim();
   if (!newAccess) {
     const failLine = 'token-exchange: FAIL ACCESS_TOKEN empty for bootstrap';
