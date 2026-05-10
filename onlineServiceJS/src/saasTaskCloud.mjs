@@ -55,16 +55,66 @@ export function rewriteDockerInternal(url) {
   }
 }
 
-export function taskApiPrefix() {
-  const endpoint = rewriteDockerInternal(String(process.env.TaskApiEndPoint || '').trim());
-  if (!endpoint) return null;
-  const tenant = String(process.env.tenantId || '').trim();
-  const workspace = String(process.env.workspaceId || '').trim();
-  const task = String(process.env.taskId || '').trim();
-  if (!tenant || !workspace || !task) {
-    throw new Error('TaskApiEndPoint set but tenantId/workspaceId/taskId missing');
+/**
+ * 从路径中解析任务云三段 ID。
+ * 支持：标准任务云路径、`/api/.../task-detail/{id}`、以及浏览器任务详情页 `/tenant/.../task-detail/{id}`。
+ * 误把任务详情页 URL 当作 TaskApiEndPoint 时，此前无法解析导致换票跳过、库中 container_refresh_token 一直为空。
+ */
+function parseTenantWorkspaceTaskFromPath(pathname) {
+  const p = String(pathname || '');
+  const patterns = [
+    /\/api\/tenant\/([^/]+)\/workspace\/([^/]+)\/task\/([^/]+)/,
+    /\/api\/tenant\/([^/]+)\/workspace\/([^/]+)\/task-detail\/([^/]+)/,
+    /\/tenant\/([^/]+)\/workspace\/([^/]+)\/task-detail\/([^/]+)/,
+  ];
+  for (const re of patterns) {
+    const m = p.match(re);
+    if (m) return { tenant: m[1], workspace: m[2], task: m[3] };
   }
-  return `${endpoint.replace(/\/$/, '')}/api/tenant/${tenant}/workspace/${workspace}/task/${task}/cloud`;
+  return null;
+}
+
+/**
+ * 任务云回调前缀：`.../api/tenant/.../workspace/.../task/.../cloud`。
+ * 优先读环境变量 tenantId / workspaceId / taskId；若缺失则从 TaskApiEndPoint 的 URL 路径解析（适用于 UserData 仅注入完整 API 根路径的场景）。
+ */
+export function taskApiPrefix() {
+  const raw = rewriteDockerInternal(String(process.env.TaskApiEndPoint || '').trim());
+  if (!raw) return null;
+
+  let tenant = String(process.env.tenantId || '').trim();
+  let workspace = String(process.env.workspaceId || '').trim();
+  let task = String(process.env.taskId || '').trim();
+
+  try {
+    const base = raw.includes('://') ? raw : `http://${raw}`;
+    const u = new URL(base);
+    const parsed = parseTenantWorkspaceTaskFromPath(u.pathname);
+    if (parsed) {
+      if (!tenant) tenant = parsed.tenant;
+      if (!workspace) workspace = parsed.workspace;
+      if (!task) task = parsed.task;
+    }
+  } catch {
+    /* 非 URL 形态时仅依赖环境变量 */
+  }
+
+  if (!tenant || !workspace || !task) {
+    throw new Error(
+      'TaskApiEndPoint set but tenantId/workspaceId/taskId missing (请在容器环境注入 tenantId/workspaceId/taskId，或使用可解析路径：/api/tenant/.../task/... 或 /api/.../task-detail/... 或浏览器任务页 /tenant/.../task-detail/...)'
+    );
+  }
+
+  let origin = raw;
+  try {
+    const base = raw.includes('://') ? raw : `http://${raw}`;
+    const u = new URL(base);
+    origin = u.origin;
+  } catch {
+    throw new Error('Invalid TaskApiEndPoint (expected absolute URL or origin)');
+  }
+
+  return `${origin.replace(/\/$/, '')}/api/tenant/${tenant}/workspace/${workspace}/task/${task}/cloud`;
 }
 
 /**

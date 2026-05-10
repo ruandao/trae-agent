@@ -111,10 +111,17 @@ function hostMappedHttpPort() {
 
 function hostMappedVscodePort() {
   const explicit = String(process.env.TRAE_HOST_VSCODE_PORT || '').trim();
-  if (!explicit) return null;
-  const n = parseInt(explicit, 10);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
+  if (explicit) {
+    const n = parseInt(explicit, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  // onlineService-entrypoint.sh：CODE_SERVER_ENABLED 时 code-server 默认监听容器内 8888；宿主机常见 8888:8888 映射
+  const cs = String(process.env.CODE_SERVER_ENABLED || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(cs)) {
+    const inner = parseInt(String(process.env.CODE_SERVER_BIND_PORT || '8888').trim(), 10);
+    return Number.isFinite(inner) && inner > 0 ? inner : 8888;
+  }
+  return null;
 }
 
 /**

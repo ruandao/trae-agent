@@ -108,17 +108,10 @@ function businessApiEndpoint() {
   return rewriteDockerInternal(raw).replace(/\/$/, '');
 }
 
-function skipExchangeForLocalBusinessApi(businessEp) {
-  const e = businessEp.toLowerCase();
-  const listen = String(process.env.PORT || '8765').trim();
-  const pnum = parseInt(listen, 10) || 8765;
-  const hosts = [`http://127.0.0.1:${pnum}`, `http://localhost:${pnum}`];
-  const hit = hosts.some((h) => e === h || e.startsWith(`${h}/`));
-  if (!hit) return false;
-  const taskApi = String(process.env.TaskApiEndPoint || '').trim().toLowerCase();
-  if (!taskApi) return true;
-  return ['127.0.0.1', 'localhost', '::1'].some(
-    (h) => taskApi.startsWith(`http://${h}:`) || taskApi.startsWith(`http://${h}/`)
+/** 仅当显式设置 TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE 时跳过换票（本地/unit 专用）。勿用语义启发式跳过：SSH 隧道把远端 SaaS 映射到 127.0.0.1 时会误判并导致 DB 中 container_refresh_token 永不写入。 */
+function skipContainerTokenExchangeByEnv() {
+  return ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE || '').trim().toLowerCase(),
   );
 }
 
@@ -459,7 +452,7 @@ export async function runBootstrapTokenExchangeOnly() {
   let newAccess = String(process.env.ACCESS_TOKEN || '').trim();
   if (!newAccess) throw new Error('ACCESS_TOKEN empty for bootstrap');
 
-  if (!skipExchangeForLocalBusinessApi(business)) {
+  if (!skipContainerTokenExchangeByEnv()) {
     const ex = await postJson(
       `${prefix}/server-container-token/exchange-refresh/`,
       { access_token: newAccess, business_api_endpoint: business },
@@ -477,7 +470,7 @@ export async function runBootstrapTokenExchangeOnly() {
     newAccess = at;
     process.env.ACCESS_TOKEN = newAccess;
   } else {
-    logOutbound('bootstrap: skip exchange (local business API)');
+    logOutbound('bootstrap: skip exchange (TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE)');
   }
 
   return { skipped: false, prefix, newAccess, timeout };
