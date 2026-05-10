@@ -12,15 +12,18 @@ log = logging.getLogger(__name__)
 
 def rewrite_host_docker_internal_url(url: str) -> str:
     """
-    将 URL 中的 host.docker.internal 换为数值 IP（仅当显式设置 DOCKER_HOST_GATEWAY_IP 时）。
+    将 URL 中与 DOCKER_GATEWAY_HOSTNAME 匹配的主机名换为 DOCKER_HOST_GATEWAY_IP（均在环境中可选）。
 
-    未设置时保留主机名，以便 HTTP Host 与 Django ALLOWED_HOSTS 中的 host.docker.internal 一致。
+    未设置 DOCKER_GATEWAY_HOSTNAME 时不改写（TaskApiEndPoint 应由 SaaS 注入公网域名）。
     """
     u = url.strip()
     if not u:
         return u
+    gateway_name = os.environ.get("DOCKER_GATEWAY_HOSTNAME", "").strip().lower()
+    if not gateway_name:
+        return u
     p = urlsplit(u)
-    if (p.hostname or "").lower() != "host.docker.internal":
+    if (p.hostname or "").lower() != gateway_name:
         return u
     ip = os.environ.get("DOCKER_HOST_GATEWAY_IP", "").strip()
     if not ip:
@@ -36,7 +39,7 @@ def rewrite_host_docker_internal_url(url: str) -> str:
     netloc = ui_prefix + new_host_part
     out = urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
     if out != u:
-        log.info("已将 host.docker.internal 替换为宿主机 IP：%s -> %s", u, out)
+        log.info("已将网关主机名替换为宿主机 IP：%s -> %s", u, out)
     return out
 
 

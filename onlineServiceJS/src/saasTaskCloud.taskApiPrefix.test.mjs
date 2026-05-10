@@ -26,6 +26,7 @@ const KEYS = [
   'tenantId',
   'workspaceId',
   'taskId',
+  'DOCKER_GATEWAY_HOSTNAME',
   'DOCKER_HOST_GATEWAY_IP',
 ];
 

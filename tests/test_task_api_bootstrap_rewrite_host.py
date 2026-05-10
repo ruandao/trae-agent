@@ -1,4 +1,4 @@
-"""task_api_bootstrap：host.docker.internal 仅在设置 DOCKER_HOST_GATEWAY_IP 时换为 IP。"""
+"""rewrite_host_docker_internal_url：仅在同时设置 DOCKER_GATEWAY_HOSTNAME 与 DOCKER_HOST_GATEWAY_IP 时换为 IP。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from trae_agent_online.task_cloud_bootstrap import (
     rewrite_host_docker_internal_url,
 )
 
+_GATEWAY_NAME = "gateway-alias.example"
+
 
 def test_rewrite_host_docker_internal_noop() -> None:
     assert (
@@ -15,26 +17,38 @@ def test_rewrite_host_docker_internal_noop() -> None:
     )
 
 
-def test_rewrite_host_docker_internal_unchanged_without_gateway_env(monkeypatch) -> None:
+def test_rewrite_host_docker_internal_unchanged_without_gateway_hostname(monkeypatch) -> None:
+    monkeypatch.delenv("DOCKER_GATEWAY_HOSTNAME", raising=False)
     monkeypatch.delenv("DOCKER_HOST_GATEWAY_IP", raising=False)
     assert (
-        rewrite_host_docker_internal_url("http://host.docker.internal:8765/api/foo")
-        == "http://host.docker.internal:8765/api/foo"
+        rewrite_host_docker_internal_url(f"http://{_GATEWAY_NAME}:8765/api/foo")
+        == f"http://{_GATEWAY_NAME}:8765/api/foo"
+    )
+
+
+def test_rewrite_host_docker_internal_unchanged_without_gateway_ip(monkeypatch) -> None:
+    monkeypatch.setenv("DOCKER_GATEWAY_HOSTNAME", _GATEWAY_NAME)
+    monkeypatch.delenv("DOCKER_HOST_GATEWAY_IP", raising=False)
+    assert (
+        rewrite_host_docker_internal_url(f"http://{_GATEWAY_NAME}:8765/api/foo")
+        == f"http://{_GATEWAY_NAME}:8765/api/foo"
     )
 
 
 def test_rewrite_host_docker_internal_with_env_ip(monkeypatch) -> None:
+    monkeypatch.setenv("DOCKER_GATEWAY_HOSTNAME", _GATEWAY_NAME)
     monkeypatch.setenv("DOCKER_HOST_GATEWAY_IP", "192.168.65.254")
     assert (
-        rewrite_host_docker_internal_url("http://host.docker.internal:8765/api/foo")
+        rewrite_host_docker_internal_url(f"http://{_GATEWAY_NAME}:8765/api/foo")
         == "http://192.168.65.254:8765/api/foo"
     )
 
 
 def test_rewrite_host_docker_internal_preserves_userinfo(monkeypatch) -> None:
+    monkeypatch.setenv("DOCKER_GATEWAY_HOSTNAME", _GATEWAY_NAME)
     monkeypatch.setenv("DOCKER_HOST_GATEWAY_IP", "10.0.0.2")
     assert (
-        rewrite_host_docker_internal_url("http://u:p@host.docker.internal:99/x")
+        rewrite_host_docker_internal_url(f"http://u:p@{_GATEWAY_NAME}:99/x")
         == "http://u:p@10.0.0.2:99/x"
     )
 

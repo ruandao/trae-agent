@@ -40,12 +40,15 @@ export async function postJson(url, body, timeoutSec = 8) {
   }
 }
 
+/** 将 TaskApi URL 中与 DOCKER_GATEWAY_HOSTNAME 一致的主机名换为 DOCKER_HOST_GATEWAY_IP（均在容器 env 中可选配置）。 */
 export function rewriteDockerInternal(url) {
   const u = String(url || '').trim();
   if (!u) return u;
+  const gatewayHost = String(process.env.DOCKER_GATEWAY_HOSTNAME || '').trim().toLowerCase();
+  if (!gatewayHost) return u;
   try {
     const x = new URL(u);
-    if (x.hostname.toLowerCase() !== 'host.docker.internal') return u;
+    if (x.hostname.toLowerCase() !== gatewayHost) return u;
     const ip = String(process.env.DOCKER_HOST_GATEWAY_IP || '').trim();
     if (!ip) return u;
     x.hostname = ip;

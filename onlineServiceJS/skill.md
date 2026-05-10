@@ -262,6 +262,8 @@ docker run --rm -p 8765:8765 -e ACCESS_TOKEN=dev your-registry/trae-online-js:la
 
 构建时可经 `ARG`/`ENV` 传入 `ACCESS_TOKEN`、`TaskApiEndPoint` 等（见 `onlineServiceJS/Dockerfile`）。镜像内已含 `/app/trae_config.yaml.example`，可复制为运行时配置后再改密钥或通过 `/api/config` 上传。
 
+**任务详情「模拟启动」（`mockStart`）**：租户已安装镜像若配置了 Docker 引用（**`image_url`**），SaaS 侧可 **`docker pull` + `docker run`** 该标签，并通过 `-e` 注入与云上 UserData / `init_from_task2app.sh` 一致的变量（无需在本机构建上述 Dockerfile）。无 **`image_url`** 时仍在本机用 **`trae-agent` 根目录** 构建 `onlineServiceJS/Dockerfile`。编排入口：Django 内联或独立 **`mock_trae_worker`**（`MOCK_TRAE_WORKER_URL`）；说明见 monorepo **`mock_trae_worker/README.md`**、**`task2app/conf/port_config.json.md`**（`mock_trae_worker`）、**`task2app/Saas_project/skillList/machine_container_ai_reference.md`** §4。
+
 ## 注意事项
 
 - 任务输出在内存与 `jobs_state.json`；服务重启后原 `running` 会记为 `interrupted`（见 `loadState`）。

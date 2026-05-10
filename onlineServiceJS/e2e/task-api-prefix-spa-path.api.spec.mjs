@@ -6,7 +6,14 @@
 import { test, expect } from '@playwright/test';
 import { taskApiPrefix } from '../src/saasTaskCloud.mjs';
 
-const KEYS = ['TaskApiEndPoint', 'tenantId', 'workspaceId', 'taskId', 'DOCKER_HOST_GATEWAY_IP'];
+const KEYS = [
+  'TaskApiEndPoint',
+  'tenantId',
+  'workspaceId',
+  'taskId',
+  'DOCKER_GATEWAY_HOSTNAME',
+  'DOCKER_HOST_GATEWAY_IP',
+];
 
 function snapshotEnv() {
   const o = {};
