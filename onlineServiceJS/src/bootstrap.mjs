@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import YAML from 'yaml';
 
-import { configFilePath, reqLogsDir } from './paths.mjs';
+import { configFilePath, reqLogsDir, logsDir } from './paths.mjs';
 import {
   newLayerId,
   createRootLayer,
@@ -430,6 +430,29 @@ function logOutbound(line) {
   }
 }
 
+/** 换票专用日志：onlineProject_state/logs/tokenRefresh.log，便于与 reqLogs/outbound.log 区分排查 */
+function appendTokenRefreshLog(line) {
+  try {
+    fs.appendFileSync(path.join(logsDir(), 'tokenRefresh.log'), `${new Date().toISOString()} | ${line}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 换票调试：不落库明文，仅长度等摘要。 */
+function summarizeSecret(value) {
+  const s = String(value || '');
+  if (!s) return '(empty)';
+  return `len=${s.length}`;
+}
+
+function logTokenExchange(line) {
+  const msg = `token-exchange: ${line}`;
+  logOutbound(msg);
+  appendTokenRefreshLog(msg);
+  console.log(`[onlineServiceJS] ${msg}`);
+}
+
 /**
  * HTTP 监听前：解析 TaskApi 前缀并完成换票（若需要）。
  * 任务详情拉取、仓库克隆、service_config.yaml 写入在 {@link runBootstrapAfterListen}。
@@ -442,35 +465,68 @@ export async function runBootstrapTokenExchangeOnly() {
   try {
     prefix = taskApiPrefix();
   } catch (e) {
-    logOutbound(`bootstrap skip: ${e.message}`);
+    const skipLine = `bootstrap skip: ${e.message}`;
+    logOutbound(skipLine);
+    appendTokenRefreshLog(skipLine);
     return { skipped: true };
   }
-  if (!prefix) return { skipped: true };
+  if (!prefix) {
+    const skipLine = 'bootstrap skip: empty task API prefix';
+    logOutbound(skipLine);
+    appendTokenRefreshLog(skipLine);
+    return { skipped: true };
+  }
 
   const timeout = Math.max(1, parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '5') || 5);
   const business = businessApiEndpoint();
   let newAccess = String(process.env.ACCESS_TOKEN || '').trim();
-  if (!newAccess) throw new Error('ACCESS_TOKEN empty for bootstrap');
+  if (!newAccess) {
+    const failLine = 'token-exchange: FAIL ACCESS_TOKEN empty for bootstrap';
+    appendTokenRefreshLog(failLine);
+    throw new Error('ACCESS_TOKEN empty for bootstrap');
+  }
+
+  logTokenExchange(
+    `begin prefix=${prefix} timeout_sec=${timeout} business_api_endpoint=${business} initial_access_token ${summarizeSecret(newAccess)}`,
+  );
 
   if (!skipContainerTokenExchangeByEnv()) {
-    const ex = await postJson(
-      `${prefix}/server-container-token/exchange-refresh/`,
-      { access_token: newAccess, business_api_endpoint: business },
-      timeout
-    );
-    const refreshToken = ex.refresh_token;
-    if (!refreshToken) throw new Error('exchange-refresh missing refresh_token');
-    const ref = await postJson(
-      `${prefix}/server-container-token/refresh-access/`,
-      { refresh_token: refreshToken },
-      timeout
-    );
-    const at = ref.access_token;
-    if (!at || typeof at !== 'string') throw new Error('refresh-access missing access_token');
-    newAccess = at;
-    process.env.ACCESS_TOKEN = newAccess;
+    try {
+      logTokenExchange(`POST ${prefix}/server-container-token/exchange-refresh/`);
+      const ex = await postJson(
+        `${prefix}/server-container-token/exchange-refresh/`,
+        { access_token: newAccess, business_api_endpoint: business },
+        timeout
+      );
+      const refreshToken = ex.refresh_token;
+      if (!refreshToken) throw new Error('exchange-refresh missing refresh_token');
+      logTokenExchange(`exchange-refresh OK refresh_token ${summarizeSecret(refreshToken)}`);
+
+      logTokenExchange(`POST ${prefix}/server-container-token/refresh-access/`);
+      const ref = await postJson(
+        `${prefix}/server-container-token/refresh-access/`,
+        { refresh_token: refreshToken },
+        timeout
+      );
+      const at = ref.access_token;
+      if (!at || typeof at !== 'string') throw new Error('refresh-access missing access_token');
+      newAccess = at;
+      process.env.ACCESS_TOKEN = newAccess;
+      logTokenExchange(`refresh-access OK new_access_token ${summarizeSecret(newAccess)} ACCESS_TOKEN env updated`);
+      logTokenExchange('done');
+    } catch (e) {
+      const detail = e && e.message ? String(e.message) : String(e);
+      const failLine = `token-exchange: FAIL ${detail}`;
+      logOutbound(failLine);
+      appendTokenRefreshLog(failLine);
+      console.error('[onlineServiceJS] token-exchange: FAIL', e);
+      throw e;
+    }
   } else {
-    logOutbound('bootstrap: skip exchange (TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE)');
+    const skipExLine = 'bootstrap: skip exchange (TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE)';
+    logOutbound(skipExLine);
+    appendTokenRefreshLog(skipExLine);
+    logTokenExchange('skipped (TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE), using initial ACCESS_TOKEN as-is');
   }
 
   return { skipped: false, prefix, newAccess, timeout };
