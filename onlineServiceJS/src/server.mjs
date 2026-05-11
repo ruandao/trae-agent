@@ -126,6 +126,51 @@ function buildGitCloneArgs(cloneUrl, { branch, depth }) {
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
+/** 与任务详情前端 ``gitCloneRefMatchKey`` 一致，用于将 ``remote.origin.url`` 与任务关联仓库 URL 对齐。 */
+function repoMatchKeyFromUrl(u) {
+  const raw = String(u || '').trim();
+  if (!raw) return '';
+  if (/^git@/i.test(raw)) {
+    const m = raw.match(/^git@([^:]+):(.+?)(?:\.git)?\/?$/i);
+    if (m) {
+      const host = String(m[1]).toLowerCase();
+      let p = String(m[2] || '')
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '')
+        .replace(/\.git$/i, '');
+      return `${host}/${p}`.toLowerCase();
+    }
+  }
+  try {
+    const x = new URL(raw);
+    let pth = (x.pathname || '/').replace(/\/+$/, '').replace(/\.git$/i, '');
+    if (pth.startsWith('/')) pth = pth.slice(1);
+    return `${x.host.toLowerCase()}/${pth}`.toLowerCase();
+  } catch {
+    return raw
+      .toLowerCase()
+      .replace(/\/+$/, '')
+      .replace(/\.git$/i, '');
+  }
+}
+
+function gitConfigGetSync(args, cwd) {
+  try {
+    const out = spawnSync(gitCmd(), args, {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      maxBuffer: 1024 * 1024,
+    });
+    if (out.status !== 0) return '';
+    return String(out.stdout || '')
+      .trim()
+      .split('\n')[0] || '';
+  } catch {
+    return '';
+  }
+}
+
 async function gitExec(args, cwd, env = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(gitCmd(), args, { cwd, env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0' } });
@@ -957,6 +1002,147 @@ api.get('/layers/:layer_id/git/log', async (req, res) => {
   } catch (e) {
     res.status(400).json({ detail: String(e.message || e) });
   }
+});
+
+/**
+ * 接口 A：给定可写层 ``layer_id``，枚举该层内各 Git 工作区（与多仓 ``rel_prefix`` 语义一致），
+ * 读取各仓 ``user.name`` / ``user.email`` 及 ``remote.origin.url``（若存在），供任务详情「关联项目」与 SaaS 仓库 URL 对齐展示。
+ */
+api.get('/layers/:layer_id/git/repo-identities', (req, res) => {
+  const layerId = String(req.params.layer_id || '').trim();
+  if (!layerId) return res.status(400).json({ detail: 'layer_id required' });
+  const root = layerPath(layerId);
+  if (!fs.existsSync(root)) {
+    return res.status(404).json({ detail: 'layer not found' });
+  }
+  const roots = layerGitWorkdirRootsForFileListing(layerId);
+  const repos = [];
+  for (const { workdir, relPrefix } of roots) {
+    const rel = relPrefix || '';
+    try {
+      const g = path.join(workdir, '.git');
+      if (!fs.existsSync(g)) {
+        repos.push({
+          rel_prefix: rel,
+          origin_url: '',
+          repo_match_key: '',
+          user_name: '',
+          user_email: '',
+          error: 'not a git worktree',
+        });
+        continue;
+      }
+      const originUrl = gitConfigGetSync(['config', '--get', 'remote.origin.url'], workdir);
+      const userName = gitConfigGetSync(['config', '--get', 'user.name'], workdir);
+      const userEmail = gitConfigGetSync(['config', '--get', 'user.email'], workdir);
+      repos.push({
+        rel_prefix: rel,
+        origin_url: originUrl,
+        repo_match_key: originUrl ? repoMatchKeyFromUrl(originUrl) : '',
+        user_name: userName,
+        user_email: userEmail,
+      });
+    } catch (e) {
+      repos.push({
+        rel_prefix: rel,
+        origin_url: '',
+        repo_match_key: '',
+        user_name: '',
+        user_email: '',
+        error: String(e.message || e),
+      });
+    }
+  }
+  res.json({ layer_id: layerId, repos });
+});
+
+/**
+ * 接口 A：将请求体中各 ``repo_match_key`` 对应的 ``user.name`` / ``user.email`` 写入该层内匹配的 Git 工作区
+ *（与 ``GET …/git/repo-identities`` 的枚举与 ``repoMatchKeyFromUrl(origin)`` 对齐）。
+ */
+api.post('/layers/:layer_id/git/repo-identities/sync', async (req, res) => {
+  const layerId = String(req.params.layer_id || '').trim();
+  if (!layerId) return res.status(400).json({ detail: 'layer_id required' });
+  const root = layerPath(layerId);
+  if (!fs.existsSync(root)) {
+    return res.status(404).json({ detail: 'layer not found' });
+  }
+  const rawList = req.body?.repos;
+  if (!Array.isArray(rawList)) {
+    return res.status(400).json({ detail: 'repos 须为非空数组' });
+  }
+  /** @type {Map<string, { user_name: string, user_email: string }>} */
+  const byKey = new Map();
+  for (const row of rawList) {
+    if (!row || typeof row !== 'object') continue;
+    const k = String(row.repo_match_key || '').trim().toLowerCase();
+    const userName = String(row.user_name || '').trim();
+    const userEmail = String(row.user_email || '').trim();
+    if (!k || !userName || !userEmail) continue;
+    byKey.set(k, { user_name: userName, user_email: userEmail });
+  }
+  if (byKey.size === 0) {
+    return res.status(400).json({
+      detail: 'repos 中至少须有一条有效记录（repo_match_key、user_name、user_email 均非空）',
+    });
+  }
+
+  const roots = layerGitWorkdirRootsForFileListing(layerId);
+  /** @type {{ repo_match_key: string, rel_prefix: string, ok: boolean, detail?: string }[]} */
+  const results = [];
+  const appliedKeys = new Set();
+
+  for (const { workdir, relPrefix } of roots) {
+    const rel = relPrefix || '';
+    const g = path.join(workdir, '.git');
+    if (!fs.existsSync(g)) {
+      continue;
+    }
+    let originUrl = '';
+    try {
+      originUrl = gitConfigGetSync(['config', '--get', 'remote.origin.url'], workdir);
+    } catch {
+      originUrl = '';
+    }
+    const key = originUrl ? repoMatchKeyFromUrl(originUrl).toLowerCase() : '';
+    if (!key || !byKey.has(key)) {
+      continue;
+    }
+    const spec = byKey.get(key);
+    try {
+      await gitExec(['config', '--local', 'user.name', spec.user_name], workdir);
+      await gitExec(['config', '--local', 'user.email', spec.user_email], workdir);
+      appliedKeys.add(key);
+      results.push({ repo_match_key: key, rel_prefix: rel, ok: true });
+    } catch (e) {
+      results.push({
+        repo_match_key: key,
+        rel_prefix: rel,
+        ok: false,
+        detail: String(e.message || e),
+      });
+    }
+  }
+
+  for (const k of byKey.keys()) {
+    if (!appliedKeys.has(k)) {
+      results.push({
+        repo_match_key: k,
+        rel_prefix: '',
+        ok: false,
+        detail: '当前层级未找到 remote.origin.url 与此 repo_match_key 一致的 Git 工作区',
+      });
+    }
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  const statusCode = failed.length ? 207 : 200;
+  res.status(statusCode).json({
+    ok: failed.length === 0,
+    layer_id: layerId,
+    applied_count: appliedKeys.size,
+    results,
+  });
 });
 
 api.post('/layers/:layer_id/git/add', async (req, res) => {
