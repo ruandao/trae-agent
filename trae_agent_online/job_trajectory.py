@@ -121,6 +121,37 @@ def _safe_job_id_segment(job_id: str) -> bool:
     return ".." not in s
 
 
+def _synthetic_steps_from_llm_interactions(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """首轮 LLM 已返回并写入 llm_interactions，但整步尚未 finalize 时 agent_steps 仍为空；用其填充可展示进度。"""
+    li = data.get("llm_interactions")
+    if not isinstance(li, list) or not li:
+        return []
+    out: list[dict[str, Any]] = []
+    for i, inter in enumerate(li):
+        if not isinstance(inter, dict):
+            continue
+        resp = inter.get("response")
+        lr: dict[str, Any] | None = None
+        if isinstance(resp, dict):
+            lr = {
+                "content": resp.get("content"),
+                "model": resp.get("model"),
+                "finish_reason": resp.get("finish_reason"),
+                "usage": resp.get("usage"),
+                "tool_calls": resp.get("tool_calls"),
+            }
+        out.append(
+            {
+                "step_number": i + 1,
+                "state": "llm_interaction",
+                "timestamp": inter.get("timestamp"),
+                "llm_response": lr,
+                "trajectory_provisional": True,
+            }
+        )
+    return out
+
+
 def _agent_steps_from_trajectory_file(traj_file: Path) -> dict[str, Any]:
     """将单个 ``trajectory_*.json`` 解析为 steps 结构。"""
     try:
@@ -181,6 +212,26 @@ def _load_state_artifacts_trajectory_for_job(layer_id: str, job_id: str) -> dict
         p = _agent_steps_from_trajectory_file(ex)
         if p.get("steps"):
             return p
+        try:
+            raw = json.loads(ex.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raw = {}
+        if isinstance(raw, dict):
+            synth = _synthetic_steps_from_llm_interactions(raw)
+            if synth:
+                max_cell = _max_cell_chars()
+                steps_out = deepcopy(synth)
+                for s in steps_out:
+                    if isinstance(s, dict):
+                        _ensure_step_llm_content(s)
+                        if max_cell is not None:
+                            _truncate_step(s, max_cell)
+                return {
+                    "trajectory_file": str(ex),
+                    "task": raw.get("task"),
+                    "steps": steps_out,
+                    "note": None,
+                }
         # start_recording writes trajectory immediately with empty agent_steps; do not fall through to
         # "no data" — running job or pre-first-step is expected.
         out = dict(p)
@@ -206,13 +257,22 @@ def _load_agent_steps_from_runtime_trajectory(job_id: str) -> dict[str, Any] | N
     steps_raw = data.get("agent_steps")
     if not isinstance(steps_raw, list):
         steps_raw = []
-    steps_out = deepcopy(steps_raw)
+    steps_out: list[Any] = deepcopy(steps_raw)
     max_cell = _max_cell_chars()
     for s in steps_out:
         if isinstance(s, dict):
             _ensure_step_llm_content(s)
             if max_cell is not None:
                 _truncate_step(s, max_cell)
+    if not steps_out:
+        synth = _synthetic_steps_from_llm_interactions(data)
+        if synth:
+            steps_out = deepcopy(synth)
+            for s in steps_out:
+                if isinstance(s, dict):
+                    _ensure_step_llm_content(s)
+                    if max_cell is not None:
+                        _truncate_step(s, max_cell)
     return {
         "trajectory_file": str(traj_file),
         "task": data.get("task"),
@@ -310,16 +370,22 @@ def load_agent_steps_for_layer(layer_path: str) -> dict[str, Any]:
 
 
 def load_agent_steps_for_job(layer_path: str, job_id: str) -> dict[str, Any]:
-    """按 job：state 精确轨迹 → state 下 tae json → runtime job 轨迹 → state 层下最新轨迹。"""
+    """按 job：state 精确轨迹（含 llm_interactions 合成的进行中步骤）→ tae json → runtime job 轨迹 → state 层下最新轨迹。"""
     layer_dir = _layer_dir_must_be_allowed(layer_path)
     layer_id = layer_dir.name
     from_state = _load_state_artifacts_trajectory_for_job(layer_id, job_id)
-    if from_state is not None:
+    if from_state is not None and from_state.get("steps"):
         return from_state
     from_json = _steps_from_tae_agent_json_state_only(job_id)
-    if from_json is not None:
+    if from_json is not None and from_json.get("steps"):
         return from_json
     runtime_traj = _load_agent_steps_from_runtime_trajectory(job_id)
+    if runtime_traj is not None and runtime_traj.get("steps"):
+        return runtime_traj
+    if from_state is not None:
+        return from_state
+    if from_json is not None:
+        return from_json
     if runtime_traj is not None:
         return runtime_traj
     latest_st = _latest_trajectory_file_in_state_artifacts(layer_id)

@@ -1,10 +1,11 @@
 /**
  * 从 ONLINE_PROJECT_STATE_ROOT 读取 Trae agent 步骤，供 GET /api/jobs/:id/steps。
- * 仅支持 runtime/layer_artifacts 与 runtime/job_logs/trae_agent_json，不读层工作区目录。
+ * 数据源：layer_artifacts/.trajectories、job_logs/trae_agent_json、job_logs/trajectories/{job_id}；
+ * agent_steps 仍空时可用 trajectory 内 llm_interactions 合成预览步。不读层工作区目录。
  */
 import fs from 'fs';
 import path from 'path';
-import { stateRoot, layerArtifactsRootPath, jobLogsTaeJsonPath } from './paths.mjs';
+import { stateRoot, runtimeDir, layerArtifactsRootPath, jobLogsTaeJsonPath } from './paths.mjs';
 
 function safeReadJson(p) {
   try {
@@ -34,6 +35,82 @@ function newestMtimeFile(dir, predicate) {
     }
   }
   return best;
+}
+
+function newestJsonFileInDir(dir) {
+  if (!fs.existsSync(dir)) return null;
+  let best = null;
+  let bestT = -1;
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue;
+    const fp = path.join(dir, name);
+    let st;
+    try {
+      st = fs.statSync(fp);
+    } catch {
+      continue;
+    }
+    if (!st.isFile()) continue;
+    if (st.mtimeMs >= bestT) {
+      bestT = st.mtimeMs;
+      best = fp;
+    }
+  }
+  return best;
+}
+
+/** runtime/job_logs/trajectories/{job_id} 下任意 *.json（与 Python 侧一致） */
+function loadStepsFromLatestRuntimeTrajectoryJson(jobId) {
+  const jid = String(jobId || '').trim();
+  if (!jid) return null;
+  const dir = path.join(runtimeDir(), 'job_logs', 'trajectories', jid);
+  const trajFile = newestJsonFileInDir(dir);
+  if (!trajFile) return null;
+  const raw = safeReadJson(trajFile);
+  if (!raw || typeof raw !== 'object') return null;
+  let steps = Array.isArray(raw.agent_steps) ? raw.agent_steps.map(normalizeAgentStep) : [];
+  if (!steps.length) {
+    const synth = stepsFromLlmInteractions(raw);
+    steps = synth.map(normalizeAgentStep);
+  }
+  if (!steps.length) return null;
+  const sr = stateRoot();
+  return {
+    steps,
+    note: null,
+    trajectory_file: path.relative(sr, trajFile).split(path.sep).join('/'),
+    task: raw.task != null ? String(raw.task) : null,
+  };
+}
+
+/** agent_step 尚未落盘时，用 trajectory 内 llm_interactions 展示首轮推理进度 */
+function stepsFromLlmInteractions(raw) {
+  const li = raw.llm_interactions;
+  if (!Array.isArray(li) || !li.length) return [];
+  const out = [];
+  for (let i = 0; i < li.length; i += 1) {
+    const inter = li[i];
+    if (!inter || typeof inter !== 'object') continue;
+    const resp = inter.response;
+    let lr = null;
+    if (resp && typeof resp === 'object') {
+      lr = {
+        content: resp.content,
+        model: resp.model,
+        finish_reason: resp.finish_reason,
+        usage: resp.usage,
+        tool_calls: resp.tool_calls,
+      };
+    }
+    out.push({
+      step_number: i + 1,
+      state: 'llm_interaction',
+      timestamp: inter.timestamp,
+      llm_response: lr,
+      trajectory_provisional: true,
+    });
+  }
+  return out;
 }
 
 function lakeviewSummaryFromFile(stepDir) {
@@ -170,6 +247,28 @@ export function getJobStepsForLayer(layerId, jobId, commandKind) {
         if (steps.length) {
           return {
             steps,
+            note: null,
+            trajectory_file: relTf,
+            task: taskVal,
+          };
+        }
+        const fromTaeEarly = loadStepsFromTaeJsonOutputDir(jobLogsTaeJsonPath(jid));
+        if (fromTaeEarly && fromTaeEarly.steps.length) {
+          return {
+            steps: fromTaeEarly.steps,
+            note: fromTaeEarly.note,
+            trajectory_file: fromTaeEarly.trajectory_file,
+            task: fromTaeEarly.task ?? taskVal,
+          };
+        }
+        const fromRuntimeEarly = loadStepsFromLatestRuntimeTrajectoryJson(jid);
+        if (fromRuntimeEarly && fromRuntimeEarly.steps.length) {
+          return fromRuntimeEarly;
+        }
+        const synth = stepsFromLlmInteractions(raw);
+        if (synth.length) {
+          return {
+            steps: synth.map(normalizeAgentStep),
             note: null,
             trajectory_file: relTf,
             task: taskVal,

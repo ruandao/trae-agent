@@ -110,6 +110,102 @@ def test_latest_trajectory_empty_steps_returns_note(monkeypatch, tmp_path: Path)
     assert out.get("note") and "empty" in out["note"].lower()
 
 
+def test_empty_exact_but_llm_interactions_yield_steps(monkeypatch, tmp_path: Path) -> None:
+    """首轮 LLM 已写入 llm_interactions、整步未 finalize 时应有可展示步骤。"""
+    layers, state_root = _state_and_layer(monkeypatch, tmp_path)
+
+    layer = layers / "20260511_llm_only_layer"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    traj_dir = state_root / "runtime" / "layer_artifacts" / layer.name / ".trajectories"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    traj_file = traj_dir / f"trajectory_{job_id}.json"
+    traj_file.write_text(
+        json.dumps(
+            {
+                "task": "ping",
+                "agent_steps": [],
+                "llm_interactions": [
+                    {
+                        "timestamp": "2026-05-11T00:00:00",
+                        "response": {"content": "thinking…", "model": "deepseek-reasoner"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    assert len(out["steps"]) == 1
+    assert out["steps"][0].get("trajectory_provisional") is True
+    assert out["steps"][0].get("state") == "llm_interaction"
+    assert out.get("note") is None
+
+
+def test_runtime_trajectory_llm_interactions_only(monkeypatch, tmp_path: Path) -> None:
+    """仅 runtime/job_logs/trajectories/{job_id} 下有文件且仅有 llm_interactions 时也应出步。"""
+    layers, state_root = _state_and_layer(monkeypatch, tmp_path)
+
+    layer = layers / "20260511_runtime_only"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    rt_dir = state_root / "runtime" / "job_logs" / "trajectories" / job_id
+    rt_dir.mkdir(parents=True, exist_ok=True)
+    (rt_dir / "chunk.json").write_text(
+        json.dumps(
+            {
+                "task": "rt",
+                "agent_steps": [],
+                "llm_interactions": [
+                    {"timestamp": "t1", "response": {"content": "hi", "model": "m"}},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    assert len(out["steps"]) == 1
+    assert out["steps"][0].get("trajectory_provisional") is True
+    assert "trajectories" in (out.get("trajectory_file") or "")
+
+
+def test_empty_exact_prefers_tae_json_when_state_agent_steps_empty(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """层上 trajectory 仍为空 agent_steps 时，不应短路，应读到 tae_agent_json 下已落盘的步。"""
+    layers, state_root = _state_and_layer(monkeypatch, tmp_path)
+
+    layer = layers / "20260511_dual_source"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    traj_dir = state_root / "runtime" / "layer_artifacts" / layer.name / ".trajectories"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    (traj_dir / f"trajectory_{job_id}.json").write_text(
+        json.dumps({"task": "x", "agent_steps": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    step_dir = state_root / "runtime" / "job_logs" / "trae_agent_json" / job_id / "step_000001"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    (step_dir / "agent_step_full.json").write_text(
+        json.dumps({"type": "agent_step_full", "step_number": 1, "state": "completed"}),
+        encoding="utf-8",
+    )
+
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    assert len(out["steps"]) == 1
+    assert "runtime/job_logs/trae_agent_json" in (out.get("trajectory_file") or "")
+
+
 def test_empty_exact_trajectory_returns_note_not_missing_data(monkeypatch, tmp_path: Path) -> None:
     """start_recording 会先写入 agent_steps 为空的 trajectory；不应误判为缺少 runtime 数据。"""
     layers, state_root = _state_and_layer(monkeypatch, tmp_path)
