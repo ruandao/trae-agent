@@ -349,7 +349,7 @@ api.get('/jobs/:job_id', (req, res) => {
 api.get('/jobs/:job_id/steps', (req, res) => {
   const j = getJob(req.params.job_id);
   if (!j) return res.status(404).json({ detail: 'not found' });
-  const payload = getJobStepsForLayer(j.layer_id, j.id);
+  const payload = getJobStepsForLayer(j.layer_id, j.id, j.command_kind);
   res.json(payload);
 });
 

@@ -181,6 +181,14 @@ def _load_state_artifacts_trajectory_for_job(layer_id: str, job_id: str) -> dict
         p = _agent_steps_from_trajectory_file(ex)
         if p.get("steps"):
             return p
+        # start_recording writes trajectory immediately with empty agent_steps; do not fall through to
+        # "no data" — running job or pre-first-step is expected.
+        out = dict(p)
+        out["note"] = (
+            "trajectory file exists but agent_steps is still empty "
+            "(job starting or before first recorded step; refresh while running)"
+        )
+        return out
     return None
 
 
@@ -319,6 +327,12 @@ def load_agent_steps_for_job(layer_path: str, job_id: str) -> dict[str, Any]:
         p = _agent_steps_from_trajectory_file(latest_st)
         if p.get("steps"):
             return p
+        out = dict(p)
+        out["note"] = out.get("note") or (
+            "latest trajectory in layer_artifacts has empty agent_steps "
+            "(may be another job's file or pre-first-step; refresh while running)"
+        )
+        return out
     return {
         "trajectory_file": None,
         "task": None,

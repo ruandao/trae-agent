@@ -119,12 +119,34 @@ function loadStepsFromTaeJsonOutputDir(outputRoot) {
   };
 }
 
+function finalStepsNote(commandKind, jid) {
+  const kind = String(commandKind || '').toLowerCase();
+  if (kind === 'shell') return '此为 shell 任务，不产生 agent 步骤轨迹。';
+  if (kind === 'clone') return '此为克隆类任务，无 agent 步骤。';
+  let taeDirReady = false;
+  if (jid) {
+    try {
+      taeDirReady = fs.existsSync(jobLogsTaeJsonPath(jid));
+    } catch {
+      taeDirReady = false;
+    }
+  }
+  if (kind === 'trae' && taeDirReady) {
+    return 'Trae 任务输出目录已就绪，尚未有可展示的步骤（常见于运行极早期或首步未完成）；请稍后刷新。若任务已结束仍为空，请检查 agent 是否写入 runtime。';
+  }
+  if (kind === 'trae') {
+    return '尚无 Trae agent 步骤：轨迹可能尚未落盘（任务未开始或进程未写入 state）；请稍后刷新。';
+  }
+  return '未找到步骤：请确认 onlineProject_state 下存在 runtime/layer_artifacts 或 runtime/job_logs/trae_agent_json 数据';
+}
+
 /**
  * @param {string} layerId
  * @param {string} [jobId]
+ * @param {string} [commandKind] 来自任务记录，用于空步骤时的兜底说明（如 shell / trae）
  * @returns {{ steps: object[], note: string | null, trajectory_file: string | null, task: string | null }}
  */
-export function getJobStepsForLayer(layerId, jobId) {
+export function getJobStepsForLayer(layerId, jobId, commandKind) {
   const lid = String(layerId || '').trim();
   if (!lid) {
     return {
@@ -143,14 +165,24 @@ export function getJobStepsForLayer(layerId, jobId) {
       const raw = safeReadJson(exactTraj);
       if (raw && typeof raw === 'object') {
         const steps = Array.isArray(raw.agent_steps) ? raw.agent_steps.map(normalizeAgentStep) : [];
+        const relTf = path.relative(sr, exactTraj).split(path.sep).join('/');
+        const taskVal = raw.task != null ? String(raw.task) : null;
         if (steps.length) {
           return {
             steps,
             note: null,
-            trajectory_file: path.relative(sr, exactTraj).split(path.sep).join('/'),
-            task: raw.task != null ? String(raw.task) : null,
+            trajectory_file: relTf,
+            task: taskVal,
           };
         }
+        // start_recording 会立刻落盘 trajectory，agent_steps 在首轮记录前为空；勿与「缺少 runtime 数据」混淆
+        return {
+          steps: [],
+          note:
+            '轨迹文件已写入，尚无 agent_steps（任务可能仍在初始化或第一轮 LLM 进行中；每步完成后会增量写入，请稍后刷新）。',
+          trajectory_file: relTf,
+          task: taskVal,
+        };
       }
     }
     const fromTae = loadStepsFromTaeJsonOutputDir(jobLogsTaeJsonPath(jid));
@@ -175,11 +207,19 @@ export function getJobStepsForLayer(layerId, jobId) {
         task: fromState.task,
       };
     }
+    if (fromState && (fromState.trajectory_file || fromState.note)) {
+      return {
+        steps: [],
+        note: fromState.note || '轨迹文件中 agent_steps 为空',
+        trajectory_file: fromState.trajectory_file,
+        task: fromState.task,
+      };
+    }
   }
 
   return {
     steps: [],
-    note: '未找到步骤：请确认 onlineProject_state 下存在 runtime/layer_artifacts 或 runtime/job_logs/trae_agent_json 数据',
+    note: finalStepsNote(commandKind, jid),
     trajectory_file: null,
     task: null,
   };

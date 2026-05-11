@@ -88,6 +88,51 @@ def test_backfills_llm_response_content_from_delivery_summary(monkeypatch, tmp_p
     assert got == "ReadFile README.md"
 
 
+def test_latest_trajectory_empty_steps_returns_note(monkeypatch, tmp_path: Path) -> None:
+    """无精确 job 轨迹时，若层下最新 trajectory 存在但 agent_steps 为空，应返回说明而非泛化缺数据。"""
+    layers, state_root = _state_and_layer(monkeypatch, tmp_path)
+
+    layer = layers / "layer_for_latest_traj"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    traj_dir = state_root / "runtime" / "layer_artifacts" / layer.name / ".trajectories"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    (traj_dir / "trajectory_otherjob.json").write_text(
+        json.dumps({"task": "other", "agent_steps": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    assert out["steps"] == []
+    assert out.get("trajectory_file")
+    assert out.get("note") and "empty" in out["note"].lower()
+
+
+def test_empty_exact_trajectory_returns_note_not_missing_data(monkeypatch, tmp_path: Path) -> None:
+    """start_recording 会先写入 agent_steps 为空的 trajectory；不应误判为缺少 runtime 数据。"""
+    layers, state_root = _state_and_layer(monkeypatch, tmp_path)
+
+    layer = layers / "20260511_062319_0e335a"
+    layer.mkdir(parents=True, exist_ok=True)
+    job_id = "69162e33-b395-46df-a8da-eceb6842e5a8"
+    traj_dir = state_root / "runtime" / "layer_artifacts" / layer.name / ".trajectories"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    traj_file = traj_dir / f"trajectory_{job_id}.json"
+    traj_file.write_text(
+        json.dumps({"task": "hello", "agent_steps": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    from trae_agent_online.job_trajectory import load_agent_steps_for_job
+
+    out = load_agent_steps_for_job(str(layer.resolve()), job_id)
+    assert out["steps"] == []
+    assert out.get("trajectory_file")
+    assert out.get("note") and "empty" in out["note"].lower()
+
+
 def test_load_agent_steps_from_runtime_job_logs(monkeypatch, tmp_path: Path) -> None:
     """与上例一致，保留对 runtime job_logs 的回归命名。"""
     layers, state_root = _state_and_layer(monkeypatch, tmp_path)
