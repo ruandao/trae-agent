@@ -78,6 +78,7 @@ import { getJobStepsForLayer } from './jobSteps.mjs';
 import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParentDiff.mjs';
 import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
 import { suggestStagedCommitMessage } from './stagedCommitSuggest.mjs';
+import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -1260,6 +1261,34 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
         /* ignore */
       }
     }
+  }
+});
+
+/**
+ * 接口 A：OAuth access_token 入参，对层内所有 GitHub 远程工作区 HTTPS 推送当前 HEAD，
+ * 并在给定 base 上创建 PR（可选）。供 SaaS 在 refresh_token 换票后转发，与 TaskDetail 推送流程对齐。
+ */
+api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
+  const token =
+    String(req.body?.github_auth || req.body?.github_access_token || req.body?.access_token || '').trim();
+  const targetBranch = String(req.body?.target_branch || '').trim();
+  const prBase = String(req.body?.pr_base_branch || '').trim();
+  const prTitle = String(req.body?.pr_title || '').trim();
+  const prBody = String(req.body?.pr_body || '').trim();
+  const layerId = String(req.params.layer_id || '').trim();
+  try {
+    const { httpStatus, payload } = await runLayerGithubOauthAccessPush({
+      layerId,
+      targetBranch,
+      accessToken: token,
+      prBaseBranch: prBase,
+      prTitle,
+      prBody,
+    });
+    res.status(httpStatus).json(payload);
+  } catch (e) {
+    console.warn('[LayerGitOauthPush] fail layer_id=%s err=%s', layerId, String(e.message || e));
+    res.status(400).json({ detail: String(e.message || e) });
   }
 });
 
