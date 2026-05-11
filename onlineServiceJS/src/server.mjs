@@ -31,6 +31,7 @@ import {
   parseGitCloneProgressPhases,
   normalizeGitProgressChunkForLog,
   runGitCloneWithProgress,
+  startSaasContainerHeartbeatLoop,
 } from './saasTaskCloud.mjs';
 import {
   getExecStreamManifest,
@@ -1473,6 +1474,10 @@ async function main() {
           } catch (e) {
             console.error('[onlineServiceJS] reachability 失败（不会回退 127.0.0.1）:', e);
             process.exit(1);
+          }
+          if (!bootstrapCtx.skipped && bootstrapCtx.prefix) {
+            startSaasContainerHeartbeatLoop();
+            console.log('[onlineServiceJS] 已启动 SaaS 容器心跳定时上报（server-container-token/heartbeat/）');
           }
           try {
             if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {

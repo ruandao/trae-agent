@@ -1,7 +1,8 @@
 /**
  * 任务云 TaskApi 前缀、JSON POST，克隆进度上报（git-clone-progress → SaaS SSE），
- * 以及层级快照上报（layer-graph-push → SSE container_layer_graph，供任务详情 zTree）。
- * 供 bootstrap、POST /api/repos/reclone、jobsRuntime 等共用。
+ * 层级快照上报（layer-graph-push → SSE container_layer_graph，供任务详情 zTree），
+ * 以及容器存活心跳（heartbeat/ → SSE container_heartbeat，供任务详情「容器连接」状态）。
+ * 供 bootstrap、POST /api/repos/reclone、jobsRuntime、server 启动后定时循环等共用。
  */
 import { spawn } from 'child_process';
 
@@ -198,6 +199,53 @@ export async function postCloneProgress(cloudPrefix, accessToken, progress, mess
  * 环境与 `taskApiPrefix()`、`ACCESS_TOKEN` 不全或请求失败时静默忽略。
  * @param {null|{ layers?: unknown[], jobs?: unknown[], layers_root?: string, bootstrap_layer_id?: string|null }} snapshot
  */
+/**
+ * POST `server-container-token/heartbeat/`：Django 向任务详情 SSE 转发 `container_heartbeat`（前端「容器连接」状态）。
+ * 与 layer-graph-push 独立；此前未调用时 zTree 有数据但心跳始终收不到。
+ * @param {string} [message]
+ * @returns {Promise<boolean>} 是否上报成功（失败静默，供定时循环使用）
+ */
+export async function postContainerHeartbeatToSaas(message) {
+  let cloudPrefix;
+  try {
+    cloudPrefix = taskApiPrefix();
+  } catch {
+    return false;
+  }
+  const accessToken = String(process.env.ACCESS_TOKEN || '').trim();
+  if (!cloudPrefix || !accessToken) return false;
+  const url = `${cloudPrefix.replace(/\/$/, '')}/server-container-token/heartbeat/`;
+  const body = { access_token: accessToken };
+  const msg = typeof message === 'string' ? message.trim() : '';
+  if (msg) body.message = msg.slice(0, 500);
+  try {
+    await postJson(url, body, 10);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const DEFAULT_SAAS_HEARTBEAT_INTERVAL_SEC = 20;
+
+/**
+ * 启动定时向 SaaS 上报容器存活（与 `TRAE_SKIP_REACHABILITY_REGISTER` 独立；可单独用 `TRAE_SKIP_SAAS_HEARTBEAT` 关闭）。
+ * @returns {() => void} 停止定时器
+ */
+export function startSaasContainerHeartbeatLoop() {
+  if (['1', 'true', 'yes', 'on'].includes(String(process.env.TRAE_SKIP_SAAS_HEARTBEAT || '').toLowerCase())) {
+    return () => {};
+  }
+  const raw = String(process.env.TRAE_SAAS_HEARTBEAT_INTERVAL_SEC || '').trim();
+  const sec = Math.max(5, Number.isFinite(parseFloat(raw)) ? parseFloat(raw) : DEFAULT_SAAS_HEARTBEAT_INTERVAL_SEC);
+  const tick = () => {
+    void postContainerHeartbeatToSaas('onlineServiceJS');
+  };
+  tick();
+  const id = setInterval(tick, Math.round(sec * 1000));
+  return () => clearInterval(id);
+}
+
 export async function publishLayerGraphSnapshotToSaas(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return;
   let cloudPrefix;
