@@ -2,7 +2,8 @@
 # 容器内 apt：amd64 用 Ubuntu_24.04_Noble.list；arm64 用 Ubuntu_24.04_Noble-ports.list（内网 → 阿里云 → 官方兜底）。
 # 含 git + openssh-client：onlineServiceJS bootstrap 会 clone 任务关联仓库（常见 git@github.com SSH）。
 # PyPI 仍走清华；Node  tarball 清华优先、失败回退 nodejs.org；code-server 同 skill 说明。
-# npm 包无清华官方 Registry，构建阶段使用默认 registry.npmjs.org。
+# npm：默认 registry.npmjs.org；可通过构建参数 NPM_REGISTRY 指向镜像（如 npmmirror）缓解跨境 ECONNRESET。
+# 构建阶段已调高 fetch-retries / 超时，降低 arm64 等环境下偶发断连失败率。
 # 多阶段：编译型 Python 依赖仅在 pydeps 阶段安装，最终镜像不含 build-essential / python3.12-dev。
 # ENABLE_CODE_SERVER=1 安装 code-server；运行时 CODE_SERVER_ENABLED=1 启动。
 
@@ -52,6 +53,8 @@ ARG ENABLE_CODE_SERVER=1
 ARG TARGETARCH
 ARG CODE_SERVER_VERSION=4.96.4
 ARG NODE_VERSION=22.14.0
+# 留空则不改 registry；可传 https://registry.npmmirror.com 等
+ARG NPM_REGISTRY=
 
 ENV CODE_SERVER_ENABLED=1 \
     CODE_SERVER_WORKDIR=/app
@@ -122,7 +125,12 @@ COPY --from=pydeps /app/.venv /app/.venv
 
 COPY onlineServiceJS/package.json onlineServiceJS/package-lock.json /app/onlineServiceJS/
 WORKDIR /app/onlineServiceJS
-RUN npm ci --omit=dev
+RUN set -eux; \
+    npm config set fetch-retries 10; \
+    npm config set fetch-retry-mintimeout 20000; \
+    npm config set fetch-retry-maxtimeout 180000; \
+    if [ -n "${NPM_REGISTRY}" ]; then npm config set registry "${NPM_REGISTRY}"; fi; \
+    npm ci --omit=dev
 COPY onlineServiceJS /app/onlineServiceJS/
 
 WORKDIR /app/onlineServiceJS

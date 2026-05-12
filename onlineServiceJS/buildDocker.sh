@@ -31,6 +31,7 @@
 #   DOCKER_BUILDX_BUILDER  可选，传给 docker buildx build --builder。
 #   DOCKER_PUSH         设为 1 / true 时推送（可与 --push 二选一）。
 #   ENABLE_CODE_SERVER / NODE_VERSION / CODE_SERVER_VERSION  传给 Dockerfile。
+#   NPM_REGISTRY  可选，传给 Dockerfile（例：https://registry.npmmirror.com），减轻 npm ci 时 ECONNRESET。
 #
 # 推送前请在目标仓库执行 docker login（本脚本不代为交互登录）。
 set -euo pipefail
@@ -43,7 +44,7 @@ for arg in "$@"; do
   case "$arg" in
     --push) DO_PUSH=1 ;;
     -h|--help)
-      sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
   esac
@@ -237,6 +238,9 @@ if [[ -n "${NODE_VERSION:-}" ]]; then
 fi
 if [[ -n "${CODE_SERVER_VERSION:-}" ]]; then
   BUILD_ARGS+=( --build-arg "CODE_SERVER_VERSION=${CODE_SERVER_VERSION}" )
+fi
+if [[ -n "${NPM_REGISTRY:-}" ]]; then
+  BUILD_ARGS+=( --build-arg "NPM_REGISTRY=${NPM_REGISTRY}" )
 fi
 
 BX=( docker buildx build )
