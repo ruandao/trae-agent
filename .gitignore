@@ -199,3 +199,6 @@ onlineServiceJS/.last-docker-image-context.sha256
 # 本地调试用，勿提交
 cookies.txt
 onlineServiceJS/auth.json
+
+# Docker 构建：code-server 预下载 tarball（由 docker/fetch-code-server-bundles.sh 生成）
+onlineServiceJS/docker/code-server/*.tar.gz

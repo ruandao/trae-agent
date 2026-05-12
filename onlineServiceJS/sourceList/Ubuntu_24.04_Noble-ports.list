@@ -11,8 +11,9 @@ deb http://mirrors.aliyun.com/ubuntu-ports/ noble-updates main restricted univer
 deb http://mirrors.aliyun.com/ubuntu-ports/ noble-security main restricted universe multiverse
 deb http://mirrors.aliyun.com/ubuntu-ports/ noble-backports main restricted universe multiverse
 
-# 第三优先级：Ubuntu 官方 ports 兜底
-deb http://ports.ubuntu.com/ubuntu-ports/ noble main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports/ noble-updates main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports/ noble-security main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports/ noble-backports main restricted universe multiverse
+# 第三优先级：官方 ports 兜底（默认注释）。与阿里云并列时若官方经代理 500/503，apt-get update 会整失败；
+# 一般仅用内网+阿里云即可；需要官方兜底时取消下行注释。
+# deb http://ports.ubuntu.com/ubuntu-ports/ noble main restricted universe multiverse
+# deb http://ports.ubuntu.com/ubuntu-ports/ noble-updates main restricted universe multiverse
+# deb http://ports.ubuntu.com/ubuntu-ports/ noble-security main restricted universe multiverse
+# deb http://ports.ubuntu.com/ubuntu-ports/ noble-backports main restricted universe multiverse

@@ -10,8 +10,9 @@ deb http://mirrors.aliyun.com/ubuntu/ noble-updates main restricted universe mul
 deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse
 deb http://mirrors.aliyun.com/ubuntu/ noble-backports main restricted universe multiverse
 
-# 第三优先级：Ubuntu 官方源兜底
-deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse
+# 第三优先级：官方源兜底（默认注释）。与阿里云并列时若官方不可用，apt-get update 会整失败；
+# 需要时取消下行注释。
+# deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
+# deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
+# deb http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
+# deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse

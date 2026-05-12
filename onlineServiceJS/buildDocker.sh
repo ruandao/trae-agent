@@ -31,9 +31,15 @@
 #   DOCKER_BUILDX_BUILDER  可选，传给 docker buildx build --builder。
 #   DOCKER_PUSH         设为 1 / true 时推送（可与 --push 二选一）。
 #   ENABLE_CODE_SERVER / NODE_VERSION / CODE_SERVER_VERSION  传给 Dockerfile。
+#   启用 code-server 时，构建前会自动下载 tarball 至 onlineServiceJS/docker/code-server/（亦见 docker/fetch-code-server-bundles.sh）。
 #   NPM_REGISTRY  可选，传给 Dockerfile（例：https://registry.npmmirror.com），减轻 npm ci 时 ECONNRESET。
-#   SKIP_INTERNAL_APT_MIRROR  默认 0；设为 1/true 时构建阶段从 apt sources 去掉 192.168.3.25 内网源
-#                             （不在该局域网构建 Docker 时务必开启，否则 apt-get update 会长时间重试后失败）。
+#   SKIP_INTERNAL_APT_MIRROR  默认 1：从 apt sources 去掉 192.168.3.25 内网源（笔记本/CI）。
+#                             在内网构建且需要该源时设为 0/false。
+#
+#   推送与代理：docker buildx --push 由守护进程向仓库上传大块层。若用 proxychains4 包裹整条脚本，或 Docker Desktop
+#   代理指向易断连的 HTTP 代理（日志里常见 host:3128），易出现 Put blob EOF、broken pipe、TLS handshake timeout。
+#   对国内 registry（如 *.aliyuncs.com）建议直连推送：不要 proxychains 包裹本脚本；或在 Docker Desktop「Proxies」里把
+#   目标 registry 主机名加入 bypass / NO_PROXY。需代理访问外网时，可只对 curl/npm 等单独配置，避免代理截断 registry 长上传。
 #
 # 推送前请在目标仓库执行 docker login（本脚本不代为交互登录）。
 set -euo pipefail
@@ -46,7 +52,7 @@ for arg in "$@"; do
   case "$arg" in
     --push) DO_PUSH=1 ;;
     -h|--help)
-      sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
   esac
@@ -195,6 +201,37 @@ platform_to_arch_slug() {
   esac
 }
 
+# 在宿主机拉取 code-server tarball 到 onlineServiceJS/docker/code-server/，供 Dockerfile COPY。
+ensure_code_server_bundles() {
+  local platforms_csv="$1"
+  local ena="${ENABLE_CODE_SERVER:-1}"
+  if [[ "$ena" != "1" && "$ena" != "true" && "$ena" != "TRUE" ]]; then
+    return 0
+  fi
+  local fetch_sh="${SCRIPT_DIR}/docker/fetch-code-server-bundles.sh"
+  if [[ ! -f "$fetch_sh" ]]; then
+    echo "[buildDocker.sh] 错误: 未找到 ${fetch_sh}" >&2
+    exit 1
+  fi
+  [[ -x "$fetch_sh" ]] || chmod +x "$fetch_sh"
+  local args=()
+  local _oifs=$IFS
+  IFS=','
+  for _entry in $platforms_csv; do
+    IFS=$_oifs
+    _p="$(trim_spaces "$_entry")"
+    [[ -z "$_p" ]] && continue
+    args+=("$_p")
+  done
+  IFS=$_oifs
+  echo "[buildDocker.sh] 确保 code-server 本地 tarball（docker/code-server/）…" >&2
+  if [[ "${#args[@]}" -eq 0 ]]; then
+    "$fetch_sh"
+  else
+    "$fetch_sh" "${args[@]}"
+  fi
+}
+
 native_arch_slug() {
   platform_to_arch_slug "$(native_platform)"
 }
@@ -235,7 +272,7 @@ fi
 docker buildx inspect --bootstrap >/dev/null 2>&1 || true
 
 BUILD_ARGS=( -f "$SCRIPT_DIR/Dockerfile" --build-arg "ENABLE_CODE_SERVER=${ENABLE_CODE_SERVER:-1}" )
-SKIP_INT="${SKIP_INTERNAL_APT_MIRROR:-0}"
+SKIP_INT="${SKIP_INTERNAL_APT_MIRROR:-1}"
 if [[ "$SKIP_INT" == "1" || "$SKIP_INT" == "true" || "$SKIP_INT" == "TRUE" ]]; then
   SKIP_INT=1
 else
@@ -262,6 +299,7 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
 
   if [[ -n "${DOCKER_PUSH_IMAGE:-}" ]]; then
     PUSH_REF="$(resolve_push_ref)"
+    ensure_code_server_bundles "$PLATFORMS"
     echo "[buildDocker.sh] 构建上下文: $REPO_ROOT" >&2
     echo "[buildDocker.sh] Dockerfile: $SCRIPT_DIR/Dockerfile" >&2
     echo "[buildDocker.sh] 推送引用（仅此标签）: $PUSH_REF" >&2
@@ -279,6 +317,7 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
     base="${DOCKER_REGISTRY_REPOSITORY%/}"
     echo "[buildDocker.sh] 构建上下文: $REPO_ROOT" >&2
     echo "[buildDocker.sh] Dockerfile: $SCRIPT_DIR/Dockerfile" >&2
+    ensure_code_server_bundles "$PLATFORMS"
     if [[ "$USE_GIT_TAG_AS_DOCKER_TAG" == "1" ]]; then
       echo "[buildDocker.sh] 标签方案: arch_timestamp（按架构使用 git tag 作为 docker tag）" >&2
     else
@@ -315,6 +354,7 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
   fi
 
   PUSH_REF="$(resolve_push_ref)"
+  ensure_code_server_bundles "$PLATFORMS"
   echo "[buildDocker.sh] 构建上下文: $REPO_ROOT" >&2
   echo "[buildDocker.sh] Dockerfile: $SCRIPT_DIR/Dockerfile" >&2
   echo "[buildDocker.sh] 推送引用（literal / 单清单）: $PUSH_REF" >&2
@@ -360,6 +400,8 @@ else
   echo "[buildDocker.sh] 标签: ${TAGS[1]}" >&2
 fi
 echo "[buildDocker.sh] 平台: $USE_PLATFORMS" >&2
+
+ensure_code_server_bundles "$USE_PLATFORMS"
 
 "${BX[@]}" "${TAGS[@]}" "${BUILD_ARGS[@]}" --platform "$USE_PLATFORMS" "${OUTPUT[@]}" "$REPO_ROOT"
 
