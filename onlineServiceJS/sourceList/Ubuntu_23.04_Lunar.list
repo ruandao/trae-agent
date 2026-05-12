@@ -1,0 +1,17 @@
+# 第一优先级：本地内网源 192.168.3.25:5080
+deb http://192.168.3.25:5080/ubuntu/ lunar main restricted universe multiverse
+deb http://192.168.3.25:5080/ubuntu/ lunar-updates main restricted universe multiverse
+deb http://192.168.3.25:5080/ubuntu/ lunar-security main restricted universe multiverse
+deb http://192.168.3.25:5080/ubuntu/ lunar-backports main restricted universe multiverse
+
+# 第二优先级：阿里云官方镜像
+deb http://mirrors.aliyun.com/ubuntu/ lunar main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ lunar-updates main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ lunar-security main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ lunar-backports main restricted universe multiverse
+
+# 第三优先级：Ubuntu 官方源兜底
+deb http://archive.ubuntu.com/ubuntu/ lunar main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ lunar-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ lunar-security main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ lunar-backports main restricted universe multiverse

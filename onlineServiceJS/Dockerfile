@@ -1,5 +1,5 @@
 # 单容器：Node onlineServiceJS（8765）+ 可选 code-server（8888）。
-# 容器内 apt 使用 Ubuntu 官方源（避免部分网络下清华 apt 证书/镜像异常导致构建失败）。
+# 容器内 apt：amd64 用 Ubuntu_24.04_Noble.list；arm64 用 Ubuntu_24.04_Noble-ports.list（内网 → 阿里云 → 官方兜底）。
 # 含 git + openssh-client：onlineServiceJS bootstrap 会 clone 任务关联仓库（常见 git@github.com SSH）。
 # PyPI 仍走清华；Node  tarball 清华优先、失败回退 nodejs.org；code-server 同 skill 说明。
 # npm 包无清华官方 Registry，构建阶段使用默认 registry.npmjs.org。
@@ -9,6 +9,18 @@
 FROM ubuntu:24.04 AS pydeps
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+
+COPY onlineServiceJS/sourceList/Ubuntu_24.04_Noble.list /tmp/apt-sources-amd64.list
+COPY onlineServiceJS/sourceList/Ubuntu_24.04_Noble-ports.list /tmp/apt-sources-arm64.list
+RUN rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64) cp /tmp/apt-sources-amd64.list /etc/apt/sources.list ;; \
+        arm64) cp /tmp/apt-sources-arm64.list /etc/apt/sources.list ;; \
+        *) echo "unsupported TARGETARCH=$arch for apt sources"; exit 1 ;; \
+    esac; \
+    rm -f /tmp/apt-sources-amd64.list /tmp/apt-sources-arm64.list
 
 RUN set -eux; \
     apt-get update; \
@@ -43,6 +55,17 @@ ARG NODE_VERSION=22.14.0
 
 ENV CODE_SERVER_ENABLED=1 \
     CODE_SERVER_WORKDIR=/app
+
+COPY onlineServiceJS/sourceList/Ubuntu_24.04_Noble.list /tmp/apt-sources-amd64.list
+COPY onlineServiceJS/sourceList/Ubuntu_24.04_Noble-ports.list /tmp/apt-sources-arm64.list
+RUN rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64) cp /tmp/apt-sources-amd64.list /etc/apt/sources.list ;; \
+        arm64) cp /tmp/apt-sources-arm64.list /etc/apt/sources.list ;; \
+        *) echo "unsupported TARGETARCH=$arch for apt sources"; exit 1 ;; \
+    esac; \
+    rm -f /tmp/apt-sources-amd64.list /tmp/apt-sources-arm64.list
 
 RUN set -eux; \
     apt-get update; \

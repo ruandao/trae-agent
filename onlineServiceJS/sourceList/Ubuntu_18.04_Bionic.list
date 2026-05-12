@@ -1,0 +1,17 @@
+# 第一优先级：本地内网源 192.168.3.25:5080
+deb http://192.168.3.25:5080/ubuntu/ bionic main restricted universe multiverse
+deb http://192.168.3.25:5080/ubuntu/ bionic-updates main restricted universe multiverse
+deb http://192.168.3.25:5080/ubuntu/ bionic-security main restricted universe multiverse
+deb http://192.168.3.25:5080/ubuntu/ bionic-backports main restricted universe multiverse
+
+# 第二优先级：阿里云官方镜像
+deb http://mirrors.aliyun.com/ubuntu/ bionic main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-updates main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-security main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-backports main restricted universe multiverse
+
+# 第三优先级：Ubuntu 官方源兜底
+deb http://archive.ubuntu.com/ubuntu/ bionic main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ bionic-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ bionic-security main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ bionic-backports main restricted universe multiverse
