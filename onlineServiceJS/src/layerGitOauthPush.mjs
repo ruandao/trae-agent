@@ -8,6 +8,7 @@ import os from 'os';
 import { spawn, spawnSync } from 'child_process';
 import { gitCmd } from './gitCmd.mjs';
 import { layerGitWorkdirRootsForFileListing } from './layerFs.mjs';
+import { appendOutboundReqLog, appendGitPushReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
 
 const GH_SLUG_RE = /github\.com[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i;
 
@@ -108,22 +109,33 @@ function branchNameFromRef(ref) {
 
 async function createGithubPullRequest({ owner, repo, head, base, accessToken, title, bodyText }) {
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/pulls`;
-  const r = await fetch(apiUrl, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${accessToken}`,
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      title: title || 'Pull request',
-      head,
-      base,
-      body: bodyText || '',
-    }),
-  });
+  const safeUrl = sanitizeUrlForOutboundLog(apiUrl);
+  const t0 = Date.now();
+  let r;
+  try {
+    r = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${accessToken}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        title: title || 'Pull request',
+        head,
+        base,
+        body: bodyText || '',
+      }),
+    });
+  } catch (e) {
+    appendOutboundReqLog(
+      `github-api POST ${safeUrl} -> error ${String(e?.message || e).slice(0, 400)} ${Date.now() - t0}ms`,
+    );
+    throw e;
+  }
   const text = await r.text();
+  appendOutboundReqLog(`github-api POST ${safeUrl} -> HTTP ${r.status} ${Date.now() - t0}ms`);
   let json = null;
   try {
     json = JSON.parse(text);
@@ -174,6 +186,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
     }
   });
   if (!gitRoots.length) {
+    appendGitPushReqLog(`oauth layer_id=${layerId} fail reason=no_git`);
     return { httpStatus: 400, payload: { ok: false, detail: 'no git' } };
   }
 
@@ -188,6 +201,8 @@ export async function runLayerGithubOauthAccessPush(opts) {
     GIT_ASKPASS: ask.shPath,
     GIT_ASKPASS_ALWAYS: '1',
   };
+
+  appendGitPushReqLog(`oauth layer_id=${layerId} begin repos=${gitRoots.length} dst=${dstRef}`);
 
   /** @type {object[]} */
   const repos = [];
@@ -205,6 +220,9 @@ export async function runLayerGithubOauthAccessPush(opts) {
       };
       if (!slugInfo) {
         item.detail = 'remote 非 github.com，已跳过 OAuth 推送';
+        appendGitPushReqLog(
+          `oauth layer_id=${layerId} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} skip=non_github_remote`,
+        );
         repos.push(item);
         continue;
       }
@@ -213,8 +231,14 @@ export async function runLayerGithubOauthAccessPush(opts) {
       try {
         await gitExecAsync(['push', httpsRemote, `HEAD:${dstRef}`], row.workdir, pushEnv);
         item.push_ok = true;
+        appendGitPushReqLog(
+          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push ok`,
+        );
       } catch (e) {
         item.detail = String(e.message || e);
+        appendGitPushReqLog(
+          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push fail err=${String(e.message || e).slice(0, 800)}`,
+        );
         repos.push(item);
         return {
           httpStatus: 400,
@@ -254,6 +278,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
 
   const anyPushed = repos.some((r) => r.push_ok);
   if (!anyPushed) {
+    appendGitPushReqLog(`oauth layer_id=${layerId} fail reason=no_successful_push`);
     return {
       httpStatus: 400,
       payload: {
@@ -263,6 +288,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
       },
     };
   }
+  appendGitPushReqLog(`oauth layer_id=${layerId} done ok repos=${repos.length}`);
   return {
     httpStatus: 200,
     payload: {

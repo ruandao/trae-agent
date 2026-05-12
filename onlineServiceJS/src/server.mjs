@@ -10,6 +10,7 @@ import { spawn, spawnSync } from 'child_process';
 import { authMiddleware, accessTokenExpected } from './auth.mjs';
 import { getAgentRenderHints } from './agentRenderHints.mjs';
 import { serviceRoot, configFilePath, repoRoot, logsDir } from './paths.mjs';
+import { appendOutboundReqLog, appendGitPushReqLog } from './outboundReqLog.mjs';
 import { ssePingLoop, addSseClient, broadcast } from './sseHub.mjs';
 import {
   runBootstrapTokenExchangeOnly,
@@ -210,10 +211,15 @@ app.use(traceMiddleware);
 app.use(express.json({ limit: '20mb' }));
 
 const accessLogPath = () => path.join(logsDir(), 'requests.log');
-function logReq(req, res, start, err) {
+function logReq(req, res, start, statusOverride) {
   try {
-    const ms = ((Date.now() - start) / 1000).toFixed(2);
-    const line = `${req.ip || '-'} "${req.method} ${req.originalUrl}" ${err ? 'err' : res.statusCode} ${ms}ms\n`;
+    const ms = Date.now() - start;
+    const tid = String(res.getHeader(TRACE_HEADER) || req.headers[TRACE_HEADER.toLowerCase()] || '')
+      .trim()
+      .replace(/\s+/g, '_');
+    const status =
+      statusOverride != null ? statusOverride : res.statusCode;
+    const line = `${req.ip || '-'} trace=${tid || '-'} "${req.method} ${req.originalUrl}" ${status} ${ms}ms\n`;
     fs.mkdirSync(path.dirname(accessLogPath()), { recursive: true });
     fs.appendFileSync(accessLogPath(), `${new Date().toISOString()} | ${line}`);
   } catch {
@@ -222,7 +228,16 @@ function logReq(req, res, start, err) {
 }
 app.use((req, res, next) => {
   const s = Date.now();
-  res.on('finish', () => logReq(req, res, s, false));
+  let logged = false;
+  const runLog = (statusOverride) => {
+    if (logged) return;
+    logged = true;
+    logReq(req, res, s, statusOverride);
+  };
+  res.on('finish', () => runLog(undefined));
+  res.on('close', () => {
+    if (!logged) runLog('aborted');
+  });
   next();
 });
 
@@ -1217,8 +1232,12 @@ api.post('/layers/:layer_id/git/commit', async (req, res) => {
 });
 
 api.post('/layers/:layer_id/git/push', async (req, res) => {
+  const layerId = String(req.params.layer_id || '').trim();
   const work = layerPrimaryGitWorkdir(req.params.layer_id);
-  if (!work) return res.status(400).json({ detail: 'no git' });
+  if (!work) {
+    appendGitPushReqLog(`api layer_id=${layerId} fail reason=no_git_workdir`);
+    return res.status(400).json({ detail: 'no git' });
+  }
   const pem = String(req.body?.ephemeral_ssh_private_key || '').trim();
   const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
   let keyPath = null;
@@ -1232,6 +1251,9 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
       env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
     }
     const branch = (req.body?.target_branch || '').toString().trim();
+    appendGitPushReqLog(
+      `api layer_id=${layerId} target_branch=${branch || '(default)'} ssh_ephemeral_key=${pem ? 'yes' : 'no'}`,
+    );
     const args = ['push'];
     // `git push origin <name>` 要求本地存在同名的 *本地 ref*。任务里传入的 `target_branch` 往往是
     // 要在远端建立的工作分支名，而 clone 后所在分支可能是 main，并无该本地分支，会报
@@ -1249,9 +1271,13 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
         : `refs/heads/${branch}`
       : 'origin HEAD';
     console.log('[LayerGitPush] ok layer_id=%s ref=%s', req.params.layer_id, pushedRef);
+    appendGitPushReqLog(`api layer_id=${layerId} ok ref=${pushedRef}`);
     res.json({ ok: true });
   } catch (e) {
     console.warn('[LayerGitPush] fail layer_id=%s err=%s', req.params.layer_id, String(e.message || e));
+    appendGitPushReqLog(
+      `api layer_id=${layerId} fail err=${String(e.message || e).slice(0, 800)}`,
+    );
     res.status(400).json({ detail: String(e.message || e) });
   } finally {
     if (keyPath) {
@@ -1303,16 +1329,6 @@ function findParentWorkdirForChildPrefix(rootsP, relPrefix) {
 const AI_SUMMARY_MAX_DIFF = 28000;
 const AI_SUMMARY_TIMEOUT_MS = 45000;
 
-function outboundLog(line) {
-  try {
-    const f = path.join(reqLogsDir(), 'outbound.log');
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.appendFileSync(f, `${new Date().toISOString()} | ${line}\n`);
-  } catch {
-    /* ignore */
-  }
-}
-
 function resolveLlmFromEnv() {
   const baseUrl = String(process.env.TRAE_STAGED_COMMIT_LLM_BASE_URL || '')
     .trim()
@@ -1356,7 +1372,7 @@ function resolveLlmFromYaml() {
 
 async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent) {
   const url = `${baseUrl}/chat/completions`;
-  outboundLog(`diff-log-summary POST ${url} model=${model}`);
+  appendOutboundReqLog(`diff-log-summary POST ${url} model=${model}`);
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), AI_SUMMARY_TIMEOUT_MS);
   try {
@@ -1382,7 +1398,7 @@ async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent)
     });
     const text = await r.text();
     if (!r.ok) {
-      outboundLog(`diff-log-summary LLM HTTP ${r.status} ${text.slice(0, 240)}`);
+      appendOutboundReqLog(`diff-log-summary LLM HTTP ${r.status} ${text.slice(0, 240)}`);
       return null;
     }
     let j;
@@ -1394,7 +1410,7 @@ async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent)
     const c = j?.choices?.[0]?.message?.content;
     return typeof c === 'string' ? c.trim() : null;
   } catch (e) {
-    outboundLog(`diff-log-summary LLM error ${String(e?.message || e).slice(0, 320)}`);
+    appendOutboundReqLog(`diff-log-summary LLM error ${String(e?.message || e).slice(0, 320)}`);
     return null;
   } finally {
     clearTimeout(t);

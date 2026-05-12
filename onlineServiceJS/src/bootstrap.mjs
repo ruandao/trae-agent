@@ -3,7 +3,8 @@ import path from 'path';
 import os from 'os';
 import YAML from 'yaml';
 
-import { configFilePath, reqLogsDir, logsDir } from './paths.mjs';
+import { configFilePath, logsDir } from './paths.mjs';
+import { appendOutboundReqLog } from './outboundReqLog.mjs';
 import {
   newLayerId,
   createRootLayer,
@@ -443,22 +444,9 @@ function createInitialWorkspaceLayer() {
   const layerId = startupEmptyLayerId || ensureStartupEmptyLayer();
   createRootLayer(layerId);
   writeLayerMeta(layerId, 'clone', null);
-  logOutbound(`bootstrap: initial writable layer (reuse empty-root, no git, await clone) ${layerId}`);
+  appendOutboundReqLog(`bootstrap: initial writable layer (reuse empty-root, no git, await clone) ${layerId}`);
   console.log(`[onlineServiceJS] 已复用空层锚点为初始可写层（无 git，待首次克隆）: ${layerId}`);
   return layerId;
-}
-
-function ensureReqLog() {
-  const d = reqLogsDir();
-  return path.join(d, 'outbound.log');
-}
-
-function logOutbound(line) {
-  try {
-    fs.appendFileSync(ensureReqLog(), `${new Date().toISOString()} | ${line}\n`);
-  } catch {
-    /* ignore */
-  }
 }
 
 /** 换票专用日志：onlineProject_state/logs/tokenRefresh.log，便于与 reqLogs/outbound.log 区分排查 */
@@ -479,7 +467,7 @@ function summarizeSecret(value) {
 
 function logTokenExchange(line) {
   const msg = `token-exchange: ${line}`;
-  logOutbound(msg);
+  appendOutboundReqLog(msg);
   appendTokenRefreshLog(msg);
   console.log(`[onlineServiceJS] ${msg}`);
 }
@@ -497,13 +485,13 @@ export async function runBootstrapTokenExchangeOnly() {
     prefix = taskApiPrefix();
   } catch (e) {
     const skipLine = `bootstrap skip: ${e.message}`;
-    logOutbound(skipLine);
+    appendOutboundReqLog(skipLine);
     appendTokenRefreshLog(skipLine);
     return { skipped: true };
   }
   if (!prefix) {
     const skipLine = 'bootstrap skip: empty task API prefix';
-    logOutbound(skipLine);
+    appendOutboundReqLog(skipLine);
     appendTokenRefreshLog(skipLine);
     return { skipped: true };
   }
@@ -514,7 +502,7 @@ export async function runBootstrapTokenExchangeOnly() {
     business = businessApiEndpoint();
   } catch (e) {
     const line = `bootstrap: business API endpoint: ${e && e.message ? String(e.message) : String(e)}`;
-    logOutbound(line);
+    appendOutboundReqLog(line);
     appendTokenRefreshLog(line);
     throw e;
   }
@@ -556,14 +544,14 @@ export async function runBootstrapTokenExchangeOnly() {
     } catch (e) {
       const detail = e && e.message ? String(e.message) : String(e);
       const failLine = `token-exchange: FAIL ${detail}`;
-      logOutbound(failLine);
+      appendOutboundReqLog(failLine);
       appendTokenRefreshLog(failLine);
       console.error('[onlineServiceJS] token-exchange: FAIL', e);
       throw e;
     }
   } else {
     const skipExLine = 'bootstrap: skip exchange (TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE)';
-    logOutbound(skipExLine);
+    appendOutboundReqLog(skipExLine);
     appendTokenRefreshLog(skipExLine);
     logTokenExchange('skipped (TRAE_SKIP_CONTAINER_TOKEN_EXCHANGE), using initial ACCESS_TOKEN as-is');
   }
@@ -576,14 +564,14 @@ export async function runBootstrapTokenExchangeOnly() {
  */
 export async function runBootstrapAfterListen(ctx) {
   if (!ctx || ctx.skipped) {
-    logOutbound('bootstrap post-listen: skip (no task API prefix)');
+    appendOutboundReqLog('bootstrap post-listen: skip (no task API prefix)');
     return;
   }
   const { prefix, newAccess, timeout } = ctx;
   const timeoutSec = timeout;
 
   console.log('[onlineServiceJS] 容器已启动，开始拉取任务详情…');
-  logOutbound('bootstrap post-listen: task-detail');
+  appendOutboundReqLog('bootstrap post-listen: task-detail');
 
   const detail = await postJson(
     `${prefix}/server-container-token/task-detail/`,
@@ -600,7 +588,7 @@ export async function runBootstrapAfterListen(ctx) {
     bootstrapCloneLayerId = await cloneReposIntoSharedLayer(urls, credRoot, prefix, newAccess);
     bootstrapRegisterCloneJob = true;
   } else {
-    logOutbound('bootstrap: no repo urls in task-detail');
+    appendOutboundReqLog('bootstrap: no repo urls in task-detail');
     bootstrapCloneLayerId = createInitialWorkspaceLayer();
     bootstrapRegisterCloneJob = false;
   }
@@ -618,7 +606,7 @@ export async function runBootstrapAfterListen(ctx) {
   const dest = configFilePath();
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.writeFileSync(dest, yamlText, 'utf8');
-  logOutbound(`bootstrap: wrote ${dest}`);
+  appendOutboundReqLog(`bootstrap: wrote ${dest}`);
   console.log('[onlineServiceJS] 任务引导完成（详情已拉取、克隆与配置已就绪）。');
 }
 

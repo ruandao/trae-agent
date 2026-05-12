@@ -7,6 +7,7 @@
 import { spawn } from 'child_process';
 
 import { gitCmd } from './gitCmd.mjs';
+import { appendOutboundReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
 
 function traceHeaders() {
   const tid = String(process.env.TRACE_ID || '').trim();
@@ -15,9 +16,22 @@ function traceHeaders() {
   return h;
 }
 
-export async function postJson(url, body, timeoutSec = 8) {
+/** 容器心跳 POST 的 reqLogs 文件名（与其它出站 outbound.log 分离） */
+export const HEARTBEAT_REQ_LOG_FILE = 'heartbeat.log';
+
+/**
+ * @param {string} url
+ * @param {object} body
+ * @param {number} [timeoutSec]
+ * @param {{ reqLogFile?: string }} [opts] — `reqLogFile: 'heartbeat.log'` 时写入 reqLogs/heartbeat.log
+ */
+export async function postJson(url, body, timeoutSec = 8, opts = {}) {
+  const reqLogFile = opts && typeof opts === 'object' ? opts.reqLogFile : undefined;
+  const safeUrl = sanitizeUrlForOutboundLog(url);
+  const t0 = Date.now();
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutSec * 1000);
+  const logOpts = reqLogFile ? { filename: reqLogFile } : {};
   try {
     const r = await fetch(url, {
       method: 'POST',
@@ -26,6 +40,8 @@ export async function postJson(url, body, timeoutSec = 8) {
       signal: ac.signal,
     });
     const text = await r.text();
+    const ms = Date.now() - t0;
+    appendOutboundReqLog(`postJson POST ${safeUrl} -> HTTP ${r.status} ${ms}ms`, logOpts);
     let data = {};
     try {
       data = text ? JSON.parse(text) : {};
@@ -36,6 +52,13 @@ export async function postJson(url, body, timeoutSec = 8) {
       throw new Error(`HTTP ${r.status} ${url}: ${JSON.stringify(data).slice(0, 500)}`);
     }
     return data;
+  } catch (e) {
+    const ms = Date.now() - t0;
+    appendOutboundReqLog(
+      `postJson POST ${safeUrl} -> error ${String(e?.message || e).slice(0, 400)} ${ms}ms`,
+      logOpts,
+    );
+    throw e;
   } finally {
     clearTimeout(t);
   }
@@ -219,7 +242,7 @@ export async function postContainerHeartbeatToSaas(message) {
   const msg = typeof message === 'string' ? message.trim() : '';
   if (msg) body.message = msg.slice(0, 500);
   try {
-    await postJson(url, body, 10);
+    await postJson(url, body, 10, { reqLogFile: HEARTBEAT_REQ_LOG_FILE });
     return true;
   } catch {
     return false;

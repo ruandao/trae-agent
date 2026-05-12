@@ -4,22 +4,12 @@
  * 出站请求写入 reqLogs/outbound.log（不含 API Key）。
  */
 import fs from 'fs';
-import path from 'path';
 import YAML from 'yaml';
-import { configFilePath, reqLogsDir } from './paths.mjs';
+import { configFilePath } from './paths.mjs';
+import { appendOutboundReqLog } from './outboundReqLog.mjs';
 
 const DIFF_MAX = 28000;
 const LLM_TIMEOUT_MS = 45000;
-
-function outboundLog(line) {
-  try {
-    const f = path.join(reqLogsDir(), 'outbound.log');
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.appendFileSync(f, `${new Date().toISOString()} | ${line}\n`);
-  } catch {
-    /* ignore */
-  }
-}
 
 function sanitizeOneLine(s) {
   const t = String(s || '').replace(/\r/g, '').trim();
@@ -88,7 +78,7 @@ function resolveLlmFromYaml() {
 
 async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent) {
   const url = `${baseUrl}/chat/completions`;
-  outboundLog(`staged-commit-suggest POST ${url} model=${model}`);
+  appendOutboundReqLog(`staged-commit-suggest POST ${url} model=${model}`);
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
   try {
@@ -115,7 +105,7 @@ async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent)
     });
     const text = await r.text();
     if (!r.ok) {
-      outboundLog(`staged-commit-suggest LLM HTTP ${r.status} ${text.slice(0, 240)}`);
+      appendOutboundReqLog(`staged-commit-suggest LLM HTTP ${r.status} ${text.slice(0, 240)}`);
       return null;
     }
     let j;
@@ -128,7 +118,7 @@ async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent)
     const out = typeof c === 'string' ? c : '';
     return sanitizeOneLine(out) || null;
   } catch (e) {
-    outboundLog(`staged-commit-suggest LLM error ${String(e?.message || e).slice(0, 320)}`);
+    appendOutboundReqLog(`staged-commit-suggest LLM error ${String(e?.message || e).slice(0, 320)}`);
     return null;
   } finally {
     clearTimeout(t);

@@ -1,21 +1,10 @@
 /**
  * 解析宿主机可达 IP（公网或本网段）与映射端口，向 SaaS 注册 CloudServerConfig（register-reachability）。
  */
-import fs from 'fs';
 import os from 'os';
-import path from 'path';
 
-import { reqLogsDir } from './paths.mjs';
+import { appendOutboundReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
 import { postJson, taskApiPrefix } from './saasTaskCloud.mjs';
-
-function logOutbound(line) {
-  try {
-    const f = path.join(reqLogsDir(), 'outbound.log');
-    fs.appendFileSync(f, `${new Date().toISOString()} | ${line}\n`);
-  } catch {
-    /* ignore */
-  }
-}
 
 /** IPv6 等非 IPv4 文本在 URL authority 中需方括号 */
 function authorityHost(ip) {
@@ -44,14 +33,20 @@ const _IPV4_RE = /\b(\d{1,3}(?:\.\d{1,3}){3})\b/;
  */
 async function fetchPublicIpv4Domestic(timeoutMs = 4500) {
   async function query(url, parse) {
+    const safe = sanitizeUrlForOutboundLog(url);
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const t0 = Date.now();
     try {
       const r = await fetch(url, { signal: ac.signal });
-      if (!r.ok) return null;
       const body = await r.text();
+      appendOutboundReqLog(`reachability GET ${safe} -> HTTP ${r.status} ${Date.now() - t0}ms`);
+      if (!r.ok) return null;
       return parse(body);
-    } catch {
+    } catch (e) {
+      appendOutboundReqLog(
+        `reachability GET ${safe} -> error ${String(e?.message || e).slice(0, 240)} ${Date.now() - t0}ms`,
+      );
       return null;
     } finally {
       clearTimeout(timer);
@@ -131,13 +126,13 @@ function hostMappedVscodePort() {
 export async function registerReachabilityAfterBootstrap(ctx) {
   if (!ctx || ctx.skipped || !ctx.prefix) return;
   if (['1', 'true', 'yes', 'on'].includes(String(process.env.TRAE_SKIP_REACHABILITY_REGISTER || '').toLowerCase())) {
-    logOutbound('reachability: skip TRAE_SKIP_REACHABILITY_REGISTER');
+    appendOutboundReqLog('reachability: skip TRAE_SKIP_REACHABILITY_REGISTER');
     return;
   }
 
   const token = String(process.env.ACCESS_TOKEN || ctx.newAccess || '').trim();
   if (!token) {
-    logOutbound('reachability: skip (no ACCESS_TOKEN)');
+    appendOutboundReqLog('reachability: skip (no ACCESS_TOKEN)');
     return;
   }
 
@@ -175,5 +170,5 @@ export async function registerReachabilityAfterBootstrap(ctx) {
     `[onlineServiceJS] 已向 SaaS 注册可达地址 public_ip=${pip} server_url=${serverUrl}` +
       (vscodeUrl ? ` vscode=${vscodeUrl}` : '')
   );
-  logOutbound(`reachability: registered public_ip=${pip} server_url=${serverUrl}`);
+  appendOutboundReqLog(`reachability: registered public_ip=${pip} server_url=${serverUrl}`);
 }
