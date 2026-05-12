@@ -32,6 +32,8 @@
 #   DOCKER_PUSH         设为 1 / true 时推送（可与 --push 二选一）。
 #   ENABLE_CODE_SERVER / NODE_VERSION / CODE_SERVER_VERSION  传给 Dockerfile。
 #   NPM_REGISTRY  可选，传给 Dockerfile（例：https://registry.npmmirror.com），减轻 npm ci 时 ECONNRESET。
+#   SKIP_INTERNAL_APT_MIRROR  默认 0；设为 1/true 时构建阶段从 apt sources 去掉 192.168.3.25 内网源
+#                             （不在该局域网构建 Docker 时务必开启，否则 apt-get update 会长时间重试后失败）。
 #
 # 推送前请在目标仓库执行 docker login（本脚本不代为交互登录）。
 set -euo pipefail
@@ -233,6 +235,13 @@ fi
 docker buildx inspect --bootstrap >/dev/null 2>&1 || true
 
 BUILD_ARGS=( -f "$SCRIPT_DIR/Dockerfile" --build-arg "ENABLE_CODE_SERVER=${ENABLE_CODE_SERVER:-1}" )
+SKIP_INT="${SKIP_INTERNAL_APT_MIRROR:-0}"
+if [[ "$SKIP_INT" == "1" || "$SKIP_INT" == "true" || "$SKIP_INT" == "TRUE" ]]; then
+  SKIP_INT=1
+else
+  SKIP_INT=0
+fi
+BUILD_ARGS+=( --build-arg "SKIP_INTERNAL_APT_MIRROR=${SKIP_INT}" )
 if [[ -n "${NODE_VERSION:-}" ]]; then
   BUILD_ARGS+=( --build-arg "NODE_VERSION=${NODE_VERSION}" )
 fi

@@ -1,5 +1,6 @@
 # 单容器：Node onlineServiceJS（8765）+ 可选 code-server（8888）。
 # 容器内 apt：amd64 用 Ubuntu_24.04_Noble.list；arm64 用 Ubuntu_24.04_Noble-ports.list（内网 → 阿里云 → 官方兜底）。
+# 构建参数 SKIP_INTERNAL_APT_MIRROR=1：去掉内网源，供 CI/本机构建使用。
 # 含 git + openssh-client：onlineServiceJS bootstrap 会 clone 任务关联仓库（常见 git@github.com SSH）。
 # PyPI 仍走清华；Node  tarball 清华优先、失败回退 nodejs.org；code-server 同 skill 说明。
 # npm：默认 registry.npmjs.org；可通过构建参数 NPM_REGISTRY 指向镜像（如 npmmirror）缓解跨境 ECONNRESET。
@@ -11,6 +12,8 @@ FROM ubuntu:24.04 AS pydeps
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
+# 设为 1 时从 sources.list 去掉 192.168.3.25 内网源（笔记本/CI 上构建且不在该局域网时必须开启）
+ARG SKIP_INTERNAL_APT_MIRROR=0
 
 COPY onlineServiceJS/sourceList/Ubuntu_24.04_Noble.list /tmp/apt-sources-amd64.list
 COPY onlineServiceJS/sourceList/Ubuntu_24.04_Noble-ports.list /tmp/apt-sources-arm64.list
@@ -21,9 +24,11 @@ RUN rm -f /etc/apt/sources.list.d/ubuntu.sources; \
         arm64) cp /tmp/apt-sources-arm64.list /etc/apt/sources.list ;; \
         *) echo "unsupported TARGETARCH=$arch for apt sources"; exit 1 ;; \
     esac; \
-    rm -f /tmp/apt-sources-amd64.list /tmp/apt-sources-arm64.list
+    rm -f /tmp/apt-sources-amd64.list /tmp/apt-sources-arm64.list; \
+    if [ "${SKIP_INTERNAL_APT_MIRROR}" = "1" ]; then sed -i '/192\.168\.3\.25/d' /etc/apt/sources.list; fi
 
 RUN set -eux; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "120";\nAcquire::https::Timeout "120";\n' > /etc/apt/apt.conf.d/80-docker-retries.conf; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl \
@@ -51,6 +56,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG ENABLE_CODE_SERVER=1
 # 与 code-server  tarball 架构一致；未传时以镜像内 dpkg 为准（避免 arm64 构建误用默认 amd64 的 Node 二进制）
 ARG TARGETARCH
+ARG SKIP_INTERNAL_APT_MIRROR=0
 ARG CODE_SERVER_VERSION=4.96.4
 ARG NODE_VERSION=22.14.0
 # 留空则不改 registry；可传 https://registry.npmmirror.com 等
@@ -68,9 +74,11 @@ RUN rm -f /etc/apt/sources.list.d/ubuntu.sources; \
         arm64) cp /tmp/apt-sources-arm64.list /etc/apt/sources.list ;; \
         *) echo "unsupported TARGETARCH=$arch for apt sources"; exit 1 ;; \
     esac; \
-    rm -f /tmp/apt-sources-amd64.list /tmp/apt-sources-arm64.list
+    rm -f /tmp/apt-sources-amd64.list /tmp/apt-sources-arm64.list; \
+    if [ "${SKIP_INTERNAL_APT_MIRROR}" = "1" ]; then sed -i '/192\.168\.3\.25/d' /etc/apt/sources.list; fi
 
 RUN set -eux; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "120";\nAcquire::https::Timeout "120";\n' > /etc/apt/apt.conf.d/80-docker-retries.conf; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils \
