@@ -80,6 +80,7 @@ import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParen
 import { gitCmd, gitCloneConfigArgs, formatGitExecDebugLine } from './gitCmd.mjs';
 import { suggestStagedCommitMessage } from './stagedCommitSuggest.mjs';
 import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
+import { gitSshFromHttps, gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -629,19 +630,6 @@ api.post('/repos/clone', (req, res) => {
     res.status(400).json({ detail: String(e.message || e), exit_code: 1 });
   }
 });
-
-function gitSshFromHttps(url) {
-  try {
-    const u = new URL(url);
-    let host = u.hostname.toLowerCase();
-    if (host === 'www.github.com') host = 'github.com';
-    let pth = u.pathname.replace(/^\//, '').replace(/\.git$/i, '');
-    if (!host || !pth || pth.includes('..')) return url;
-    return `git@${host}:${pth}.git`;
-  } catch {
-    return url;
-  }
-}
 
 api.post('/repos/reclone', async (req, res) => {
   const repoUrl = String(req.body?.repo_url || '').trim();
@@ -1252,15 +1240,17 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
       env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
     }
     const branch = (req.body?.target_branch || '').toString().trim();
+    const originUrl = gitConfigGetSync(['config', '--get', 'remote.origin.url'], work);
+    const pushRemoteArg = gitPushRemoteArgFromOrigin(originUrl);
     const args = ['push'];
     // `git push origin <name>` 要求本地存在同名的 *本地 ref*。任务里传入的 `target_branch` 往往是
     // 要在远端建立的工作分支名，而 clone 后所在分支可能是 main，并无该本地分支，会报
     // "src refspec does not match any"。用 HEAD:<dst> 将当前工作区提交推送到远端分支。
     if (branch) {
       const dst = branch.startsWith('refs/') ? branch : `refs/heads/${branch}`;
-      args.push('origin', `HEAD:${dst}`);
+      args.push(pushRemoteArg, `HEAD:${dst}`);
     } else {
-      args.push('origin', 'HEAD');
+      args.push(pushRemoteArg, 'HEAD');
     }
     cmdLine = formatGitExecDebugLine(
       work,
@@ -1268,6 +1258,11 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
       pem ? { GIT_SSH_COMMAND: env.GIT_SSH_COMMAND } : null,
     );
     appendGitPushReqLog(`api layer_id=${layerId} run ${cmdLine}`);
+    if (pushRemoteArg !== 'origin') {
+      appendGitPushReqLog(
+        `api layer_id=${layerId} push_remote=ssh_from_origin origin=${String(originUrl || '').slice(0, 240)} remote=${pushRemoteArg}`,
+      );
+    }
     await gitExec(args, work, env);
     const pushedRef = branch
       ? branch.startsWith('refs/')
