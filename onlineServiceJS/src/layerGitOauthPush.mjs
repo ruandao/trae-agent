@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { spawn, spawnSync } from 'child_process';
-import { gitCmd } from './gitCmd.mjs';
+import { gitCmd, formatGitExecDebugLine } from './gitCmd.mjs';
 import { layerGitWorkdirRootsForFileListing } from './layerFs.mjs';
 import { appendOutboundReqLog, appendGitPushReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
 
@@ -228,8 +228,16 @@ export async function runLayerGithubOauthAccessPush(opts) {
       }
       const httpsRemote = githubHttpsRemoteFromSlug(slugInfo.owner, slugInfo.repo);
       item.github_slug = slugInfo.slug;
+      const pushArgs = ['push', httpsRemote, `HEAD:${dstRef}`];
+      const cmdLine = formatGitExecDebugLine(row.workdir, pushArgs, {
+        GIT_ASKPASS: ask.shPath,
+        GIT_ASKPASS_ALWAYS: '1',
+      });
+      appendGitPushReqLog(
+        `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} run ${cmdLine}`,
+      );
       try {
-        await gitExecAsync(['push', httpsRemote, `HEAD:${dstRef}`], row.workdir, pushEnv);
+        await gitExecAsync(pushArgs, row.workdir, pushEnv);
         item.push_ok = true;
         appendGitPushReqLog(
           `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push ok`,
@@ -237,7 +245,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
       } catch (e) {
         item.detail = String(e.message || e);
         appendGitPushReqLog(
-          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push fail err=${String(e.message || e).slice(0, 800)}`,
+          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push fail cmd=${cmdLine} err=${String(e.message || e).slice(0, 800)}`,
         );
         repos.push(item);
         return {

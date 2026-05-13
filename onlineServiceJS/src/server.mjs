@@ -77,7 +77,7 @@ import {
 } from './jobsRuntime.mjs';
 import { getJobStepsForLayer } from './jobSteps.mjs';
 import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParentDiff.mjs';
-import { gitCmd, gitCloneConfigArgs } from './gitCmd.mjs';
+import { gitCmd, gitCloneConfigArgs, formatGitExecDebugLine } from './gitCmd.mjs';
 import { suggestStagedCommitMessage } from './stagedCommitSuggest.mjs';
 import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1241,6 +1241,7 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
   const pem = String(req.body?.ephemeral_ssh_private_key || '').trim();
   const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
   let keyPath = null;
+  let cmdLine = '';
   try {
     if (pem) {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push_'));
@@ -1251,9 +1252,6 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
       env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
     }
     const branch = (req.body?.target_branch || '').toString().trim();
-    appendGitPushReqLog(
-      `api layer_id=${layerId} target_branch=${branch || '(default)'} ssh_ephemeral_key=${pem ? 'yes' : 'no'}`,
-    );
     const args = ['push'];
     // `git push origin <name>` 要求本地存在同名的 *本地 ref*。任务里传入的 `target_branch` 往往是
     // 要在远端建立的工作分支名，而 clone 后所在分支可能是 main，并无该本地分支，会报
@@ -1264,6 +1262,12 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
     } else {
       args.push('origin', 'HEAD');
     }
+    cmdLine = formatGitExecDebugLine(
+      work,
+      args,
+      pem ? { GIT_SSH_COMMAND: env.GIT_SSH_COMMAND } : null,
+    );
+    appendGitPushReqLog(`api layer_id=${layerId} run ${cmdLine}`);
     await gitExec(args, work, env);
     const pushedRef = branch
       ? branch.startsWith('refs/')
@@ -1276,7 +1280,7 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
   } catch (e) {
     console.warn('[LayerGitPush] fail layer_id=%s err=%s', req.params.layer_id, String(e.message || e));
     appendGitPushReqLog(
-      `api layer_id=${layerId} fail err=${String(e.message || e).slice(0, 800)}`,
+      `api layer_id=${layerId} fail ${cmdLine ? `cmd=${cmdLine} ` : ''}err=${String(e.message || e).slice(0, 800)}`,
     );
     res.status(400).json({ detail: String(e.message || e) });
   } finally {
