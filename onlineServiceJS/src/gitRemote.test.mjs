@@ -9,13 +9,18 @@ test('gitSshFromHttps: github https 转 ssh', () => {
   assert.equal(gitSshFromHttps('https://www.github.com/AAAA/BBBB'), 'git@github.com:AAAA/BBBB.git');
 });
 
-test('gitPushRemoteArgFromOrigin: github https 优先 ssh remote', () => {
+test('gitPushRemoteArgFromOrigin: github https 默认保持 origin（容器凭据可用）', () => {
+  assert.equal(gitPushRemoteArgFromOrigin('https://github.com/AAAA/BBBB.git'), 'origin');
+  assert.equal(gitPushRemoteArgFromOrigin('https://my-user@github.com/AAAA/BBBB'), 'origin');
+});
+
+test('gitPushRemoteArgFromOrigin: github https 在 preferGithubSsh=true 时转 ssh remote', () => {
   assert.equal(
-    gitPushRemoteArgFromOrigin('https://github.com/AAAA/BBBB.git'),
+    gitPushRemoteArgFromOrigin('https://github.com/AAAA/BBBB.git', { preferGithubSsh: true }),
     'git@github.com:AAAA/BBBB.git',
   );
   assert.equal(
-    gitPushRemoteArgFromOrigin('https://my-user@github.com/AAAA/BBBB'),
+    gitPushRemoteArgFromOrigin('https://my-user@github.com/AAAA/BBBB', { preferGithubSsh: true }),
     'git@github.com:AAAA/BBBB.git',
   );
 });

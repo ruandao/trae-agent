@@ -1,5 +1,5 @@
 /**
- * 接口 A：接收 GitHub OAuth access_token，对层级内各 Git 工作区执行 HTTPS push，
+ * 接口 A：接收 GitHub OAuth 每仓库 access_token 映射，对层级内各 Git 工作区执行 HTTPS push，
  * 并在给定 base 分支上尝试创建 Pull Request（GitHub REST API）。
  */
 import fs from 'fs';
@@ -154,7 +154,7 @@ async function createGithubPullRequest({ owner, repo, head, base, accessToken, t
  * @param {object} opts
  * @param {string} opts.layerId
  * @param {string} opts.targetBranch - 推送到远端的分支名（与现有 /git/push 一致）
- * @param {string} opts.accessToken - GitHub user-to-server access token
+ * @param {Record<string,string>} [opts.accessTokenByRepoSlug] - 每仓库 token，键为 owner/repo（小写）
  * @param {string} [opts.prBaseBranch] - 若提供则对每个 GitHub 仓尝试创建 PR：base ← 该值，head ← targetBranch
  * @param {string} [opts.prTitle]
  * @param {string} [opts.prBody]
@@ -162,7 +162,19 @@ async function createGithubPullRequest({ owner, repo, head, base, accessToken, t
 export async function runLayerGithubOauthAccessPush(opts) {
   const layerId = String(opts.layerId || '').trim();
   const targetBranch = String(opts.targetBranch || '').trim();
-  const accessToken = String(opts.accessToken || '').trim();
+  const rawAccessTokenByRepoSlug =
+    opts && typeof opts.accessTokenByRepoSlug === 'object' && opts.accessTokenByRepoSlug
+      ? opts.accessTokenByRepoSlug
+      : null;
+  const accessTokenByRepoSlug = {};
+  if (rawAccessTokenByRepoSlug) {
+    for (const [rawSlug, rawToken] of Object.entries(rawAccessTokenByRepoSlug)) {
+      const slug = String(rawSlug || '').trim().toLowerCase();
+      const tok = String(rawToken || '').trim();
+      if (!slug || !tok) continue;
+      accessTokenByRepoSlug[slug] = tok;
+    }
+  }
   const prBaseBranch = String(opts.prBaseBranch || '').trim();
   const prTitle = String(opts.prTitle || '').trim() || 'Pull request';
   const prBody = String(opts.prBody || '').trim();
@@ -173,8 +185,8 @@ export async function runLayerGithubOauthAccessPush(opts) {
   if (!targetBranch) {
     return { httpStatus: 400, payload: { ok: false, detail: 'target_branch 必填' } };
   }
-  if (!accessToken) {
-    return { httpStatus: 400, payload: { ok: false, detail: 'github_access_token 必填' } };
+  if (!Object.keys(accessTokenByRepoSlug).length) {
+    return { httpStatus: 400, payload: { ok: false, detail: 'github_auth_by_repo 必填' } };
   }
 
   const roots = layerGitWorkdirRootsForFileListing(layerId);
@@ -194,18 +206,20 @@ export async function runLayerGithubOauthAccessPush(opts) {
   const headName = branchNameFromRef(dstRef);
   const baseName = prBaseBranch ? branchNameFromRef(normalizeBranchRef(prBaseBranch)) : '';
 
-  const ask = writeAskpassBundle(accessToken);
-  const pushEnv = {
-    ...process.env,
-    GIT_TERMINAL_PROMPT: '0',
-    GIT_ASKPASS: ask.shPath,
-    GIT_ASKPASS_ALWAYS: '1',
-  };
-
   appendGitPushReqLog(`oauth layer_id=${layerId} begin repos=${gitRoots.length} dst=${dstRef}`);
 
   /** @type {object[]} */
   const repos = [];
+
+  const askpassByToken = new Map();
+  const askpassForToken = (token) => {
+    const key = String(token || '');
+    const hit = askpassByToken.get(key);
+    if (hit) return hit;
+    const bundle = writeAskpassBundle(key);
+    askpassByToken.set(key, bundle);
+    return bundle;
+  };
 
   try {
     for (const row of gitRoots) {
@@ -228,6 +242,29 @@ export async function runLayerGithubOauthAccessPush(opts) {
       }
       const httpsRemote = githubHttpsRemoteFromSlug(slugInfo.owner, slugInfo.repo);
       item.github_slug = slugInfo.slug;
+      const repoToken = accessTokenByRepoSlug[String(slugInfo.slug || '').toLowerCase()];
+      if (!repoToken) {
+        item.detail = '该仓库未找到可用的 GitHub OAuth access_token';
+        appendGitPushReqLog(
+          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} token=missing`,
+        );
+        repos.push(item);
+        return {
+          httpStatus: 400,
+          payload: {
+            ok: false,
+            detail: `推送失败（${slugInfo.slug}）：${item.detail}`,
+            github_oauth_multirepo: { repos },
+          },
+        };
+      }
+      const ask = askpassForToken(repoToken);
+      const pushEnv = {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_ASKPASS: ask.shPath,
+        GIT_ASKPASS_ALWAYS: '1',
+      };
       const pushArgs = ['push', httpsRemote, `HEAD:${dstRef}`];
       const cmdLine = formatGitExecDebugLine(row.workdir, pushArgs, {
         GIT_ASKPASS: ask.shPath,
@@ -264,7 +301,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
           repo: slugInfo.repo,
           head: headName,
           base: baseName,
-          accessToken,
+          accessToken: repoToken,
           title: prTitle,
           bodyText: prBody,
         });
@@ -281,7 +318,13 @@ export async function runLayerGithubOauthAccessPush(opts) {
       repos.push(item);
     }
   } finally {
-    ask.cleanup();
+    for (const ask of askpassByToken.values()) {
+      try {
+        ask.cleanup();
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   const anyPushed = repos.some((r) => r.push_ok);

@@ -1241,7 +1241,7 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
     }
     const branch = (req.body?.target_branch || '').toString().trim();
     const originUrl = gitConfigGetSync(['config', '--get', 'remote.origin.url'], work);
-    const pushRemoteArg = gitPushRemoteArgFromOrigin(originUrl);
+    const pushRemoteArg = gitPushRemoteArgFromOrigin(originUrl, { preferGithubSsh: Boolean(pem) });
     const args = ['push'];
     // `git push origin <name>` 要求本地存在同名的 *本地 ref*。任务里传入的 `target_branch` 往往是
     // 要在远端建立的工作分支名，而 clone 后所在分支可能是 main，并无该本地分支，会报
@@ -1290,12 +1290,15 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
 });
 
 /**
- * 接口 A：OAuth access_token 入参，对层内所有 GitHub 远程工作区 HTTPS 推送当前 HEAD，
+ * 接口 A：OAuth 按仓库 token 入参（github_auth_by_repo），对层内所有 GitHub 远程工作区 HTTPS 推送当前 HEAD，
  * 并在给定 base 上创建 PR（可选）。供 SaaS 在 refresh_token 换票后转发，与 TaskDetail 推送流程对齐。
  */
 api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
-  const token =
-    String(req.body?.github_auth || req.body?.github_access_token || req.body?.access_token || '').trim();
+  const rawTokenByRepo = req.body?.github_auth_by_repo;
+  const tokenByRepo =
+    rawTokenByRepo && typeof rawTokenByRepo === 'object' && !Array.isArray(rawTokenByRepo)
+      ? rawTokenByRepo
+      : null;
   const targetBranch = String(req.body?.target_branch || '').trim();
   const prBase = String(req.body?.pr_base_branch || '').trim();
   const prTitle = String(req.body?.pr_title || '').trim();
@@ -1305,7 +1308,7 @@ api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
     const { httpStatus, payload } = await runLayerGithubOauthAccessPush({
       layerId,
       targetBranch,
-      accessToken: token,
+      accessTokenByRepoSlug: tokenByRepo,
       prBaseBranch: prBase,
       prTitle,
       prBody,
