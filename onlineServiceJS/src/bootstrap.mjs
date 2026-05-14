@@ -472,6 +472,46 @@ function logTokenExchange(line) {
   console.log(`[onlineServiceJS] ${msg}`);
 }
 
+function bootstrapTimeoutSec() {
+  return Math.max(1, parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '15') || 15);
+}
+
+function tokenExchangeTimeoutSec() {
+  const raw = String(process.env.TASK_API_TOKEN_EXCHANGE_TIMEOUT_SEC || '').trim();
+  if (!raw) return bootstrapTimeoutSec();
+  return Math.max(1, parseFloat(raw) || 15);
+}
+
+function isAbortError(e) {
+  const name = String(e?.name || '').trim();
+  const msg = String(e?.message || e || '');
+  return name === 'AbortError' || /aborted/i.test(msg);
+}
+
+async function sleepMs(ms) {
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+async function postJsonWithAbortRetry(url, body, timeoutSec, tag) {
+  const maxAttempts = Math.max(1, parseInt(String(process.env.TASK_API_TOKEN_EXCHANGE_RETRIES || '2'), 10) || 2);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (attempt > 1) {
+        logTokenExchange(`${tag}: retry attempt=${attempt}/${maxAttempts} timeout_sec=${timeoutSec}`);
+      }
+      return await postJson(url, body, timeoutSec);
+    } catch (e) {
+      lastErr = e;
+      if (!isAbortError(e) || attempt >= maxAttempts) {
+        throw e;
+      }
+      await sleepMs(600 * attempt);
+    }
+  }
+  throw lastErr || new Error(`${tag}: request failed`);
+}
+
 /**
  * HTTP 监听前：解析 TaskApi 前缀并完成换票（若需要）。
  * 任务详情拉取、仓库克隆、service_config.yaml 写入在 {@link runBootstrapAfterListen}。
@@ -496,7 +536,8 @@ export async function runBootstrapTokenExchangeOnly() {
     return { skipped: true };
   }
 
-  const timeout = Math.max(1, parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '5') || 5);
+  const timeout = bootstrapTimeoutSec();
+  const tokenTimeout = tokenExchangeTimeoutSec();
   let business;
   try {
     business = businessApiEndpoint();
@@ -514,26 +555,28 @@ export async function runBootstrapTokenExchangeOnly() {
   }
 
   logTokenExchange(
-    `begin prefix=${prefix} timeout_sec=${timeout} business_api_endpoint=${business} initial_access_token ${summarizeSecret(newAccess)}`,
+    `begin prefix=${prefix} timeout_sec=${timeout} token_timeout_sec=${tokenTimeout} business_api_endpoint=${business} initial_access_token ${summarizeSecret(newAccess)}`,
   );
 
   if (!skipContainerTokenExchangeByEnv()) {
     try {
       logTokenExchange(`POST ${prefix}/server-container-token/exchange-refresh/`);
-      const ex = await postJson(
+      const ex = await postJsonWithAbortRetry(
         `${prefix}/server-container-token/exchange-refresh/`,
         { access_token: newAccess, business_api_endpoint: business },
-        timeout
+        tokenTimeout,
+        'exchange-refresh'
       );
       const refreshToken = ex.refresh_token;
       if (!refreshToken) throw new Error('exchange-refresh missing refresh_token');
       logTokenExchange(`exchange-refresh OK refresh_token ${summarizeSecret(refreshToken)}`);
 
       logTokenExchange(`POST ${prefix}/server-container-token/refresh-access/`);
-      const ref = await postJson(
+      const ref = await postJsonWithAbortRetry(
         `${prefix}/server-container-token/refresh-access/`,
         { refresh_token: refreshToken },
-        timeout
+        tokenTimeout,
+        'refresh-access'
       );
       const at = ref.access_token;
       if (!at || typeof at !== 'string') throw new Error('refresh-access missing access_token');
