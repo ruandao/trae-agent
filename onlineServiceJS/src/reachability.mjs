@@ -4,7 +4,7 @@
 import os from 'os';
 
 import { appendOutboundReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
-import { postJson, taskApiPrefix } from './saasTaskCloud.mjs';
+import { postJson, rewriteDockerInternal, taskApiPrefix } from './saasTaskCloud.mjs';
 
 /** IPv6 等非 IPv4 文本在 URL authority 中需方括号 */
 function authorityHost(ip) {
@@ -22,6 +22,51 @@ function buildHttpUrl(ip, port, pathname = '') {
   let suffix = pathname || '';
   if (suffix && !suffix.startsWith('/')) suffix = `/${suffix}`;
   return `http://${h}:${p}${suffix}`;
+}
+
+function normalizeUrlNoTrailingSlash(raw) {
+  const u = new URL(raw);
+  return u.href.replace(/\/$/, '');
+}
+
+function envBusinessApiEndpointRaw() {
+  return String(process.env.BusinessApiEndPoint || process.env.BUSINESS_API_ENDPOINT || '').trim();
+}
+
+/**
+ * 优先沿用换票阶段使用的 BUSINESS_API_ENDPOINT，避免注册可达地址与换票地址源不一致。
+ * @returns {{ businessApiEndpoint: string, serverUrl: string, publicIp: string|null } | null}
+ */
+export function reachabilityFromBusinessEndpointEnv() {
+  const raw = envBusinessApiEndpointRaw();
+  if (!raw) return null;
+
+  let u;
+  try {
+    u = new URL(rewriteDockerInternal(raw));
+  } catch {
+    appendOutboundReqLog('reachability: ignore invalid BUSINESS_API_ENDPOINT/BusinessApiEndPoint');
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    appendOutboundReqLog(`reachability: ignore non-http business endpoint protocol=${u.protocol}`);
+    return null;
+  }
+  const businessApiEndpoint = normalizeUrlNoTrailingSlash(u.href);
+  const hostName = String(u.hostname || '').trim();
+  const ipLikeHost =
+    /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostName) || hostName.includes(':');
+  const publicIp = ipLikeHost ? hostName : null;
+
+  // business_api_endpoint 约定为 .../api；server_url 对应其上一级根（保留可能存在的前缀路径）。
+  let pathNoTrailing = String(u.pathname || '/').replace(/\/+$/, '');
+  if (!pathNoTrailing) pathNoTrailing = '/';
+  if (pathNoTrailing.toLowerCase().endsWith('/api')) {
+    pathNoTrailing = pathNoTrailing.slice(0, -4) || '/';
+  }
+  const serverUrl = normalizeUrlNoTrailingSlash(`${u.origin}${pathNoTrailing}`);
+
+  return { businessApiEndpoint, serverUrl, publicIp };
 }
 
 const _IPV4_RE = /\b(\d{1,3}(?:\.\d{1,3}){3})\b/;
@@ -145,20 +190,21 @@ export async function registerReachabilityAfterBootstrap(ctx) {
 
   const timeoutSec = Math.max(1, ctx.timeout || parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '5') || 5);
 
-  const pip = await resolveReachableIp();
+  const fromBusiness = reachabilityFromBusinessEndpointEnv();
+  const pip = fromBusiness ? fromBusiness.publicIp : await resolveReachableIp();
   const httpPort = hostMappedHttpPort();
   const vscodePort = hostMappedVscodePort();
 
-  const serverUrl = buildHttpUrl(pip, httpPort);
-  const biz = buildHttpUrl(pip, httpPort, '/api');
-  const vscodeUrl = vscodePort != null ? buildHttpUrl(pip, vscodePort, '/') : '';
+  const serverUrl = fromBusiness?.serverUrl || buildHttpUrl(pip, httpPort);
+  const biz = fromBusiness?.businessApiEndpoint || buildHttpUrl(pip, httpPort, '/api');
+  const vscodeUrl = vscodePort != null && pip ? buildHttpUrl(pip, vscodePort, '/') : '';
 
   const body = {
     access_token: token,
-    public_ip: pip,
     server_url: serverUrl,
     business_api_endpoint: biz,
   };
+  if (pip) body.public_ip = pip;
   if (vscodeUrl) body.container_vscode_url = vscodeUrl;
 
   await postJson(
@@ -166,9 +212,12 @@ export async function registerReachabilityAfterBootstrap(ctx) {
     body,
     timeoutSec
   );
+  const pipText = pip || '(none)';
   console.log(
-    `[onlineServiceJS] 已向 SaaS 注册可达地址 public_ip=${pip} server_url=${serverUrl}` +
+    `[onlineServiceJS] 已向 SaaS 注册可达地址 public_ip=${pipText} server_url=${serverUrl} business_api_endpoint=${biz}` +
       (vscodeUrl ? ` vscode=${vscodeUrl}` : '')
   );
-  appendOutboundReqLog(`reachability: registered public_ip=${pip} server_url=${serverUrl}`);
+  appendOutboundReqLog(
+    `reachability: registered public_ip=${pipText} server_url=${serverUrl} business_api_endpoint=${biz}`
+  );
 }

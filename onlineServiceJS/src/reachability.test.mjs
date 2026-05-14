@@ -1,0 +1,58 @@
+// @ts-check
+import { test } from 'node:test';
+import assert from 'node:assert';
+
+import { reachabilityFromBusinessEndpointEnv } from './reachability.mjs';
+
+const KEYS = [
+  'BusinessApiEndPoint',
+  'BUSINESS_API_ENDPOINT',
+  'DOCKER_GATEWAY_HOSTNAME',
+  'DOCKER_HOST_GATEWAY_IP',
+];
+
+function snapshotEnv(keys) {
+  const out = {};
+  for (const k of keys) out[k] = process.env[k];
+  return out;
+}
+
+function restoreEnv(saved) {
+  for (const k of Object.keys(saved)) {
+    const v = saved[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
+
+test('reachabilityFromBusinessEndpointEnv：域名 BUSINESS_API_ENDPOINT 直接用于注册', () => {
+  const saved = snapshotEnv(KEYS);
+  try {
+    process.env.BUSINESS_API_ENDPOINT = 'https://3009-47-86-27-42.ngrok-free.app/api';
+    delete process.env.BusinessApiEndPoint;
+    const got = reachabilityFromBusinessEndpointEnv();
+    assert.deepStrictEqual(got, {
+      businessApiEndpoint: 'https://3009-47-86-27-42.ngrok-free.app/api',
+      serverUrl: 'https://3009-47-86-27-42.ngrok-free.app',
+      publicIp: null,
+    });
+  } finally {
+    restoreEnv(saved);
+  }
+});
+
+test('reachabilityFromBusinessEndpointEnv：IP BUSINESS_API_ENDPOINT 可提取 public_ip', () => {
+  const saved = snapshotEnv(KEYS);
+  try {
+    process.env.BusinessApiEndPoint = 'http://203.0.113.8:8765/api';
+    delete process.env.BUSINESS_API_ENDPOINT;
+    const got = reachabilityFromBusinessEndpointEnv();
+    assert.deepStrictEqual(got, {
+      businessApiEndpoint: 'http://203.0.113.8:8765/api',
+      serverUrl: 'http://203.0.113.8:8765',
+      publicIp: '203.0.113.8',
+    });
+  } finally {
+    restoreEnv(saved);
+  }
+});
