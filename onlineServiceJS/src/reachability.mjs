@@ -166,6 +166,10 @@ function hostMappedVscodePort() {
 }
 
 /**
+ * 向 SaaS 注册 `server_url` / `business_api_endpoint`（register-reachability）。
+ * 由 `server.mjs` 在 HTTP listen 成功后尽快调用，早于 `runBootstrapAfterListen`（克隆与 YAML），
+ * 以便任务详情页拉层图与心跳不被长时间 git clone 阻塞。
+ *
  * @param {{ skipped?: boolean, prefix?: string, newAccess?: string, timeout?: number }} ctx
  */
 export async function registerReachabilityAfterBootstrap(ctx) {

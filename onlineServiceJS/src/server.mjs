@@ -1732,34 +1732,38 @@ async function main() {
       app.listen(port, host, async () => {
         console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);
         broadcast({ type: 'service_ready', port });
-        let afterListenOk = false;
+        // register-reachability（server_url）与 SaaS 心跳须在 HTTP 已监听后立即执行，不得被引导克隆/写 YAML 阻塞。
         try {
-          await runBootstrapAfterListen(bootstrapCtx);
-          afterListenOk = true;
+          await registerReachabilityAfterBootstrap(bootstrapCtx);
         } catch (e) {
-          console.error('[onlineServiceJS] bootstrap (post-listen) error:', e);
-          if (strict) process.exit(1);
+          console.error('[onlineServiceJS] reachability 失败（不会回退 127.0.0.1）:', e);
+          process.exit(1);
         }
-        if (afterListenOk) {
+        if (!bootstrapCtx.skipped && bootstrapCtx.prefix) {
+          startSaasContainerHeartbeatLoop();
+          console.log('[onlineServiceJS] 已启动 SaaS 容器心跳定时上报（server-container-token/heartbeat/）');
+        }
+        void (async () => {
           try {
-            await registerReachabilityAfterBootstrap(bootstrapCtx);
-          } catch (e) {
-            console.error('[onlineServiceJS] reachability 失败（不会回退 127.0.0.1）:', e);
-            process.exit(1);
-          }
-          if (!bootstrapCtx.skipped && bootstrapCtx.prefix) {
-            startSaasContainerHeartbeatLoop();
-            console.log('[onlineServiceJS] 已启动 SaaS 容器心跳定时上报（server-container-token/heartbeat/）');
-          }
-          try {
-            if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
-              registerBootstrapCloneJob(bootstrapCloneLayerId);
+            await runBootstrapAfterListen(bootstrapCtx);
+            try {
+              if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
+                registerBootstrapCloneJob(bootstrapCloneLayerId);
+              }
+            } catch (e) {
+              console.error('[onlineServiceJS] bootstrap clone job 注册错误:', e);
+              if (strict) process.exit(1);
+            }
+            try {
+              await mirrorLayerGraphToTaskCloudSSE();
+            } catch {
+              /* 推层图至任务云为辅助通道，失败不阻断服务 */
             }
           } catch (e) {
-            console.error('[onlineServiceJS] bootstrap clone job 注册错误:', e);
+            console.error('[onlineServiceJS] bootstrap (post-listen) error:', e);
             if (strict) process.exit(1);
           }
-        }
+        })();
         resolve();
       });
     } catch (e) {

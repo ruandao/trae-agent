@@ -20,7 +20,7 @@
 
 Dockerfile 基于 **ubuntu:24.04**（多阶段构建 Python venv；主软件源见 `onlineServiceJS/Dockerfile` 头部注释）。系统 Python 为 3.12，业务 venv 为 `/app/.venv`。构建参数 `ENABLE_CODE_SERVER=0` 可跳过 code-server 以缩短构建时间。
 
-容器换票、引导克隆等仍可使用：`TaskApiEndPoint`、`BusinessApiEndPoint`、`BUSINESS_API_ENDPOINT`、`tenantId`、`workspaceId`、`taskId`、`ACCESS_TOKEN`（与任务云约定一致；**完整协议**见 `task2app/Saas_project/skillList/machine_container.md`）。**`TaskApiEndPoint` 推荐**为 `…/api/tenant/…/workspace/…/task/…/cloud`；**容错**：`saasTaskCloud.mjs` 的 `taskApiPrefix()` 亦可从 pathname 解析 **`/tenant/…/task-detail/<task>/`**（浏览器任务详情页 URL）及 **`/api/…/task-detail/<task>`**，避免未设三环境变量时换票失败、`container_refresh_token` 不落库。**启动就绪日志**：标准输出含 **`[onlineServiceJS] server listening on http://0.0.0.0:<PORT>`**，供编排检测。
+容器换票、引导克隆等仍可使用：`TaskApiEndPoint`、`BusinessApiEndPoint`、`BUSINESS_API_ENDPOINT`、`tenantId`、`workspaceId`、`taskId`、`ACCESS_TOKEN`（与任务云约定一致；**完整协议**见 `task2app/Saas_project/skillList/machine_container.md`）。**`TaskApiEndPoint` 推荐**为 `…/api/tenant/…/workspace/…/task/…/cloud`；**容错**：`saasTaskCloud.mjs` 的 `taskApiPrefix()` 亦可从 pathname 解析 **`/tenant/…/task-detail/<task>/`**（浏览器任务详情页 URL）及 **`/api/…/task-detail/<task>`**，避免未设三环境变量时换票失败、`container_refresh_token` 不落库。**启动就绪日志**：标准输出含 **`[onlineServiceJS] server listening on http://0.0.0.0:<PORT>`**，供编排检测。监听成功后**先** `register-reachability`（写入 `server_url`）并启动 **SaaS 心跳**，再**异步**执行引导克隆与 `service_config.yaml` 写入，避免长时间 `git clone` 阻塞任务详情拉层图与心跳。
 
 运行时与任务行为还可通过环境变量调节（见 `src/jobsRuntime.mjs`、`src/bootstrap.mjs`）；克隆相关常见有 `GIT_CLONE_TIMEOUT_SEC` 等（以代码为准）。
 

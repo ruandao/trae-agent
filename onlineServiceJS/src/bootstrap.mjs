@@ -546,7 +546,8 @@ async function postJsonWithAbortRetry(url, body, timeoutSec, tag) {
 
 /**
  * HTTP 监听前：解析 TaskApi 前缀并完成换票（若需要）。
- * 任务详情拉取、仓库克隆、service_config.yaml 写入在 {@link runBootstrapAfterListen}。
+ * 任务详情拉取、仓库克隆、service_config.yaml 写入在 {@link runBootstrapAfterListen}（由 `server.mjs`
+ * 在 register-reachability 与 SaaS 心跳启动之后异步执行，避免克隆阻塞 `server_url` 与心跳）。
  */
 export async function runBootstrapTokenExchangeOnly() {
   bootstrapCloneLayerId = null;
