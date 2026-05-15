@@ -2,7 +2,7 @@
 /** taskApiPrefix：任务详情页形态 TaskApiEndPoint 须能解析，否则换票不执行。 */
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { taskApiPrefix } from './saasTaskCloud.mjs';
+import { isRetryableGitCloneFailure, taskApiPrefix } from './saasTaskCloud.mjs';
 
 function snapshotEnv(keys) {
   const out = {};
@@ -97,4 +97,17 @@ test('taskApiPrefix：/api/.../task-detail/{id}', () => {
   } finally {
     restoreEnv(saved);
   }
+});
+
+test('isRetryableGitCloneFailure: 识别 TLS/EOF 网络中断', () => {
+  const err = new Error(
+    'git exit 128: error: RPC failed; curl 56 GnuTLS recv error (-9): Error decoding the received TLS packet.\n' +
+      'fatal: early EOF\nfatal: fetch-pack: invalid index-pack output'
+  );
+  assert.strictEqual(isRetryableGitCloneFailure(err), true);
+});
+
+test('isRetryableGitCloneFailure: 不误判认证失败', () => {
+  const err = new Error('git exit 128: fatal: Authentication failed for https://example.com/repo.git');
+  assert.strictEqual(isRetryableGitCloneFailure(err), false);
 });

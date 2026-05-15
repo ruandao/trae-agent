@@ -348,6 +348,43 @@ export function normalizeGitProgressChunkForLog(s) {
   return String(s || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+const GIT_CLONE_RETRYABLE_PATTERNS = [
+  /RPC failed; curl \d+/i,
+  /GnuTLS recv error/i,
+  /SSL read: errno/i,
+  /OpenSSL SSL_read:/i,
+  /SSL_ERROR_SYSCALL/i,
+  /fatal: early EOF/i,
+  /unexpected disconnect while reading sideband packet/i,
+  /fetch-pack: invalid index-pack output/i,
+  /Connection (?:timed out|reset by peer)/i,
+  /Operation timed out/i,
+  /The remote end hung up unexpectedly/i,
+];
+
+/**
+ * git clone 失败时是否属于可恢复网络抖动：仅此类错误才建议重试。
+ * @param {unknown} errLike
+ * @returns {boolean}
+ */
+export function isRetryableGitCloneFailure(errLike) {
+  const msg = String(errLike instanceof Error ? errLike.message : errLike || '');
+  if (!msg) return false;
+  return GIT_CLONE_RETRYABLE_PATTERNS.some((re) => re.test(msg));
+}
+
+/**
+ * 克隆重试配置（用于 bootstrap/reclone）：默认最多 3 次（含首轮）。
+ * @returns {{ maxAttempts: number, backoffMs: number }}
+ */
+export function gitCloneRetryConfigFromEnv() {
+  const maxAttemptsRaw = parseInt(String(process.env.TRAE_GIT_CLONE_MAX_ATTEMPTS || '3'), 10);
+  const backoffRaw = parseInt(String(process.env.TRAE_GIT_CLONE_RETRY_BACKOFF_MS || '1200'), 10);
+  const maxAttempts = Number.isFinite(maxAttemptsRaw) ? Math.max(1, Math.min(6, maxAttemptsRaw)) : 3;
+  const backoffMs = Number.isFinite(backoffRaw) ? Math.max(200, Math.min(15000, backoffRaw)) : 1200;
+  return { maxAttempts, backoffMs };
+}
+
 export function runGitCloneWithProgress(args, env, cwd, onStderrProgress) {
   return new Promise((resolve, reject) => {
     const proc = spawn(gitCmd(), args, {

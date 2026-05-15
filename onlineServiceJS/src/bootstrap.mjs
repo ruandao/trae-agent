@@ -31,6 +31,8 @@ import {
   latestGitProgressPercent,
   parseGitCloneProgressPhases,
   normalizeGitProgressChunkForLog,
+  gitCloneRetryConfigFromEnv,
+  isRetryableGitCloneFailure,
   runGitCloneWithProgress,
 } from './saasTaskCloud.mjs';
 import { hostMappedHttpPort } from './reachability.mjs';
@@ -263,33 +265,63 @@ async function runOneBootstrapClone({
       const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${sshTimeout}`;
       gitEnv.GIT_SSH_COMMAND = ssh;
     }
-    let lastPosted = 0;
-    let lastPct = -1;
-    await runGitCloneWithProgress(args, gitEnv, undefined, (chunk, errAll) => {
-      if (chunk) {
+    const { maxAttempts, backoffMs } = gitCloneRetryConfigFromEnv();
+    let attempt = 1;
+    while (attempt <= maxAttempts) {
+      let lastPosted = 0;
+      let lastPct = -1;
+      try {
+        await runGitCloneWithProgress(args, gitEnv, undefined, (chunk, errAll) => {
+          if (chunk) {
+            const ent = bootstrapRepoLogState?.bufs.get(raw);
+            if (ent) ent.body += normalizeGitProgressChunkForLog(chunk);
+          }
+          const g = latestGitProgressPercent(errAll);
+          if (g < 0) return;
+          const now = Date.now();
+          if (g === lastPct && now - lastPosted < 2000) return;
+          if (now - lastPosted < 400 && g <= lastPct) return;
+          lastPct = g;
+          lastPosted = now;
+          const phases = parseGitCloneProgressPhases(errAll);
+          const seg = { phase: 'bootstrap', index: i + 1, total: n };
+          if (phases.recv != null) seg.recv_progress = phases.recv;
+          if (phases.unpack != null) seg.unpack_progress = phases.unpack;
+          void postCloneProgress(
+            cloudPrefix,
+            accessToken,
+            g,
+            `【项目克隆】(${i + 1}/${n}) ${path.basename(repoDir)} … ${g}%`,
+            raw,
+            seg
+          );
+        });
+        break;
+      } catch (err) {
+        const retryable = isRetryableGitCloneFailure(err);
+        if (!retryable || attempt >= maxAttempts) throw err;
+        const waitMs = backoffMs * attempt;
         const ent = bootstrapRepoLogState?.bufs.get(raw);
-        if (ent) ent.body += normalizeGitProgressChunkForLog(chunk);
+        if (ent) {
+          ent.body += `\n[bootstrap-clone] 网络抖动，准备第 ${attempt + 1}/${maxAttempts} 次重试（${waitMs}ms）...\n`;
+        }
+        await postCloneProgress(
+          cloudPrefix,
+          accessToken,
+          0,
+          `【项目克隆】(${i + 1}/${n}) 网络抖动，准备第 ${attempt + 1}/${maxAttempts} 次重试…`,
+          raw,
+          { phase: 'bootstrap', index: i + 1, total: n }
+        );
+        try {
+          fs.rmSync(repoDir, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        attempt += 1;
       }
-      const g = latestGitProgressPercent(errAll);
-      if (g < 0) return;
-      const now = Date.now();
-      if (g === lastPct && now - lastPosted < 2000) return;
-      if (now - lastPosted < 400 && g <= lastPct) return;
-      lastPct = g;
-      lastPosted = now;
-      const phases = parseGitCloneProgressPhases(errAll);
-      const seg = { phase: 'bootstrap', index: i + 1, total: n };
-      if (phases.recv != null) seg.recv_progress = phases.recv;
-      if (phases.unpack != null) seg.unpack_progress = phases.unpack;
-      void postCloneProgress(
-        cloudPrefix,
-        accessToken,
-        g,
-        `【项目克隆】(${i + 1}/${n}) ${path.basename(repoDir)} … ${g}%`,
-        raw,
-        seg
-      );
-    });
+    }
     await postCloneProgress(
       cloudPrefix,
       accessToken,

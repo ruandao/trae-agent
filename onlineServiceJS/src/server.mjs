@@ -31,6 +31,8 @@ import {
   latestGitProgressPercent,
   parseGitCloneProgressPhases,
   normalizeGitProgressChunkForLog,
+  gitCloneRetryConfigFromEnv,
+  isRetryableGitCloneFailure,
   runGitCloneWithProgress,
   startSaasContainerHeartbeatLoop,
 } from './saasTaskCloud.mjs';
@@ -701,30 +703,67 @@ api.post('/repos/reclone', async (req, res) => {
         } catch {
           /* ignore */
         }
-        let lastPosted = 0;
-        let lastPct = -1;
-        await runGitCloneWithProgress(gitArgs, env, target, (chunk, errAll) => {
-          if (chunk) {
+        const { maxAttempts, backoffMs } = gitCloneRetryConfigFromEnv();
+        let attempt = 1;
+        while (attempt <= maxAttempts) {
+          let lastPosted = 0;
+          let lastPct = -1;
+          try {
+            await runGitCloneWithProgress(gitArgs, env, target, (chunk, errAll) => {
+              if (chunk) {
+                try {
+                  appendCloneLayerLog(layerId, normalizeGitProgressChunkForLog(chunk));
+                } catch {
+                  /* ignore */
+                }
+              }
+              if (!prefix || !accessToken) return;
+              const g = latestGitProgressPercent(errAll);
+              if (g < 0) return;
+              const now = Date.now();
+              if (g === lastPct && now - lastPosted < 2000) return;
+              if (now - lastPosted < 400 && g <= lastPct) return;
+              lastPct = g;
+              lastPosted = now;
+              const phases = parseGitCloneProgressPhases(errAll);
+              const seg = { phase: 'reclone' };
+              if (phases.recv != null) seg.recv_progress = phases.recv;
+              if (phases.unpack != null) seg.unpack_progress = phases.unpack;
+              void postCloneProgress(prefix, accessToken, g, `【重新克隆】${name} … ${g}%`, repoUrl, seg);
+            });
+            break;
+          } catch (e) {
+            const retryable = isRetryableGitCloneFailure(e);
+            if (!retryable || attempt >= maxAttempts) throw e;
+            const waitMs = backoffMs * attempt;
             try {
-              appendCloneLayerLog(layerId, normalizeGitProgressChunkForLog(chunk));
+              appendCloneLayerLog(
+                layerId,
+                `\n[重新克隆] 网络抖动，准备第 ${attempt + 1}/${maxAttempts} 次重试（${waitMs}ms）\n`
+              );
             } catch {
               /* ignore */
             }
+            if (prefix && accessToken) {
+              await postCloneProgress(
+                prefix,
+                accessToken,
+                0,
+                `【重新克隆】网络抖动，准备第 ${attempt + 1}/${maxAttempts} 次重试…`,
+                repoUrl,
+                { phase: 'reclone' }
+              );
+            }
+            try {
+              fs.rmSync(target, { recursive: true, force: true });
+              fs.mkdirSync(target, { recursive: true });
+            } catch {
+              /* ignore */
+            }
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
+            attempt += 1;
           }
-          if (!prefix || !accessToken) return;
-          const g = latestGitProgressPercent(errAll);
-          if (g < 0) return;
-          const now = Date.now();
-          if (g === lastPct && now - lastPosted < 2000) return;
-          if (now - lastPosted < 400 && g <= lastPct) return;
-          lastPct = g;
-          lastPosted = now;
-          const phases = parseGitCloneProgressPhases(errAll);
-          const seg = { phase: 'reclone' };
-          if (phases.recv != null) seg.recv_progress = phases.recv;
-          if (phases.unpack != null) seg.unpack_progress = phases.unpack;
-          void postCloneProgress(prefix, accessToken, g, `【重新克隆】${name} … ${g}%`, repoUrl, seg);
-        });
+        }
         try {
           const metaPath = path.join(layerPath(layerId), 'layer_meta.json');
           const existingMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
