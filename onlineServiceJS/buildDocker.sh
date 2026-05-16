@@ -30,6 +30,9 @@
 #   DOCKER_PLATFORMS    逗号分隔，默认 linux/amd64,linux/arm64（arch_timestamp 下逐项构建推送）。
 #   DOCKER_BUILDX_BUILDER  可选，传给 docker buildx build --builder。
 #   DOCKER_PUSH         设为 1 / true 时推送（可与 --push 二选一）。
+#   DOCKER_PUSH_PROGRESS  推送（含 --push）时在 stderr 底部单行刷新：阶段、百分比（来自 plain 日志里的 X/Y）、已用时与预计剩余时间。
+#                         默认 1；设为 0 / false / off 关闭。需 python3；关闭后恢复不经管道、由 Docker 自带进度显示。
+#                         启用时为保留完整构建日志会注入 --progress=plain；无 X/Y 行时剩余时间为基于阶段耗时的粗估并随时间更新。
 #   ENABLE_CODE_SERVER / NODE_VERSION / CODE_SERVER_VERSION  传给 Dockerfile。
 #   启用 code-server 时，构建前会自动下载 tarball 至 onlineServiceJS/docker/code-server/（亦见 docker/fetch-code-server-bundles.sh）。
 #   NPM_REGISTRY  可选，传给 Dockerfile（例：https://registry.npmmirror.com），减轻 npm ci 时 ECONNRESET。
@@ -294,6 +297,179 @@ if [[ -n "${DOCKER_BUILDX_BUILDER:-}" ]]; then
   BX+=( --builder "${DOCKER_BUILDX_BUILDER}" )
 fi
 
+# 推送/导出阶段：使用 --progress=plain 保留完整日志；由 python 解析 X/Y 传输与阶段，在 stderr 单行刷新进度与 ETA。
+docker_buildx_push_with_progress() {
+  local pp="${DOCKER_PUSH_PROGRESS:-1}"
+  if [[ "$pp" == "0" || "$pp" == "false" || "$pp" == "FALSE" || "$pp" == "off" ]]; then
+    "$@"
+    return $?
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[buildDocker.sh] 警告: 未找到 python3，跳过推送进度行（可安装 python3 或设 DOCKER_PUSH_PROGRESS=0）" >&2
+    "$@"
+    return $?
+  fi
+  local -a injected=()
+  local seen_build=0
+  local arg
+  for arg in "$@"; do
+    injected+=( "$arg" )
+    if [[ "$seen_build" -eq 0 && "$arg" == "build" ]]; then
+      injected+=( --progress=plain )
+      seen_build=1
+    fi
+  done
+  if [[ "$seen_build" -eq 0 ]]; then
+    echo "[buildDocker.sh] 内部错误: 未在参数中找到 build，无法注入 --progress=plain" >&2
+    "$@"
+    return $?
+  fi
+  "${injected[@]}" 2>&1 | python3 -u <<'PYCODE'
+import re, select, sys, time
+
+_FRAC = re.compile(
+    r"([\d.]+)\s*([KMGTPk]?[bB]|[KMGTP]B)\s*/\s*([\d.]+)\s*([KMGTPk]?[bB]|[KMGTP]B)"
+)
+
+
+def fmt_sec(sec):
+    if sec is None or sec < 0:
+        return "--"
+    sec = int(sec + 0.5)
+    if sec >= 3600:
+        return "%dh%02dm" % (sec // 3600, (sec % 3600) // 60)
+    if sec >= 60:
+        return "%dm%02ds" % (sec // 60, sec % 60)
+    return "%ds" % sec
+
+
+def to_bytes(val, unit):
+    u = unit.replace("kB", "KB").replace("mB", "MB").upper()
+    mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+    return float(val) * mult.get(u, 1024**2)
+
+
+def main():
+    start = time.monotonic()
+    phase = {"t_export": None, "t_push": None, "name": "构建"}
+    last_cur = last_tot = 0.0
+    samples = []
+    last_draw = 0.0
+
+    def note_phase(line):
+        low = line.lower()
+        if "pushing layer" in low or "pushing layers" in low or "pushing manifest" in low:
+            phase["name"] = "推送"
+            if phase["t_push"] is None:
+                phase["t_push"] = time.monotonic()
+            return
+        if "exporting to image" in low or "exporting layers" in low:
+            phase["name"] = "导出镜像"
+            if phase["t_export"] is None:
+                phase["t_export"] = time.monotonic()
+            return
+        if "transferring context" in low or "resolve " in low:
+            phase["name"] = "解析/上下文"
+            return
+        if "load build definition" in low or "load .dockerignore" in low:
+            phase["name"] = "加载定义"
+            return
+
+    def ingest_line(line, now):
+        nonlocal last_cur, last_tot
+        note_phase(line)
+        m = _FRAC.search(line)
+        if not m:
+            return
+        try:
+            c = to_bytes(m.group(1), m.group(2))
+            t = to_bytes(m.group(3), m.group(4))
+        except (ValueError, TypeError):
+            return
+        if t <= 0:
+            return
+        cur_b = min(c, t)
+        if last_tot > 0 and abs(t - last_tot) / max(last_tot, 1) > 0.02:
+            samples.clear()
+        last_cur, last_tot = cur_b, t
+        samples.append((now, cur_b))
+        while len(samples) > 16:
+            samples.pop(0)
+
+    def draw(now, force=False):
+        nonlocal last_draw
+        if not force and now - last_draw < 0.2:
+            return
+        last_draw = now
+        elapsed = now - start
+        export_t, push_t = phase["t_export"], phase["t_push"]
+        pname = phase["name"]
+
+        pct_s = pname
+        eta = None
+        if last_tot > 0:
+            pct = min(100.0, 100.0 * last_cur / last_tot)
+            pct_s = "%s %.1f%%" % (pname, pct)
+            if last_cur < last_tot and len(samples) >= 2:
+                t0, c0 = samples[-2]
+                t1, c1 = samples[-1]
+                dt, dc = t1 - t0, c1 - c0
+                if dt > 0.08 and dc > 0:
+                    rate = dc / dt
+                    if rate > 0:
+                        eta = (last_tot - last_cur) / rate
+
+        if eta is None and (push_t is not None or export_t is not None or pname in ("推送", "导出镜像")):
+            phase_anchor = push_t or export_t or start
+            ep = now - phase_anchor
+            if ep >= 2:
+                eta = max(15.0, ep * 1.5)
+
+        line = (
+            "[buildDocker.sh] 进度 %s | 已用时 %s | 预计剩余 %s"
+            % (pct_s, fmt_sec(elapsed), fmt_sec(eta))
+        )
+        sys.stderr.write("\r\033[2K" + line)
+        sys.stderr.flush()
+
+    try:
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.8)
+            now = time.monotonic()
+            if not r:
+                draw(now)
+                continue
+            raw = sys.stdin.readline()
+            if raw == "":
+                break
+            sys.stdout.write(raw)
+            sys.stdout.flush()
+            ingest_line(raw, now)
+            draw(now)
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        raise
+    now = time.monotonic()
+    draw(now, force=True)
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)
+PYCODE
+  local dock="${PIPESTATUS[0]}"
+  local py="${PIPESTATUS[1]}"
+  if [[ "$py" -ne 0 ]]; then
+    return "$py"
+  fi
+  return "$dock"
+}
+
 if [[ "$DO_PUSH" -eq 1 ]]; then
   assert_required_push_platforms "$PLATFORMS" "$REQUIRED_PUSH_PLATFORMS"
 
@@ -304,7 +480,7 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
     echo "[buildDocker.sh] Dockerfile: $SCRIPT_DIR/Dockerfile" >&2
     echo "[buildDocker.sh] 推送引用（仅此标签）: $PUSH_REF" >&2
     echo "[buildDocker.sh] 平台（单条清单）: $PLATFORMS" >&2
-    "${BX[@]}" -t "$PUSH_REF" "${BUILD_ARGS[@]}" --platform "$PLATFORMS" --push "$REPO_ROOT"
+    docker_buildx_push_with_progress "${BX[@]}" -t "$PUSH_REF" "${BUILD_ARGS[@]}" --platform "$PLATFORMS" --push "$REPO_ROOT"
     echo "[buildDocker.sh] 已推送: $PUSH_REF" >&2
     exit 0
   fi
@@ -342,7 +518,7 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
       fi
       ref_latest="${base}:${slug}-latest"
       printf '[buildDocker.sh] 构建并推送: %s 与 %s （平台 %s）\n' "${ref_ts}" "${ref_latest}" "${plat}" >&2
-      "${BX[@]}" -t "$ref_ts" -t "$ref_latest" "${BUILD_ARGS[@]}" --platform "${plat}" --push "$REPO_ROOT"
+      docker_buildx_push_with_progress "${BX[@]}" -t "$ref_ts" -t "$ref_latest" "${BUILD_ARGS[@]}" --platform "${plat}" --push "$REPO_ROOT"
     done
     IFS=$_oifs
     if [[ "$USE_GIT_TAG_AS_DOCKER_TAG" == "1" ]]; then
@@ -360,7 +536,7 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
   echo "[buildDocker.sh] 推送引用（literal / 单清单）: $PUSH_REF" >&2
   [[ "$PUSH_REF" != "$IMAGE" ]] && echo "[buildDocker.sh] 说明: DOCKER_IMAGE=$IMAGE 未标记到本次构建，避免误推 docker.io/library/*" >&2
   echo "[buildDocker.sh] 平台: $PLATFORMS" >&2
-  "${BX[@]}" -t "$PUSH_REF" "${BUILD_ARGS[@]}" --platform "$PLATFORMS" --push "$REPO_ROOT"
+  docker_buildx_push_with_progress "${BX[@]}" -t "$PUSH_REF" "${BUILD_ARGS[@]}" --platform "$PLATFORMS" --push "$REPO_ROOT"
   echo "[buildDocker.sh] 已推送多架构清单: $PUSH_REF" >&2
   exit 0
 fi
