@@ -34,6 +34,20 @@ function envBusinessApiEndpointRaw() {
 }
 
 /**
+ * 与 `bootstrap.mjs` 中换票用 `normalizeBusinessApiEndpointUrl` 对齐：编排常见
+ * `http://<ip>/api` 无显式端口时，WHATWG URL 的 origin 会落在默认 80/443，与容器实际
+ * `PORT` / `TRAE_HOST_HTTP_PORT`（默认 8765）不一致，导致 register-reachability 写入 DB 缺端口。
+ */
+function applyHostMappedPortIfIpLikeHost(u) {
+  const host = String(u.hostname || '').trim();
+  const looksLikeIp =
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host === 'localhost';
+  if (!u.port && looksLikeIp) {
+    u.port = String(hostMappedHttpPort());
+  }
+}
+
+/**
  * 优先沿用换票阶段使用的 BUSINESS_API_ENDPOINT，避免注册可达地址与换票地址源不一致。
  * @returns {{ businessApiEndpoint: string, serverUrl: string, publicIp: string|null } | null}
  */
@@ -52,6 +66,7 @@ export function reachabilityFromBusinessEndpointEnv() {
     appendOutboundReqLog(`reachability: ignore non-http business endpoint protocol=${u.protocol}`);
     return null;
   }
+  applyHostMappedPortIfIpLikeHost(u);
   const businessApiEndpoint = normalizeUrlNoTrailingSlash(u.href);
   const hostName = String(u.hostname || '').trim();
   const ipLikeHost =

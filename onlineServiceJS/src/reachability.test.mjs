@@ -9,6 +9,8 @@ const KEYS = [
   'BUSINESS_API_ENDPOINT',
   'DOCKER_GATEWAY_HOSTNAME',
   'DOCKER_HOST_GATEWAY_IP',
+  'PORT',
+  'TRAE_HOST_HTTP_PORT',
 ];
 
 function snapshotEnv(keys) {
@@ -51,6 +53,24 @@ test('reachabilityFromBusinessEndpointEnv：IP BUSINESS_API_ENDPOINT 可提取 p
       businessApiEndpoint: 'http://203.0.113.8:8765/api',
       serverUrl: 'http://203.0.113.8:8765',
       publicIp: '203.0.113.8',
+    });
+  } finally {
+    restoreEnv(saved);
+  }
+});
+
+test('reachabilityFromBusinessEndpointEnv：IP 无显式端口时补 hostMappedHttpPort（与换票规范化一致）', () => {
+  const saved = snapshotEnv(KEYS);
+  try {
+    delete process.env.TRAE_HOST_HTTP_PORT;
+    process.env.PORT = '37521';
+    process.env.BUSINESS_API_ENDPOINT = 'http://203.0.113.9/api';
+    delete process.env.BusinessApiEndPoint;
+    const got = reachabilityFromBusinessEndpointEnv();
+    assert.deepStrictEqual(got, {
+      businessApiEndpoint: 'http://203.0.113.9:37521/api',
+      serverUrl: 'http://203.0.113.9:37521',
+      publicIp: '203.0.113.9',
     });
   } finally {
     restoreEnv(saved);
