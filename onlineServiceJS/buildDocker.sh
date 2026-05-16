@@ -324,7 +324,11 @@ docker_buildx_push_with_progress() {
     "$@"
     return $?
   fi
-  "${injected[@]}" 2>&1 | python3 -u <<'PYCODE'
+  # 不可使用 `docker … | python3 <<'PY'`：heredoc 会占用 python 的 stdin，管道无人读，docker 很快 SIGPIPE/失败。
+  local progress_py=""
+  progress_py="$(mktemp "${TMPDIR:-/tmp}/buildDocker-progress.XXXXXX")" || return 1
+  # 不用 trap RETURN：macOS /bin/bash 3.2 不支持 RETURN。
+  cat >"$progress_py" <<'PYCODE'
 import re, select, sys, time
 
 _FRAC = re.compile(
@@ -462,8 +466,11 @@ if __name__ == "__main__":
     except BrokenPipeError:
         sys.exit(0)
 PYCODE
-  local dock="${PIPESTATUS[0]}"
-  local py="${PIPESTATUS[1]}"
+  "${injected[@]}" 2>&1 | python3 -u "$progress_py"
+  # 须在一条 local 里同时读 PIPESTATUS：第一个 local 执行后会覆盖 PIPESTATUS，set -u 下再读 [1] 会报错。
+  local dock="${PIPESTATUS[0]}" py="${PIPESTATUS[1]}"
+  rm -f "$progress_py"
+  progress_py=""
   if [[ "$py" -ne 0 ]]; then
     return "$py"
   fi
