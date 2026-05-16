@@ -2,7 +2,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import http from 'http';
-import { postContainerHeartbeatToSaas } from './saasTaskCloud.mjs';
+import {
+  postContainerHeartbeatToSaas,
+  resetContainerHeartbeatSeqState,
+} from './saasTaskCloud.mjs';
 
 function snapshotEnv(keys) {
   const out = {};
@@ -35,7 +38,15 @@ test('postContainerHeartbeatToSaas：POST .../heartbeat/ 且 body 含 access_tok
     req.on('end', () => {
       received = Buffer.concat(chunks).toString('utf8');
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', task_id: 't1' }));
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          task_id: 't1',
+          seq: 1,
+          ack: 1,
+          bidirectional_ok: true,
+        }),
+      );
     });
   });
   await new Promise((resolve, reject) => {
@@ -45,6 +56,7 @@ test('postContainerHeartbeatToSaas：POST .../heartbeat/ 且 body 含 access_tok
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : 0;
   try {
+    resetContainerHeartbeatSeqState();
     delete process.env.tenantId;
     delete process.env.workspaceId;
     delete process.env.taskId;
@@ -56,6 +68,8 @@ test('postContainerHeartbeatToSaas：POST .../heartbeat/ 且 body 含 access_tok
     const body = JSON.parse(received);
     assert.strictEqual(body.access_token, 'hb-test-token');
     assert.strictEqual(body.message, 'ping-msg');
+    assert.strictEqual(typeof body.seq, 'number');
+    assert.ok(body.seq >= 1);
   } finally {
     restoreEnv(saved);
     await new Promise((resolve) => server.close(() => resolve(undefined)));

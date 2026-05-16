@@ -336,6 +336,16 @@ api.get('/requirements/task-gate', (req, res) => {
   res.json({ clone_done: anyLayerHasGitRepo() });
 });
 
+/** SaaS 下行心跳探测：GET ?seq=N，回显 ack=N（类 TCP ack，供 server-container-token/heartbeat/ 校验双向可达） */
+api.get('/saas-heartbeat-probe', (req, res) => {
+  const raw = req.query?.seq;
+  const seq = typeof raw === 'string' ? parseInt(raw, 10) : Number(raw);
+  if (!Number.isFinite(seq) || seq < 0) {
+    return res.status(400).json({ detail: 'seq 须为非负整数' });
+  }
+  res.json({ status: 'ok', ack: seq });
+});
+
 /** Agent 步骤字段 → 富文本呈现策略（表驱动）；前端 GET 后按 step_rows / tool_expansion / tail_rows 渲染 */
 api.get('/ui/agent-render-hints', (req, res) => {
   res.json(getAgentRenderHints());

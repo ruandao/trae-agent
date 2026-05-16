@@ -228,6 +228,15 @@ export async function postCloneProgress(cloudPrefix, accessToken, progress, mess
  * @param {string} [message]
  * @returns {Promise<boolean>} 是否上报成功（失败静默，供定时循环使用）
  */
+let containerHeartbeatSeq = 0;
+let lastSaasHeartbeatSeq = 0;
+
+/** 测试或重启后重置 seq/ack 状态 */
+export function resetContainerHeartbeatSeqState() {
+  containerHeartbeatSeq = 0;
+  lastSaasHeartbeatSeq = 0;
+}
+
 export async function postContainerHeartbeatToSaas(message) {
   let cloudPrefix;
   try {
@@ -238,12 +247,20 @@ export async function postContainerHeartbeatToSaas(message) {
   const accessToken = String(process.env.ACCESS_TOKEN || '').trim();
   if (!cloudPrefix || !accessToken) return false;
   const url = `${cloudPrefix.replace(/\/$/, '')}/server-container-token/heartbeat/`;
-  const body = { access_token: accessToken };
+  containerHeartbeatSeq += 1;
+  const body = { access_token: accessToken, seq: containerHeartbeatSeq };
+  if (lastSaasHeartbeatSeq > 0) {
+    body.ack = lastSaasHeartbeatSeq;
+  }
   const msg = typeof message === 'string' ? message.trim() : '';
   if (msg) body.message = msg.slice(0, 500);
   try {
-    await postJson(url, body, 10, { reqLogFile: HEARTBEAT_REQ_LOG_FILE });
-    return true;
+    const data = await postJson(url, body, 10, { reqLogFile: HEARTBEAT_REQ_LOG_FILE });
+    const saasSeq = data?.seq;
+    if (typeof saasSeq === 'number' && Number.isFinite(saasSeq) && saasSeq >= 0) {
+      lastSaasHeartbeatSeq = saasSeq;
+    }
+    return Boolean(data?.bidirectional_ok ?? data?.status === 'ok');
   } catch {
     return false;
   }
