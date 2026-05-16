@@ -48,6 +48,26 @@ function applyHostMappedPortIfIpLikeHost(u) {
 }
 
 /**
+ * Docker ``-p <host>:8765`` 时 env 常仍写 ``:8765``，而 ``TRAE_HOST_HTTP_PORT`` 为宿主机映射口；
+ * 与 IP 无端口补全同理，避免 register-reachability 写入错误 server_url（SaaS 拉层图 502）。
+ * 不改动 ngrok/HTTPS 等非 8765 的显式端口。
+ */
+function applyHostMappedPortWhenBusinessEndpointUsesContainerDefault(u) {
+  if (!String(process.env.TRAE_HOST_HTTP_PORT || '').trim()) return;
+  const mapped = hostMappedHttpPort();
+  const containerDefault = parseInt(process.env.PORT || '8765', 10) || 8765;
+  const endpointPort = u.port
+    ? parseInt(u.port, 10)
+    : u.protocol === 'https:'
+      ? 443
+      : 80;
+  if (!Number.isFinite(endpointPort) || endpointPort !== containerDefault || mapped === endpointPort) {
+    return;
+  }
+  u.port = String(mapped);
+}
+
+/**
  * 优先沿用换票阶段使用的 BUSINESS_API_ENDPOINT，避免注册可达地址与换票地址源不一致。
  * @returns {{ businessApiEndpoint: string, serverUrl: string, publicIp: string|null } | null}
  */
@@ -67,6 +87,7 @@ export function reachabilityFromBusinessEndpointEnv() {
     return null;
   }
   applyHostMappedPortIfIpLikeHost(u);
+  applyHostMappedPortWhenBusinessEndpointUsesContainerDefault(u);
   const businessApiEndpoint = normalizeUrlNoTrailingSlash(u.href);
   const hostName = String(u.hostname || '').trim();
   const ipLikeHost =

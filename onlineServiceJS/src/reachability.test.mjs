@@ -76,3 +76,21 @@ test('reachabilityFromBusinessEndpointEnv：IP 无显式端口时补 hostMappedH
     restoreEnv(saved);
   }
 });
+
+test('reachabilityFromBusinessEndpointEnv：域名仍写 :8765 且 TRAE_HOST_HTTP_PORT 为映射口时改用映射口', () => {
+  const saved = snapshotEnv(KEYS);
+  try {
+    process.env.TRAE_HOST_HTTP_PORT = '49152';
+    process.env.PORT = '8765';
+    process.env.BUSINESS_API_ENDPOINT = 'http://debug.aidevpm.com:8765/api';
+    delete process.env.BusinessApiEndPoint;
+    const got = reachabilityFromBusinessEndpointEnv();
+    assert.deepStrictEqual(got, {
+      businessApiEndpoint: 'http://debug.aidevpm.com:49152/api',
+      serverUrl: 'http://debug.aidevpm.com:49152',
+      publicIp: null,
+    });
+  } finally {
+    restoreEnv(saved);
+  }
+});
