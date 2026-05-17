@@ -396,6 +396,40 @@ export function removeLayerQueue(layerId) {
   saveState();
 }
 
+/** 终止并移除绑定到该层的任务记录（删层前调用，避免快照仍含已删层任务）。 */
+function stripJobsForLayer(layerId) {
+  const lid = String(layerId || '').trim();
+  if (!lid) return;
+  for (const [jid, j] of [...jobs]) {
+    if (String(j.layer_id || '').trim() !== lid) continue;
+    try {
+      if (j.status === 'running' || j.status === 'pending') interruptJob(jid);
+    } catch {
+      /* 已结束或不存在 */
+    }
+    jobs.delete(jid);
+  }
+}
+
+/**
+ * 删除可写层（含直接子层）并将层级快照上报至任务云 SSE（``container_layer_graph``）。
+ * 供 ``DELETE /api/layers/:layer_id`` 与容器内 Web UI 删除按钮使用。
+ */
+export async function deleteLayerAndMirrorToSaas(layerId) {
+  const lid = String(layerId || '').trim();
+  if (!lid) throw new Error('layer_id required');
+  for (const cid of directChildLayerIds(lid)) {
+    stripJobsForLayer(cid);
+    removeLayerQueue(cid);
+    deleteLayerTree(cid);
+  }
+  stripJobsForLayer(lid);
+  removeLayerQueue(lid);
+  deleteLayerTree(lid);
+  saveState();
+  await mirrorLayerGraphToTaskCloudSSE();
+}
+
 export function enqueueLayerQueueItem(layerId, body) {
   const lid = String(layerId || '').trim();
   if (!lid) throw new Error('layer_id 无效');

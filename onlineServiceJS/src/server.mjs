@@ -53,7 +53,6 @@ import {
   resolveLayerGitLogContext,
   resolveAbsolutePathForLayerListedFile,
   deleteLayerTree,
-  directChildLayerIds,
   repoDirNameFromUrl,
   writeLayerMeta,
   readLayerMeta,
@@ -74,7 +73,7 @@ import {
   mirrorLayerGraphToTaskCloudSSE,
   sweepDanglingLayerDirs,
   enqueueLayerQueueItem,
-  removeLayerQueue,
+  deleteLayerAndMirrorToSaas,
   getJobEvents,
 } from './jobsRuntime.mjs';
 import { getJobStepsForLayer } from './jobSteps.mjs';
@@ -82,7 +81,8 @@ import { getLayerParentDiffFiles, getLayerParentUnifiedDiff } from './layerParen
 import { gitCmd, gitCloneConfigArgs, formatGitExecDebugLine } from './gitCmd.mjs';
 import { suggestStagedCommitMessage } from './stagedCommitSuggest.mjs';
 import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
-import { gitSshFromHttps, gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
+import { runLayerOauthRefreshPush } from './layerGitOauthRefreshPush.mjs';
+import { gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -95,17 +95,6 @@ function traceMiddleware(req, res, next) {
 
 function cryptoRandomId() {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-}
-
-/** 避免 UI/localStorage 里残留非 PEM 文本时仍走 SSH，把公开 HTTPS 误转为 git@ 导致克隆失败 */
-function looksLikePemPrivateKey(raw) {
-  const s = String(raw || '').trim();
-  if (s.length < 40) return false;
-  return /-----BEGIN[^-]+PRIVATE KEY-----/.test(s) && /-----END[^-]+KEY-----/.test(s);
-}
-
-function gitSshCommandFromIdentityFile(resolvedPath) {
-  return `ssh -i ${resolvedPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
 }
 
 function useGitCloneForceIpv4() {
@@ -549,25 +538,6 @@ api.post('/repos/clone', (req, res) => {
   const url = String(req.body?.url || '').trim();
   if (!url) return res.status(400).json({ detail: 'url required' });
   const parent_layer_id = req.body?.parent_layer_id ? String(req.body.parent_layer_id).trim() : '';
-  const pemRaw = String(req.body?.ephemeral_ssh_private_key ?? '');
-  const usePem = looksLikePemPrivateKey(pemRaw);
-  const pem = usePem ? pemRaw.trim() : '';
-
-  const sshIdentityIn = req.body?.ssh_identity_file ? String(req.body.ssh_identity_file).trim() : '';
-  let sshIdentityResolved = null;
-  if (sshIdentityIn) {
-    sshIdentityResolved = path.resolve(sshIdentityIn);
-    try {
-      if (!fs.existsSync(sshIdentityResolved) || !fs.statSync(sshIdentityResolved).isFile()) {
-        return res.status(400).json({
-          detail: `ssh_identity_file 不存在或不是文件: ${sshIdentityIn}`,
-        });
-      }
-    } catch (e) {
-      return res.status(400).json({ detail: `ssh_identity_file: ${e.message || e}` });
-    }
-  }
-
   const branch = req.body?.branch ? String(req.body.branch).trim() : '';
   let depth = null;
   if (req.body?.depth != null && req.body?.depth !== '') {
@@ -580,7 +550,6 @@ api.post('/repos/clone', (req, res) => {
 
   const lid = newLayerId();
   const root = layerPath(lid);
-  let ephemeralKeyDir = null;
   try {
     // 在克隆开始前先创建层级节点，建立可写层
     writeLayerMeta(lid, 'clone', parent_layer_id || null);
@@ -589,23 +558,8 @@ api.post('/repos/clone', (req, res) => {
     fs.mkdirSync(cloneCwd, { recursive: true });
     clearCloneLayerLog(lid);
 
-    let cloneUrl = url;
+    const cloneUrl = url;
     const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-    if (usePem) {
-      cloneUrl = url.toLowerCase().startsWith('https://') ? gitSshFromHttps(url) : url;
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ui_clone_'));
-      ephemeralKeyDir = dir;
-      const keyPath = path.join(dir, 'k');
-      let c = pem;
-      if (!c.endsWith('\n')) c += '\n';
-      fs.writeFileSync(keyPath, c, { mode: 0o600 });
-      env.GIT_SSH_COMMAND = gitSshCommandFromIdentityFile(keyPath);
-    } else if (sshIdentityResolved) {
-      cloneUrl = url.toLowerCase().startsWith('https://') ? gitSshFromHttps(url) : url;
-      env.GIT_SSH_COMMAND = gitSshCommandFromIdentityFile(sshIdentityResolved);
-    } else {
-      cloneUrl = url;
-    }
 
     const gitArgs = buildGitCloneArgs(cloneUrl, { branch, depth });
     const queuePosition = enqueueClone({
@@ -615,7 +569,7 @@ api.post('/repos/clone', (req, res) => {
       parentLayerId: parent_layer_id || null,
       gitArgs,
       env,
-      ephemeralKeyDir,
+      ephemeralKeyDir: null,
       titleUrl: url,
     });
 
@@ -632,13 +586,6 @@ api.post('/repos/clone', (req, res) => {
     } catch {
       /* ignore */
     }
-    if (ephemeralKeyDir) {
-      try {
-        fs.rmSync(ephemeralKeyDir, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
     res.status(400).json({ detail: String(e.message || e), exit_code: 1 });
   }
 });
@@ -646,9 +593,6 @@ api.post('/repos/clone', (req, res) => {
 api.post('/repos/reclone', async (req, res) => {
   const repoUrl = String(req.body?.repo_url || '').trim();
   if (!repoUrl) return res.status(400).json({ detail: 'repo_url required' });
-  const pemRaw = String(req.body?.ephemeral_ssh_private_key ?? '');
-  const usePem = looksLikePemPrivateKey(pemRaw);
-  const pem = usePem ? pemRaw.trim() : '';
   let layerId = bootstrapCloneLayerId;
   if (!layerId) {
     for (const row of listLayerRows()) {
@@ -668,29 +612,7 @@ api.post('/repos/reclone', async (req, res) => {
     GIT_TERMINAL_PROMPT: '0',
     GIT_HTTP_IPV4: String(process.env.GIT_HTTP_IPV4 || '1'),
   };
-  let cloneUrl = repoUrl;
-  let ephemeralKeyDir = null;
-  try {
-    if (usePem) {
-      cloneUrl = repoUrl.toLowerCase().startsWith('https://') ? gitSshFromHttps(repoUrl) : repoUrl;
-      ephemeralKeyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reclone_'));
-      const keyPath = path.join(ephemeralKeyDir, 'k');
-      let c = pem;
-      if (!c.endsWith('\n')) c += '\n';
-      fs.writeFileSync(keyPath, c, { mode: 0o600 });
-      env.GIT_SSH_COMMAND = gitSshCommandFromIdentityFile(keyPath);
-    }
-  } catch (e) {
-    if (ephemeralKeyDir) {
-      try {
-        fs.rmSync(ephemeralKeyDir, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
-    return res.status(400).json({ detail: String(e.message || e) });
-  }
-
+  const cloneUrl = repoUrl;
   const gitArgs = buildGitCloneArgs(cloneUrl, { branch: '', depth: null });
   let prefix = null;
   try {
@@ -816,14 +738,6 @@ api.post('/repos/reclone', async (req, res) => {
         } catch {
           /* ignore */
         }
-      } finally {
-        if (ephemeralKeyDir) {
-          try {
-            fs.rmSync(ephemeralKeyDir, { recursive: true, force: true });
-          } catch {
-            /* ignore */
-          }
-        }
       }
     })();
   };
@@ -838,15 +752,13 @@ api.post('/repos/reclone', async (req, res) => {
   setImmediate(runRecloneInBackground);
 });
 
-api.delete('/layers/:layer_id', (req, res) => {
-  const lid = req.params.layer_id;
-  for (const cid of directChildLayerIds(lid)) {
-    removeLayerQueue(cid);
-    deleteLayerTree(cid);
+api.delete('/layers/:layer_id', async (req, res) => {
+  try {
+    await deleteLayerAndMirrorToSaas(req.params.layer_id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ detail: String(e.message || e) });
   }
-  removeLayerQueue(lid);
-  deleteLayerTree(lid);
-  res.json({ ok: true });
 });
 
 api.post('/layers/:layer_id/queue', (req, res) => {
@@ -1275,22 +1187,12 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
     appendGitPushReqLog(`api layer_id=${layerId} fail reason=no_git_workdir`);
     return res.status(400).json({ detail: 'no git' });
   }
-  const pem = String(req.body?.ephemeral_ssh_private_key || '').trim();
   const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-  let keyPath = null;
   let cmdLine = '';
   try {
-    if (pem) {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push_'));
-      keyPath = path.join(dir, 'k');
-      let c = pem;
-      if (!c.endsWith('\n')) c += '\n';
-      fs.writeFileSync(keyPath, c, { mode: 0o600 });
-      env.GIT_SSH_COMMAND = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
-    }
     const branch = (req.body?.target_branch || '').toString().trim();
     const originUrl = gitConfigGetSync(['config', '--get', 'remote.origin.url'], work);
-    const pushRemoteArg = gitPushRemoteArgFromOrigin(originUrl, { preferGithubSsh: Boolean(pem) });
+    const pushRemoteArg = gitPushRemoteArgFromOrigin(originUrl);
     const args = ['push'];
     // `git push origin <name>` 要求本地存在同名的 *本地 ref*。任务里传入的 `target_branch` 往往是
     // 要在远端建立的工作分支名，而 clone 后所在分支可能是 main，并无该本地分支，会报
@@ -1301,11 +1203,7 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
     } else {
       args.push(pushRemoteArg, 'HEAD');
     }
-    cmdLine = formatGitExecDebugLine(
-      work,
-      args,
-      pem ? { GIT_SSH_COMMAND: env.GIT_SSH_COMMAND } : null,
-    );
+    cmdLine = formatGitExecDebugLine(work, args, null);
     appendGitPushReqLog(`api layer_id=${layerId} run ${cmdLine}`);
     if (pushRemoteArg !== 'origin') {
       appendGitPushReqLog(
@@ -1327,14 +1225,6 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
       `api layer_id=${layerId} fail ${cmdLine ? `cmd=${cmdLine} ` : ''}err=${String(e.message || e).slice(0, 800)}`,
     );
     res.status(400).json({ detail: String(e.message || e) });
-  } finally {
-    if (keyPath) {
-      try {
-        fs.rmSync(path.dirname(keyPath), { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
   }
 });
 
@@ -1365,6 +1255,19 @@ api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
     res.status(httpStatus).json(payload);
   } catch (e) {
     console.warn('[LayerGitOauthPush] fail layer_id=%s err=%s', layerId, String(e.message || e));
+    res.status(400).json({ detail: String(e.message || e) });
+  }
+});
+
+/** 从 task2app 拉取 GitHub OAuth access_token 并对层内各仓 HTTPS 推送（容器 UI）。 */
+api.post('/layers/:layer_id/git/oauth-refresh-push', async (req, res) => {
+  const layerId = String(req.params.layer_id || '').trim();
+  const targetBranch = String(req.body?.target_branch || '').trim();
+  try {
+    const { httpStatus, payload } = await runLayerOauthRefreshPush({ layerId, targetBranch });
+    res.status(httpStatus).json(payload);
+  } catch (e) {
+    console.warn('[LayerGitOauthRefreshPush] fail layer_id=%s err=%s', layerId, String(e.message || e));
     res.status(400).json({ detail: String(e.message || e) });
   }
 });

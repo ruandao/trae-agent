@@ -238,7 +238,7 @@ __cleanup_node() {
   return 0
 }
 set +e
-node "${_watch_flag[@]}" src/server.mjs &
+node ${_watch_flag+"${_watch_flag[@]}"} src/server.mjs &
 _node_pid=$!
 set -e
 trap '__cleanup_node' INT TERM HUP

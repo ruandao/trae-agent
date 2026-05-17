@@ -646,29 +646,6 @@
       </div>
       <div class="row" style="margin-top: 0.35rem">
         <div style="flex: 1; min-width: 280px">
-          <label for="cloneSshKeyPath">SSH 私钥路径（可选，服务器本机）</label>
-          <input
-            type="text"
-            id="cloneSshKeyPath"
-            data-testid="clone-ssh-key-path"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="git@ 克隆时：本机可读私钥路径"
-          />
-        </div>
-      </div>
-      <div class="row" style="margin-top: 0.35rem">
-        <div style="flex: 1; min-width: 280px">
-          <label for="cloneSshPrivateKey">SSH 私钥内容（可选，粘贴 PEM）</label>
-          <textarea
-            id="cloneSshPrivateKey"
-            data-testid="clone-ssh-private-key"
-            autocomplete="off"
-            spellcheck="false"
-            placeholder="粘贴 SSH 私钥（PEM 格式），用于 git@ 或私有 HTTPS 仓库克隆"
-            style="min-height: 80px; font-family: ui-monospace, monospace; font-size: 0.75rem;"
-          ></textarea>
-        </div>
       </div>
       <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.25rem">
         <button type="button" id="btnClone" data-testid="btn-clone">克隆到新建层</button>
@@ -2394,8 +2371,6 @@
             }
             body.depth = d;
           }
-          if (sshRaw) body.ssh_identity_file = sshRaw;
-          if (sshPkRaw) body.ephemeral_ssh_private_key = sshPkRaw;
           if (emptyRootId) body.parent_layer_id = emptyRootId;
           const r = await api('/api/repos/clone', {
             method: 'POST',
@@ -3978,22 +3953,61 @@
       }, BTN_DEBOUNCE_MS);
       bar.appendChild(commitBtn);
 
+      const oauthRefreshPushBtn = document.createElement('button');
+      oauthRefreshPushBtn.type = 'button';
+      oauthRefreshPushBtn.className = 'secondary tree-layer-oauth-refresh-push';
+      oauthRefreshPushBtn.setAttribute('data-testid', 'layer-git-oauth-refresh-push');
+      oauthRefreshPushBtn.textContent = '拉取 AccessToken 并推送';
+      oauthRefreshPushBtn.title =
+        '经 task2app 用 GitHub OAuth refresh_token 换发 access_token，并对层内各 github.com 仓库 HTTPS 推送';
+      oauthRefreshPushBtn.onclick = debounceClick(() => {
+        void runAsyncButton(
+          oauthRefreshPushBtn,
+          async () => {
+            const r = await api(
+              '/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/oauth-refresh-push',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              },
+            );
+            const rawText = await r.text();
+            let j = null;
+            try {
+              j = JSON.parse(rawText);
+            } catch (_) {}
+            if (!r.ok) {
+              let msg = rawText;
+              if (j && j.detail !== undefined) {
+                msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+              }
+              alert('拉取 AccessToken 并推送失败：' + msg);
+              return;
+            }
+            if (j && j.ok) {
+              const repos = j.github_oauth_multirepo?.repos;
+              const pushed = Array.isArray(repos)
+                ? repos.filter((x) => x && x.push_ok).map((x) => x.github_slug || x.rel_prefix || '?')
+                : [];
+              const head = pushed.length
+                ? '已推送：' + pushed.join(', ')
+                : '已完成 OAuth 推送。';
+              alert(head);
+            } else {
+              alert('已完成：' + rawText);
+            }
+            await loadJobs();
+            const sel = document.getElementById('layerSelect');
+            await loadLayers(sel && sel.value ? sel.value : null);
+          },
+          { busyText: '换票推送中…' },
+        );
+      }, BTN_DEBOUNCE_MS);
+      bar.appendChild(oauthRefreshPushBtn);
+
       const gr = layer.git_remote;
       if (gr && gr.is_git && !gr.no_upstream) {
-        const pushSshKeyWrap = document.createElement('div');
-        pushSshKeyWrap.style.cssText = 'margin-top:0.35rem;width:100%;';
-        const pushSshKeyLabel = document.createElement('label');
-        pushSshKeyLabel.className = 'meta';
-        pushSshKeyLabel.style.cssText = 'display:block;margin-bottom:0.2rem;';
-        pushSshKeyLabel.textContent = 'SSH 私钥（可选，粘贴 PEM 用于推送）';
-        pushSshKeyWrap.appendChild(pushSshKeyLabel);
-        const pushSshKeyTextarea = document.createElement('textarea');
-        pushSshKeyTextarea.className = 'push-ssh-key-input';
-        pushSshKeyTextarea.setAttribute('data-testid', 'push-ssh-private-key');
-        pushSshKeyTextarea.placeholder = '粘贴 SSH 私钥（PEM 格式），用于 git push';
-        pushSshKeyTextarea.style.cssText = 'min-height:60px;width:100%;font-family:ui-monospace,monospace;font-size:0.72rem;resize:vertical;';
-        pushSshKeyWrap.appendChild(pushSshKeyTextarea);
-        bar.appendChild(pushSshKeyWrap);
 
         const pushBtn = document.createElement('button');
         pushBtn.type = 'button';
@@ -4015,7 +4029,6 @@
             async () => {
               const sshPk = pushSshKeyTextarea.value.trim();
               const body = {};
-              if (sshPk) body.ephemeral_ssh_private_key = sshPk;
               const r = await api('/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/push', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

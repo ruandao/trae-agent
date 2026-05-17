@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import YAML from 'yaml';
 
-import { configFilePath, logsDir } from './paths.mjs';
+import { configFilePath, logsDir, runtimeDir } from './paths.mjs';
 import { appendOutboundReqLog } from './outboundReqLog.mjs';
 import {
   newLayerId,
@@ -149,38 +149,6 @@ function skipContainerTokenExchangeByEnv() {
   );
 }
 
-function gitCloneRemoteForSshPem(canonicalUrl) {
-  let u = String(canonicalUrl || '').trim();
-  if (!u) return u;
-  const low = u.toLowerCase();
-  if (low.startsWith('git@') || low.startsWith('ssh://')) return u;
-  if (!low.startsWith('https://')) return u;
-  let host = '';
-  try {
-    host = new URL(u).hostname.toLowerCase();
-  } catch {
-    return u;
-  }
-  if (host === 'www.github.com') host = 'github.com';
-  let pth = '';
-  try {
-    pth = new URL(u).pathname.replace(/^\//, '').replace(/\.git$/i, '');
-  } catch {
-    return u;
-  }
-  if (!host || !pth || pth.includes('..')) return u;
-  return `git@${host}:${pth}.git`;
-}
-
-function writeTempSshKey(pem) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'boot_git_'));
-  const keyPath = path.join(dir, 'key');
-  let c = String(pem).trim();
-  if (!c.endsWith('\n')) c += '\n';
-  fs.writeFileSync(keyPath, c, { mode: 0o600 });
-  return keyPath;
-}
-
 function collectRepoUrls(taskDetail) {
   const out = [];
   const seen = new Set();
@@ -232,39 +200,13 @@ async function runOneBootstrapClone({
   accessToken,
 }) {
   const { raw, repoDir, index: i } = job;
-  const cred = credRoot[raw] || credRoot[raw.replace(/\/$/, '')];
-  const pem = cred && typeof cred === 'object' ? String(cred.ephemeral_ssh_private_key || '').trim() : '';
-  const useSsh =
-    !!pem ||
-    String(process.env.GIT_CLONE_USE_SSH_URL || '')
-      .trim()
-      .toLowerCase() === '1' ||
-    ['true', 'yes'].includes(String(process.env.GIT_CLONE_USE_SSH_URL || '').trim().toLowerCase());
-  let cloneRemote = raw;
-  if (pem || (useSsh && raw.toLowerCase().startsWith('https://'))) {
-    cloneRemote = gitCloneRemoteForSshPem(raw);
-    if (cloneRemote !== raw) {
-      const ent = bootstrapRepoLogState?.bufs.get(raw);
-      if (ent) ent.body += `[bootstrap-clone] HTTPS → SSH: ${cloneRemote}\n`;
-    }
-  }
-
-  let keyPath = null;
+  const cloneRemote = raw;
   try {
     const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
     const useV4 = String(process.env.TRAE_GIT_CLONE_ALLOW_IPV6 || '').trim() !== '1';
     const args = useV4
       ? [...gitCloneConfigArgs(), 'clone', '-4', '--progress', cloneRemote, repoDir]
       : [...gitCloneConfigArgs(), 'clone', '--progress', cloneRemote, repoDir];
-    if (pem) {
-      keyPath = writeTempSshKey(pem);
-      const sshTimeout = Math.max(
-        5,
-        Math.min(120, parseInt(String(process.env.TRAE_GIT_SSH_CONNECT_TIMEOUT_SEC || '30'), 10) || 30)
-      );
-      const ssh = `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=${sshTimeout}`;
-      gitEnv.GIT_SSH_COMMAND = ssh;
-    }
     const { maxAttempts, backoffMs } = gitCloneRetryConfigFromEnv();
     let attempt = 1;
     while (attempt <= maxAttempts) {
@@ -333,14 +275,6 @@ async function runOneBootstrapClone({
     return { ok: true };
   } catch (err) {
     return { ok: false, err: err instanceof Error ? err : new Error(String(err)) };
-  } finally {
-    if (keyPath) {
-      try {
-        fs.rmSync(path.dirname(keyPath), { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
   }
 }
 
@@ -544,6 +478,79 @@ async function postJsonWithAbortRetry(url, body, timeoutSec, tag) {
   throw lastErr || new Error(`${tag}: request failed`);
 }
 
+function bootstrapTaskIdForTokenStore() {
+  return String(process.env.taskId || process.env.TASK_ID || '').trim();
+}
+
+function containerRefreshTokenStorePath() {
+  return path.join(runtimeDir(), 'container_refresh_token.json');
+}
+
+function readPersistedRefreshToken() {
+  const fromEnv = String(process.env.CONTAINER_REFRESH_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  const storePath = containerRefreshTokenStorePath();
+  if (!fs.existsSync(storePath)) return '';
+  try {
+    const data = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    const taskId = bootstrapTaskIdForTokenStore();
+    const storedTask = String(data.task_id || '').trim();
+    if (taskId && storedTask && taskId !== storedTask) return '';
+    return String(data.refresh_token || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function writePersistedRefreshToken(refreshToken) {
+  const token = String(refreshToken || '').trim();
+  if (!token) return;
+  const payload = {
+    task_id: bootstrapTaskIdForTokenStore(),
+    refresh_token: token,
+    updated_at: new Date().toISOString(),
+  };
+  fs.writeFileSync(containerRefreshTokenStorePath(), `${JSON.stringify(payload)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+}
+
+function clearPersistedRefreshToken() {
+  try {
+    fs.unlinkSync(containerRefreshTokenStorePath());
+  } catch {
+    /* ignore */
+  }
+}
+
+/** exchange-refresh 返回 403：库中已有 refresh，须改走 refresh-access。 */
+function isExchangeRefreshForbiddenError(e) {
+  const msg = String(e?.message || e || '');
+  return /HTTP\s+403\b/i.test(msg) && /refresh-access/i.test(msg);
+}
+
+async function runRefreshAccessOnly(prefix, refreshToken, tokenTimeout) {
+  const rt = String(refreshToken || '').trim();
+  if (!rt) throw new Error('refresh-access: empty refresh_token');
+  logTokenExchange(
+    `POST ${prefix}/server-container-token/refresh-access/ refresh_token ${summarizeSecret(rt)}`,
+  );
+  const ref = await postJsonWithAbortRetry(
+    `${prefix}/server-container-token/refresh-access/`,
+    { refresh_token: rt },
+    tokenTimeout,
+    'refresh-access',
+  );
+  const at = ref.access_token;
+  if (!at || typeof at !== 'string') throw new Error('refresh-access missing access_token');
+  process.env.ACCESS_TOKEN = at;
+  logTokenExchange(
+    `refresh-access OK new_access_token ${summarizeSecret(at)} ACCESS_TOKEN env updated`,
+  );
+  return at;
+}
+
 /**
  * HTTP 监听前：解析 TaskApi 前缀并完成换票（若需要）。
  * 任务详情拉取、仓库克隆、service_config.yaml 写入在 {@link runBootstrapAfterListen}（由 `server.mjs`
@@ -593,29 +600,39 @@ export async function runBootstrapTokenExchangeOnly() {
 
   if (!skipContainerTokenExchangeByEnv()) {
     try {
-      logTokenExchange(`POST ${prefix}/server-container-token/exchange-refresh/`);
-      const ex = await postJsonWithAbortRetry(
-        `${prefix}/server-container-token/exchange-refresh/`,
-        { access_token: newAccess, business_api_endpoint: business },
-        tokenTimeout,
-        'exchange-refresh'
-      );
-      const refreshToken = ex.refresh_token;
-      if (!refreshToken) throw new Error('exchange-refresh missing refresh_token');
-      logTokenExchange(`exchange-refresh OK refresh_token ${summarizeSecret(refreshToken)}`);
+      let refreshToken = '';
+      try {
+        logTokenExchange(`POST ${prefix}/server-container-token/exchange-refresh/`);
+        const ex = await postJsonWithAbortRetry(
+          `${prefix}/server-container-token/exchange-refresh/`,
+          { access_token: newAccess, business_api_endpoint: business },
+          tokenTimeout,
+          'exchange-refresh',
+        );
+        refreshToken = ex.refresh_token;
+        if (!refreshToken) throw new Error('exchange-refresh missing refresh_token');
+        logTokenExchange(`exchange-refresh OK refresh_token ${summarizeSecret(refreshToken)}`);
+        writePersistedRefreshToken(refreshToken);
+      } catch (e) {
+        if (!isExchangeRefreshForbiddenError(e)) {
+          throw e;
+        }
+        refreshToken = readPersistedRefreshToken();
+        if (!refreshToken) {
+          logTokenExchange(
+            'exchange-refresh 403 and no persisted refresh_token; run env-prepare / 重新生成令牌 before start',
+          );
+          throw e;
+        }
+        logTokenExchange(
+          'exchange-refresh 403: fallback to refresh-access using persisted refresh_token',
+        );
+        newAccess = await runRefreshAccessOnly(prefix, refreshToken, tokenTimeout);
+        logTokenExchange('done (refresh-access fallback)');
+        return { skipped: false, prefix, newAccess, timeout };
+      }
 
-      logTokenExchange(`POST ${prefix}/server-container-token/refresh-access/`);
-      const ref = await postJsonWithAbortRetry(
-        `${prefix}/server-container-token/refresh-access/`,
-        { refresh_token: refreshToken },
-        tokenTimeout,
-        'refresh-access'
-      );
-      const at = ref.access_token;
-      if (!at || typeof at !== 'string') throw new Error('refresh-access missing access_token');
-      newAccess = at;
-      process.env.ACCESS_TOKEN = newAccess;
-      logTokenExchange(`refresh-access OK new_access_token ${summarizeSecret(newAccess)} ACCESS_TOKEN env updated`);
+      newAccess = await runRefreshAccessOnly(prefix, refreshToken, tokenTimeout);
       logTokenExchange('done');
     } catch (e) {
       const detail = e && e.message ? String(e.message) : String(e);
