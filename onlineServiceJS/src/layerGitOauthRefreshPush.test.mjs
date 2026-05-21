@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import http from 'http';
 import { spawnSync } from 'child_process';
 
 const ENV_KEYS = [
@@ -51,6 +52,7 @@ function prepareLayerWithGithubRepo(prefix) {
   return {
     stateRoot,
     layerId,
+    repoDir,
     gitPushLog: path.join(stateRoot, 'logs', 'gitPush.log'),
   };
 }
@@ -156,6 +158,133 @@ describe('layerGitOauthRefreshPush', () => {
     assert.match(log, /oauth-refresh-push begin/);
     assert.match(log, /oauth-refresh-push token-fetch/);
     assert.match(log, /oauth-refresh-push fail/);
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('runLayerOauthFetchTokenFiles 拉取 token 并按仓库写入 .task2app_access_token', async () => {
+    const { stateRoot, layerId, repoDir } = prepareLayerWithGithubRepo('oauth-fetch-files');
+    const repoDir2 = path.join(path.dirname(repoDir), 'second-repo');
+    fs.mkdirSync(repoDir2, { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: repoDir2, encoding: 'utf8' }).status, 0);
+    assert.equal(
+      spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/second.git'], {
+        cwd: repoDir2,
+        encoding: 'utf8',
+      }).status,
+      0,
+    );
+
+    const server = http.createServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/task-detail/') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ task: { target_branch: 'feature/demo' } }));
+        return;
+      }
+      if (
+        req.method === 'POST' &&
+        req.url === '/api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'
+      ) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            github_auth_by_repo: {
+              'acme/demo': 'token_demo_123',
+              'acme/second': 'token_second_456',
+            },
+          }),
+        );
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'not found' }));
+    });
+    let httpStatus;
+    let payload;
+    try {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      process.env.TaskApiEndPoint = `${base}/api/tenant/t1/workspace/w1/task/task1/cloud`;
+      process.env.ACCESS_TOKEN = 'container_access_token';
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?fetchfiles=${Date.now()}`);
+      const res = await mod.runLayerOauthFetchTokenFiles({
+        layerId,
+        targetBranch: '',
+      });
+      httpStatus = res.httpStatus;
+      payload = res.payload;
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.equal(httpStatus, 200);
+    assert.equal(payload?.ok, true);
+    assert.match(String(payload?.summary || ''), /已写入/);
+
+    const tokenPath1 = path.join(repoDir, '.task2app_access_token');
+    const tokenPath2 = path.join(repoDir2, '.task2app_access_token');
+    assert.equal(fs.readFileSync(tokenPath1, 'utf8'), 'token_demo_123\n');
+    assert.equal(fs.readFileSync(tokenPath2, 'utf8'), 'token_second_456\n');
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('runLayerOauthFetchTokenFiles 在 target_branch 缺失时仍可拉取并落盘', async () => {
+    const { stateRoot, layerId, repoDir } = prepareLayerWithGithubRepo('oauth-fetch-files-no-branch');
+    const requests = [];
+    const server = http.createServer((req, res) => {
+      requests.push(`${req.method} ${req.url}`);
+      if (
+        req.method === 'POST' &&
+        req.url === '/api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'
+      ) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            github_auth_by_repo: {
+              'acme/demo': 'token_demo_no_branch',
+            },
+          }),
+        );
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'not found' }));
+    });
+
+    let httpStatus;
+    let payload;
+    try {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      process.env.TaskApiEndPoint = `${base}/api/tenant/t1/workspace/w1/task/task1/cloud`;
+      process.env.ACCESS_TOKEN = 'container_access_token_no_branch';
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?fetchfilesnobranch=${Date.now()}`);
+      const res = await mod.runLayerOauthFetchTokenFiles({
+        layerId,
+        targetBranch: '',
+      });
+      httpStatus = res.httpStatus;
+      payload = res.payload;
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.equal(httpStatus, 200);
+    assert.equal(payload?.ok, true);
+    assert.equal(fs.readFileSync(path.join(repoDir, '.task2app_access_token'), 'utf8'), 'token_demo_no_branch\n');
+    assert.deepEqual(
+      requests,
+      ['POST /api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'],
+    );
+
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 });

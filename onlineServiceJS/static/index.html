@@ -4006,6 +4006,65 @@
       }, BTN_DEBOUNCE_MS);
       bar.appendChild(oauthRefreshPushBtn);
 
+      const oauthFetchTokenFilesBtn = document.createElement('button');
+      oauthFetchTokenFilesBtn.type = 'button';
+      oauthFetchTokenFilesBtn.className = 'secondary tree-layer-oauth-fetch-token-files';
+      oauthFetchTokenFilesBtn.setAttribute('data-testid', 'layer-git-oauth-fetch-token-files');
+      oauthFetchTokenFilesBtn.textContent = '拉取AccessToken';
+      oauthFetchTokenFilesBtn.title = '经 task2app 换发 access_token，并写入每个仓库根目录 .task2app_access_token';
+      oauthFetchTokenFilesBtn.onclick = debounceClick(() => {
+        void runAsyncButton(
+          oauthFetchTokenFilesBtn,
+          async () => {
+            const r = await api(
+              '/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/oauth-fetch-token-files',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+              },
+            );
+            const rawText = await r.text();
+            let j = null;
+            try {
+              j = JSON.parse(rawText);
+            } catch (_) {}
+            if (!r.ok) {
+              let msg = rawText;
+              if (j && j.detail !== undefined) {
+                msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+              }
+              alert('拉取AccessToken失败：' + msg);
+              return;
+            }
+            if (j && j.ok) {
+              const rows = Array.isArray(j.token_files) ? j.token_files : [];
+              const okRows = rows.filter((x) => x && x.write_ok);
+              const failedRows = rows.filter((x) => x && !x.write_ok);
+              const okNames = okRows.map((x) => x.github_slug || x.rel_prefix || '?');
+              const msg =
+                '已写入 ' +
+                okRows.length +
+                '/' +
+                rows.length +
+                ' 个仓库 token 文件' +
+                (okNames.length ? '\n\n成功：' + okNames.join(', ') : '') +
+                (failedRows.length
+                  ? '\n\n失败：' +
+                    failedRows
+                      .map((x) => (x.github_slug || x.rel_prefix || '?') + (x.detail ? '（' + x.detail + '）' : ''))
+                      .join(', ')
+                  : '');
+              alert(msg);
+            } else {
+              alert('已完成：' + rawText);
+            }
+          },
+          { busyText: '拉取中…' },
+        );
+      }, BTN_DEBOUNCE_MS);
+      bar.appendChild(oauthFetchTokenFilesBtn);
+
       const gr = layer.git_remote;
       if (gr && gr.is_git && !gr.no_upstream) {
 

@@ -82,6 +82,7 @@ import { gitCmd, gitCloneConfigArgs, formatGitExecDebugLine } from './gitCmd.mjs
 import { suggestStagedCommitMessage } from './stagedCommitSuggest.mjs';
 import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
 import { runLayerOauthRefreshPush } from './layerGitOauthRefreshPush.mjs';
+import { runLayerOauthFetchTokenFiles } from './layerGitOauthFetchTokenFiles.mjs';
 import { gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1268,6 +1269,19 @@ api.post('/layers/:layer_id/git/oauth-refresh-push', async (req, res) => {
     res.status(httpStatus).json(payload);
   } catch (e) {
     console.warn('[LayerGitOauthRefreshPush] fail layer_id=%s err=%s', layerId, String(e.message || e));
+    res.status(400).json({ detail: String(e.message || e) });
+  }
+});
+
+/** 从 task2app 拉取 GitHub OAuth access_token 并按仓库写入 .task2app_access_token（不推送）。 */
+api.post('/layers/:layer_id/git/oauth-fetch-token-files', async (req, res) => {
+  const layerId = String(req.params.layer_id || '').trim();
+  const targetBranch = String(req.body?.target_branch || '').trim();
+  try {
+    const { httpStatus, payload } = await runLayerOauthFetchTokenFiles({ layerId, targetBranch });
+    res.status(httpStatus).json(payload);
+  } catch (e) {
+    console.warn('[LayerGitOauthFetchTokenFiles] fail layer_id=%s err=%s', layerId, String(e.message || e));
     res.status(400).json({ detail: String(e.message || e) });
   }
 });
