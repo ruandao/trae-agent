@@ -8,6 +8,7 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { gitCmd } from './gitCmd.mjs';
+import { logsDir } from './paths.mjs';
 
 function gitConfigGetRemoteOrigin(workdir) {
   try {
@@ -26,6 +27,22 @@ function gitConfigGetRemoteOrigin(workdir) {
   } catch {
     return '';
   }
+}
+
+function appendOauthRefreshPushLog(line) {
+  try {
+    const p = path.join(logsDir(), 'gitPush.log');
+    fs.appendFileSync(p, `${new Date().toISOString()} | ${line}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
+function oauthTokenFetchTimeoutSec() {
+  const raw = String(process.env.TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_SEC || '').trim();
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 120;
+  return Math.max(30, Math.min(300, n));
 }
 
 /** @returns {string[]} owner/repo slug（小写），来自层内 GitHub 远程 */
@@ -53,13 +70,18 @@ export function collectGithubRepoSlugsInLayer(layerId) {
 export async function runLayerOauthRefreshPush(opts) {
   const layerId = String(opts.layerId || '').trim();
   if (!layerId) {
+    appendOauthRefreshPushLog('oauth-refresh-push fail layer_id=invalid detail=layer_id 无效');
     return { httpStatus: 400, payload: { ok: false, detail: 'layer_id 无效' } };
   }
+  appendOauthRefreshPushLog(`oauth-refresh-push begin layer_id=${layerId}`);
 
   let cloudPrefix;
   try {
     cloudPrefix = taskApiPrefix();
   } catch (e) {
+    appendOauthRefreshPushLog(
+      `oauth-refresh-push fail layer_id=${layerId} detail=TaskApiPrefix ${String(e?.message || e).slice(0, 240)}`,
+    );
     return {
       httpStatus: 503,
       payload: {
@@ -71,6 +93,7 @@ export async function runLayerOauthRefreshPush(opts) {
 
   const accessToken = String(process.env.ACCESS_TOKEN || '').trim();
   if (!accessToken) {
+    appendOauthRefreshPushLog(`oauth-refresh-push fail layer_id=${layerId} detail=缺少容器 ACCESS_TOKEN`);
     return { httpStatus: 503, payload: { ok: false, detail: '缺少容器 ACCESS_TOKEN' } };
   }
 
@@ -85,6 +108,9 @@ export async function runLayerOauthRefreshPush(opts) {
       const tb = detail?.task?.target_branch;
       if (typeof tb === 'string' && tb.trim()) targetBranch = tb.trim();
     } catch (e) {
+      appendOauthRefreshPushLog(
+        `oauth-refresh-push fail layer_id=${layerId} detail=task-detail ${String(e?.message || e).slice(0, 240)}`,
+      );
       return {
         httpStatus: 502,
         payload: {
@@ -95,17 +121,23 @@ export async function runLayerOauthRefreshPush(opts) {
     }
   }
   if (!targetBranch) {
+    appendOauthRefreshPushLog(`oauth-refresh-push fail layer_id=${layerId} detail=target_branch 缺失`);
     return { httpStatus: 400, payload: { ok: false, detail: 'target_branch 必填（任务未配置目标分支）' } };
   }
 
   const repoSlugs = collectGithubRepoSlugsInLayer(layerId);
   if (!repoSlugs.length) {
+    appendOauthRefreshPushLog(`oauth-refresh-push fail layer_id=${layerId} detail=层内未发现 github.com 远程仓库`);
     return {
       httpStatus: 400,
       payload: { ok: false, detail: '层内未发现 github.com 远程仓库' },
     };
   }
 
+  const oauthFetchTimeoutSec = oauthTokenFetchTimeoutSec();
+  appendOauthRefreshPushLog(
+    `oauth-refresh-push token-fetch layer_id=${layerId} repos=${repoSlugs.length} target_branch=${targetBranch.slice(0, 120)} timeout_sec=${oauthFetchTimeoutSec}`,
+  );
   let tokenPayload;
   try {
     tokenPayload = await postJson(
@@ -115,9 +147,12 @@ export async function runLayerOauthRefreshPush(opts) {
         repo_slugs: repoSlugs,
         target_branch: targetBranch,
       },
-      60,
+      oauthFetchTimeoutSec,
     );
   } catch (e) {
+    appendOauthRefreshPushLog(
+      `oauth-refresh-push fail layer_id=${layerId} detail=layer-github-oauth-access-tokens ${String(e?.message || e).slice(0, 320)}`,
+    );
     return {
       httpStatus: 502,
       payload: {
@@ -133,6 +168,9 @@ export async function runLayerOauthRefreshPush(opts) {
       : null;
   if (!githubAuthByRepo || !Object.keys(githubAuthByRepo).length) {
     const partial = tokenPayload?.partial_error || tokenPayload?.detail;
+    appendOauthRefreshPushLog(
+      `oauth-refresh-push fail layer_id=${layerId} detail=no github_auth_by_repo partial=${String(partial || '').slice(0, 240)}`,
+    );
     return {
       httpStatus: 409,
       payload: {
@@ -144,13 +182,27 @@ export async function runLayerOauthRefreshPush(opts) {
       },
     };
   }
+  appendOauthRefreshPushLog(
+    `oauth-refresh-push token-ready layer_id=${layerId} token_repos=${Object.keys(githubAuthByRepo).length}`,
+  );
 
-  return runLayerGithubOauthAccessPush({
-    layerId,
-    targetBranch,
-    accessTokenByRepoSlug: githubAuthByRepo,
-    prBaseBranch: String(tokenPayload?.pr_base_branch || '').trim(),
-    prTitle: String(tokenPayload?.pr_title || '').trim(),
-    prBody: String(tokenPayload?.pr_body || '').trim(),
-  });
+  try {
+    const result = await runLayerGithubOauthAccessPush({
+      layerId,
+      targetBranch,
+      accessTokenByRepoSlug: githubAuthByRepo,
+      prBaseBranch: String(tokenPayload?.pr_base_branch || '').trim(),
+      prTitle: String(tokenPayload?.pr_title || '').trim(),
+      prBody: String(tokenPayload?.pr_body || '').trim(),
+    });
+    appendOauthRefreshPushLog(
+      `oauth-refresh-push done layer_id=${layerId} http_status=${result.httpStatus} ok=${Boolean(result?.payload?.ok)}`,
+    );
+    return result;
+  } catch (e) {
+    appendOauthRefreshPushLog(
+      `oauth-refresh-push fail layer_id=${layerId} detail=oauth-access-push ${String(e?.message || e).slice(0, 320)}`,
+    );
+    throw e;
+  }
 }
