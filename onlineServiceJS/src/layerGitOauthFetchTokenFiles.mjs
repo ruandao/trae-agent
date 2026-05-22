@@ -40,9 +40,53 @@ function appendTokenRefreshLog(line) {
 
 function oauthTokenFetchTimeoutSec() {
   const raw = String(process.env.TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_SEC || '').trim();
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n)) return 120;
-  return Math.max(30, Math.min(300, n));
+  const configured = Number.parseInt(raw, 10);
+  const rawMin = String(process.env.TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_MIN_SEC || '').trim();
+  const configuredMin = Number.parseInt(rawMin, 10);
+  const minTimeoutSec = Number.isFinite(configuredMin) ? Math.max(1, Math.min(300, configuredMin)) : 30;
+  if (!Number.isFinite(configured)) return 120;
+  return Math.max(minTimeoutSec, Math.min(300, configured));
+}
+
+function parseStructuredErrorFromMessage(message) {
+  const text = String(message || '').trim();
+  const jsonStart = text.indexOf('{');
+  if (jsonStart < 0) return null;
+  const candidate = text.slice(jsonStart);
+  try {
+    const parsed = JSON.parse(candidate);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function defaultStructuredErrorForMessage(message) {
+  const text = String(message || '').toLowerCase();
+  if (text.includes('aborted') || text.includes('timeout') || text.includes('timed out')) {
+    return {
+      error_code: 'UPSTREAM_GITOAUTH_TIMEOUT',
+      failed_stage: 'gitoauth_summary',
+      retryable: true,
+      detail_safe: '访问 gitOauth 超时，请稍后重试',
+    };
+  }
+  return null;
+}
+
+function pickStructuredErrorFields(value) {
+  if (!value || typeof value !== 'object') return null;
+  const errorCode = String(value.error_code || '').trim();
+  const failedStage = String(value.failed_stage || '').trim();
+  if (!errorCode && !failedStage) return null;
+  const picked = {
+    error_code: errorCode || undefined,
+    failed_stage: failedStage || undefined,
+    retryable: typeof value.retryable === 'boolean' ? value.retryable : undefined,
+    detail_safe: value.detail_safe ? String(value.detail_safe) : undefined,
+  };
+  return picked;
 }
 
 function collectGithubRepoWriteTargets(layerId) {
@@ -118,11 +162,20 @@ export async function runLayerOauthFetchTokenFiles(opts) {
       oauthFetchTimeoutSec,
     );
   } catch (e) {
+    const errMsg = String(e?.message || e);
+    const fromStructuredPayload = pickStructuredErrorFields(e?.structuredPayload);
+    const parsed = pickStructuredErrorFields(parseStructuredErrorFromMessage(errMsg));
+    const fallback = defaultStructuredErrorForMessage(errMsg);
+    const structured = fromStructuredPayload || parsed || fallback;
     return {
       httpStatus: 502,
       payload: {
         ok: false,
-        detail: `从 task2app 拉取 GitHub AccessToken 失败：${String(e?.message || e).slice(0, 500)}`,
+        detail: `从 task2app 拉取 GitHub AccessToken 失败：${errMsg.slice(0, 500)}`,
+        error_code: structured?.error_code,
+        failed_stage: structured?.failed_stage,
+        retryable: structured?.retryable,
+        detail_safe: structured?.detail_safe,
       },
     };
   }

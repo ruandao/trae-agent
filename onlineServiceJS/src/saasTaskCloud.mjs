@@ -49,7 +49,11 @@ export async function postJson(url, body, timeoutSec = 8, opts = {}) {
       throw new Error(`Invalid JSON from ${url}: ${text.slice(0, 200)}`);
     }
     if (!r.ok) {
-      throw new Error(`HTTP ${r.status} ${url}: ${JSON.stringify(data).slice(0, 500)}`);
+      const err = new Error(`HTTP ${r.status} ${url}: ${JSON.stringify(data).slice(0, 500)}`);
+      if (data && typeof data === 'object') {
+        err.structuredPayload = data;
+      }
+      throw err;
     }
     return data;
   } catch (e) {

@@ -15,6 +15,7 @@ const ENV_KEYS = [
   'ACCESS_TOKEN',
   'ONLINE_PROJECT_STATE_ROOT',
   'TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_SEC',
+  'TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_MIN_SEC',
 ];
 
 function saveEnv() {
@@ -284,6 +285,164 @@ describe('layerGitOauthRefreshPush', () => {
       requests,
       ['POST /api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'],
     );
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('runLayerOauthFetchTokenFiles 透传 task2app 结构化错误字段', async () => {
+    const { stateRoot, layerId } = prepareLayerWithGithubRepo('oauth-fetch-structured-error');
+    const server = http.createServer((req, res) => {
+      if (
+        req.method === 'POST' &&
+        req.url === '/api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'
+      ) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            detail: '访问 gitOauth 超时，请稍后重试',
+            detail_safe: '访问 gitOauth 超时，请稍后重试',
+            error_code: 'UPSTREAM_GITOAUTH_TIMEOUT',
+            failed_stage: 'gitoauth_summary',
+            retryable: true,
+            github_auth_by_repo: {},
+          }),
+        );
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'not found' }));
+    });
+
+    let result;
+    try {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      process.env.TaskApiEndPoint = `${base}/api/tenant/t1/workspace/w1/task/task1/cloud`;
+      process.env.ACCESS_TOKEN = 'container_access_token_structured_error';
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?structured=${Date.now()}`);
+      result = await mod.runLayerOauthFetchTokenFiles({
+        layerId,
+        targetBranch: '',
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.equal(result.httpStatus, 502);
+    assert.equal(result.payload?.ok, false);
+    assert.equal(result.payload?.error_code, 'UPSTREAM_GITOAUTH_TIMEOUT');
+    assert.equal(result.payload?.failed_stage, 'gitoauth_summary');
+    assert.equal(result.payload?.retryable, true);
+    assert.equal(result.payload?.detail_safe, '访问 gitOauth 超时，请稍后重试');
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('runLayerOauthFetchTokenFiles 在超长错误体时仍透传结构化字段', async () => {
+    const { stateRoot, layerId } = prepareLayerWithGithubRepo('oauth-fetch-structured-error-long');
+    const longDetail = `repo binding missing: ${'x'.repeat(1200)}`;
+    const server = http.createServer((req, res) => {
+      if (
+        req.method === 'POST' &&
+        req.url === '/api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'
+      ) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            detail: longDetail,
+            detail_safe: '请先在任务详情绑定 GitHub 授权账号',
+            error_code: 'BINDING_MISSING',
+            failed_stage: 'binding_check',
+            retryable: false,
+            github_auth_by_repo: {},
+          }),
+        );
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'not found' }));
+    });
+
+    let result;
+    try {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      process.env.TaskApiEndPoint = `${base}/api/tenant/t1/workspace/w1/task/task1/cloud`;
+      process.env.ACCESS_TOKEN = 'container_access_token_structured_error_long';
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?structuredlong=${Date.now()}`);
+      result = await mod.runLayerOauthFetchTokenFiles({
+        layerId,
+        targetBranch: '',
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.equal(result.httpStatus, 502);
+    assert.equal(result.payload?.ok, false);
+    assert.equal(result.payload?.error_code, 'BINDING_MISSING');
+    assert.equal(result.payload?.failed_stage, 'binding_check');
+    assert.equal(result.payload?.retryable, false);
+    assert.equal(result.payload?.detail_safe, '请先在任务详情绑定 GitHub 授权账号');
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('runLayerOauthFetchTokenFiles 对本地超时使用默认结构化错误', async () => {
+    const { stateRoot, layerId } = prepareLayerWithGithubRepo('oauth-fetch-local-timeout-fallback');
+    const sockets = new Set();
+    const server = http.createServer((req, res) => {
+      if (
+        req.method === 'POST' &&
+        req.url === '/api/tenant/t1/workspace/w1/task/task1/cloud/server-container-token/layer-github-oauth-access-tokens/'
+      ) {
+        // 故意不返回响应，触发 postJson 的 AbortController 超时路径
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'not found' }));
+    });
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+
+    let result;
+    try {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      process.env.TaskApiEndPoint = `${base}/api/tenant/t1/workspace/w1/task/task1/cloud`;
+      process.env.ACCESS_TOKEN = 'container_access_token_timeout_fallback';
+      process.env.TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_SEC = '1';
+      process.env.TRAE_LAYER_GITHUB_OAUTH_FETCH_TIMEOUT_MIN_SEC = '1';
+
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?localtimeout=${Date.now()}`);
+      const startedAt = Date.now();
+      result = await mod.runLayerOauthFetchTokenFiles({
+        layerId,
+        targetBranch: '',
+      });
+      assert.ok(Date.now() - startedAt < 5000);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    assert.equal(result.httpStatus, 502);
+    assert.equal(result.payload?.ok, false);
+    assert.equal(result.payload?.error_code, 'UPSTREAM_GITOAUTH_TIMEOUT');
+    assert.equal(result.payload?.failed_stage, 'gitoauth_summary');
+    assert.equal(result.payload?.retryable, true);
+    assert.equal(result.payload?.detail_safe, '访问 gitOauth 超时，请稍后重试');
 
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
