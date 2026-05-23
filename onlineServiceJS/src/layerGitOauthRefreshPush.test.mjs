@@ -446,4 +446,61 @@ describe('layerGitOauthRefreshPush', () => {
 
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
+
+  test('runLayerOauthFetchTokenFiles 首次 localhost 网络失败时回退 127.0.0.1 重试成功', async () => {
+    const { stateRoot, layerId, repoDir } = prepareLayerWithGithubRepo('oauth-fetch-loopback-fallback');
+    const calls = [];
+    const fetchMock = mock.method(globalThis, 'fetch', async (input, init) => {
+      const url = typeof input === 'string' ? input : String(input?.url || '');
+      calls.push(url);
+      if (calls.length === 1) {
+        const cause = new Error('socket hang up');
+        cause.code = 'ECONNRESET';
+        const err = new TypeError('fetch failed');
+        err.cause = cause;
+        throw err;
+      }
+      assert.equal(init?.method, 'POST');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          github_auth_by_repo: {
+            'acme/demo': 'token_loopback_ok',
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    });
+
+    let result;
+    try {
+      process.env.TaskApiEndPoint = 'http://localhost:8001/api/tenant/t1/workspace/w1/task/task1/cloud';
+      process.env.ACCESS_TOKEN = 'container_access_token_loopback_fallback';
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?loopbackfallback=${Date.now()}`);
+      result = await mod.runLayerOauthFetchTokenFiles({
+        layerId,
+        targetBranch: '',
+      });
+    } finally {
+      fetchMock.mock.restore();
+    }
+
+    assert.equal(result.httpStatus, 200);
+    assert.equal(result.payload?.ok, true);
+    assert.equal(calls.length, 2);
+    assert.match(
+      calls[0],
+      /http:\/\/localhost:8001\/api\/tenant\/t1\/workspace\/w1\/task\/task1\/cloud\/server-container-token\/layer-github-oauth-access-tokens\//,
+    );
+    assert.match(
+      calls[1],
+      /http:\/\/127\.0\.0\.1:8001\/api\/tenant\/t1\/workspace\/w1\/task\/task1\/cloud\/server-container-token\/layer-github-oauth-access-tokens\//,
+    );
+    assert.equal(fs.readFileSync(path.join(repoDir, '.task2app_access_token'), 'utf8'), 'token_loopback_ok\n');
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
 });

@@ -16,6 +16,81 @@ function traceHeaders() {
   return h;
 }
 
+function loopbackFallbackUrl(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    if (parsed.hostname === 'localhost') {
+      parsed.hostname = '127.0.0.1';
+      return parsed.toString();
+    }
+    if (parsed.hostname === '127.0.0.1') {
+      parsed.hostname = 'localhost';
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function fetchCauseCode(err) {
+  const code = err && typeof err === 'object' ? err?.cause?.code : '';
+  return String(code || '').trim();
+}
+
+function isAbortLikeError(err) {
+  const names = [
+    String(err?.name || ''),
+    String(err?.cause?.name || ''),
+    fetchCauseCode(err),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (names.includes('abort')) return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return msg.includes('aborted') || msg.includes('timeout');
+}
+
+function formatErrorWithCause(err) {
+  const message = String(err?.message || err || '').trim();
+  const code = fetchCauseCode(err);
+  const causeMessage = String(err?.cause?.message || '').trim();
+  const extra = [];
+  if (code) extra.push(code);
+  if (causeMessage && causeMessage !== message) extra.push(causeMessage);
+  if (!extra.length) return message;
+  return `${message} (${extra.join(': ')})`;
+}
+
+function normalizePostJsonError(err) {
+  const detail = formatErrorWithCause(err);
+  if (detail === String(err?.message || err || '').trim()) return err;
+  const wrapped = new Error(detail);
+  if (err && typeof err === 'object' && err.structuredPayload) {
+    wrapped.structuredPayload = err.structuredPayload;
+  }
+  return wrapped;
+}
+
+function isRetryableLoopbackFetchError(err) {
+  if (!err || typeof err !== 'object') return false;
+  if (err.structuredPayload) return false;
+  if (isAbortLikeError(err)) return false;
+  const code = fetchCauseCode(err).toUpperCase();
+  if (['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT'].includes(code)) {
+    return true;
+  }
+  const msg = String(err?.message || err || '').toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes('fetch failed') ||
+    msg.includes('socket hang up') ||
+    msg.includes('connection reset') ||
+    msg.includes('connection refused')
+  );
+}
+
 /** 容器心跳 POST 的 reqLogs 文件名（与其它出站 outbound.log 分离） */
 export const HEARTBEAT_REQ_LOG_FILE = 'heartbeat.log';
 
@@ -28,41 +103,68 @@ export const HEARTBEAT_REQ_LOG_FILE = 'heartbeat.log';
 export async function postJson(url, body, timeoutSec = 8, opts = {}) {
   const reqLogFile = opts && typeof opts === 'object' ? opts.reqLogFile : undefined;
   const safeUrl = sanitizeUrlForOutboundLog(url);
+  const fallbackUrl = loopbackFallbackUrl(url);
+  const safeFallbackUrl = fallbackUrl ? sanitizeUrlForOutboundLog(fallbackUrl) : '';
   const t0 = Date.now();
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutSec * 1000);
   const logOpts = reqLogFile ? { filename: reqLogFile } : {};
+  const attempts = [url];
+  if (fallbackUrl && fallbackUrl !== url) attempts.push(fallbackUrl);
+  let idx = 0;
   try {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: traceHeaders(),
-      body: JSON.stringify(body),
-      signal: ac.signal,
-    });
-    const text = await r.text();
-    const ms = Date.now() - t0;
-    appendOutboundReqLog(`postJson POST ${safeUrl} -> HTTP ${r.status} ${ms}ms`, logOpts);
-    let data = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      throw new Error(`Invalid JSON from ${url}: ${text.slice(0, 200)}`);
-    }
-    if (!r.ok) {
-      const err = new Error(`HTTP ${r.status} ${url}: ${JSON.stringify(data).slice(0, 500)}`);
-      if (data && typeof data === 'object') {
-        err.structuredPayload = data;
+    while (idx < attempts.length) {
+      const targetUrl = attempts[idx];
+      const safeTargetUrl = sanitizeUrlForOutboundLog(targetUrl);
+      try {
+        const r = await fetch(targetUrl, {
+          method: 'POST',
+          headers: traceHeaders(),
+          body: JSON.stringify(body),
+          signal: ac.signal,
+        });
+        const text = await r.text();
+        const ms = Date.now() - t0;
+        appendOutboundReqLog(`postJson POST ${safeTargetUrl} -> HTTP ${r.status} ${ms}ms`, logOpts);
+        let data = {};
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch {
+          throw new Error(`Invalid JSON from ${targetUrl}: ${text.slice(0, 200)}`);
+        }
+        if (!r.ok) {
+          const err = new Error(`HTTP ${r.status} ${targetUrl}: ${JSON.stringify(data).slice(0, 500)}`);
+          if (data && typeof data === 'object') {
+            err.structuredPayload = data;
+          }
+          throw err;
+        }
+        return data;
+      } catch (e) {
+        if (
+          idx === 0 &&
+          attempts.length > 1 &&
+          isRetryableLoopbackFetchError(e) &&
+          !String(e?.name || '').includes('AbortError')
+        ) {
+          appendOutboundReqLog(
+            `postJson POST ${safeTargetUrl} -> retry loopback ${safeFallbackUrl} reason=${formatErrorWithCause(e).slice(0, 240)}`,
+            logOpts,
+          );
+          idx += 1;
+          continue;
+        }
+        throw normalizePostJsonError(e);
       }
-      throw err;
     }
-    return data;
+    throw new Error(`postJson exhausted attempts for ${safeUrl}`);
   } catch (e) {
     const ms = Date.now() - t0;
     appendOutboundReqLog(
-      `postJson POST ${safeUrl} -> error ${String(e?.message || e).slice(0, 400)} ${ms}ms`,
+      `postJson POST ${safeUrl} -> error ${formatErrorWithCause(e).slice(0, 400)} ${ms}ms`,
       logOpts,
     );
-    throw e;
+    throw normalizePostJsonError(e);
   } finally {
     clearTimeout(t);
   }
