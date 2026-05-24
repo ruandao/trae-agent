@@ -11,6 +11,7 @@ import { layerGitWorkdirRootsForFileListing } from './layerFs.mjs';
 import { appendOutboundReqLog, appendGitPushReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
 
 const GH_SLUG_RE = /github\.com[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i;
+const GL_SLUG_RE = /gitlab[^:/]*[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i;
 
 export function parseGithubOwnerRepoFromRemoteUrl(url) {
   const m = String(url || '').match(GH_SLUG_RE);
@@ -20,6 +21,22 @@ export function parseGithubOwnerRepoFromRemoteUrl(url) {
   if (repo.toLowerCase().endsWith('.git')) repo = repo.slice(0, -4);
   if (!owner || !repo) return null;
   return { owner, repo, slug: `${owner}/${repo}` };
+}
+
+function parseGitlabOwnerRepoFromRemoteUrl(url) {
+  const m = String(url || '').match(GL_SLUG_RE);
+  if (!m) return null;
+  const owner = String(m[1]).trim();
+  let repo = String(m[2]).trim();
+  if (repo.toLowerCase().endsWith('.git')) repo = repo.slice(0, -4);
+  if (!owner || !repo) return null;
+  return { owner, repo, slug: `${owner}/${repo}` };
+}
+
+function canonicalRepoKey(url) {
+  let s = String(url || '').trim().replace(/\/$/, '');
+  if (s.toLowerCase().endsWith('.git')) s = s.slice(0, -4);
+  return s.toLowerCase();
 }
 
 function gitConfigGetRemoteOrigin(workdir) {
@@ -43,7 +60,7 @@ function githubHttpsRemoteFromSlug(owner, repo) {
   return `https://github.com/${owner}/${repo}.git`;
 }
 
-function writeAskpassBundle(accessToken) {
+function writeAskpassBundle(accessToken, username = 'x-access-token') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ghoauth_'));
   const tokenPath = path.join(dir, 'token');
   fs.writeFileSync(tokenPath, accessToken, { mode: 0o600 });
@@ -54,7 +71,7 @@ function writeAskpassBundle(accessToken) {
     `#!/bin/sh
 T=$(cat '${tp}')
 case "$1" in
-  *Username*) printf '%s\n' 'x-access-token' ;;
+  *Username*) printf '%s\n' '${String(username || 'x-access-token').replace(/'/g, "'\\''")}' ;;
   *Password*) printf '%s\n' "$T" ;;
 esac
 `,
@@ -166,6 +183,10 @@ export async function runLayerGithubOauthAccessPush(opts) {
     opts && typeof opts.accessTokenByRepoSlug === 'object' && opts.accessTokenByRepoSlug
       ? opts.accessTokenByRepoSlug
       : null;
+  const rawOauthAuthByRepo =
+    opts && typeof opts.oauthAuthByRepo === 'object' && opts.oauthAuthByRepo
+      ? opts.oauthAuthByRepo
+      : null;
   const accessTokenByRepoSlug = {};
   if (rawAccessTokenByRepoSlug) {
     for (const [rawSlug, rawToken] of Object.entries(rawAccessTokenByRepoSlug)) {
@@ -173,6 +194,18 @@ export async function runLayerGithubOauthAccessPush(opts) {
       const tok = String(rawToken || '').trim();
       if (!slug || !tok) continue;
       accessTokenByRepoSlug[slug] = tok;
+    }
+  }
+  const oauthAuthByRepo = {};
+  if (rawOauthAuthByRepo) {
+    for (const [rawRepoKey, rawAuth] of Object.entries(rawOauthAuthByRepo)) {
+      const key = canonicalRepoKey(rawRepoKey);
+      if (!key) continue;
+      if (!rawAuth || typeof rawAuth !== 'object') continue;
+      const provider = String(rawAuth.provider || '').trim().toLowerCase();
+      const accessToken = String(rawAuth.access_token || '').trim();
+      if (!provider || !accessToken) continue;
+      oauthAuthByRepo[key] = { provider, accessToken };
     }
   }
   const prBaseBranch = String(opts.prBaseBranch || '').trim();
@@ -185,8 +218,8 @@ export async function runLayerGithubOauthAccessPush(opts) {
   if (!targetBranch) {
     return { httpStatus: 400, payload: { ok: false, detail: 'target_branch 必填' } };
   }
-  if (!Object.keys(accessTokenByRepoSlug).length) {
-    return { httpStatus: 400, payload: { ok: false, detail: 'github_auth_by_repo 必填' } };
+  if (!Object.keys(accessTokenByRepoSlug).length && !Object.keys(oauthAuthByRepo).length) {
+    return { httpStatus: 400, payload: { ok: false, detail: 'github_auth_by_repo / oauth_auth_by_repo 必填' } };
   }
 
   const roots = layerGitWorkdirRootsForFileListing(layerId);
@@ -212,11 +245,11 @@ export async function runLayerGithubOauthAccessPush(opts) {
   const repos = [];
 
   const askpassByToken = new Map();
-  const askpassForToken = (token) => {
-    const key = String(token || '');
+  const askpassForToken = (token, username = 'x-access-token') => {
+    const key = `${String(username || 'x-access-token')}::${String(token || '')}`;
     const hit = askpassByToken.get(key);
     if (hit) return hit;
-    const bundle = writeAskpassBundle(key);
+    const bundle = writeAskpassBundle(String(token || ''), username);
     askpassByToken.set(key, bundle);
     return bundle;
   };
@@ -225,6 +258,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
     for (const row of gitRoots) {
       const originUrl = gitConfigGetRemoteOrigin(row.workdir);
       const slugInfo = parseGithubOwnerRepoFromRemoteUrl(originUrl);
+      const gitlabInfo = parseGitlabOwnerRepoFromRemoteUrl(originUrl);
       const item = {
         rel_prefix: row.relPrefix || '',
         origin_url: originUrl ? 'set' : '',
@@ -232,7 +266,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
         pr: null,
         pr_error: null,
       };
-      if (!slugInfo) {
+      if (!slugInfo && !gitlabInfo) {
         item.detail = 'remote 非 github.com，已跳过 OAuth 推送';
         appendGitPushReqLog(
           `oauth layer_id=${layerId} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} skip=non_github_remote`,
@@ -240,25 +274,34 @@ export async function runLayerGithubOauthAccessPush(opts) {
         repos.push(item);
         continue;
       }
-      const httpsRemote = githubHttpsRemoteFromSlug(slugInfo.owner, slugInfo.repo);
-      item.github_slug = slugInfo.slug;
-      const repoToken = accessTokenByRepoSlug[String(slugInfo.slug || '').toLowerCase()];
+      const provider = slugInfo ? 'github' : 'gitlab';
+      const slug = slugInfo ? slugInfo.slug : gitlabInfo.slug;
+      const httpsRemote = slugInfo ? githubHttpsRemoteFromSlug(slugInfo.owner, slugInfo.repo) : originUrl;
+      item.github_slug = slug;
+      item.provider = provider;
+      const canonicalKey = canonicalRepoKey(originUrl);
+      const repoToken = provider === 'github'
+        ? (accessTokenByRepoSlug[String(slug || '').toLowerCase()] || oauthAuthByRepo[canonicalKey]?.accessToken || '')
+        : (oauthAuthByRepo[canonicalKey]?.accessToken || '');
       if (!repoToken) {
-        item.detail = '该仓库未找到可用的 GitHub OAuth access_token';
+        item.detail = '该仓库未找到可用的 OAuth access_token';
         appendGitPushReqLog(
-          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} token=missing`,
+          `oauth layer_id=${layerId} slug=${slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} token=missing`,
         );
         repos.push(item);
         return {
           httpStatus: 400,
           payload: {
             ok: false,
-            detail: `推送失败（${slugInfo.slug}）：${item.detail}`,
+            detail: `推送失败（${slug}）：${item.detail}`,
             github_oauth_multirepo: { repos },
           },
         };
       }
-      const ask = askpassForToken(repoToken);
+      const ask = askpassForToken(
+        repoToken,
+        provider === 'gitlab' ? 'oauth2' : 'x-access-token',
+      );
       const pushEnv = {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',
@@ -271,31 +314,31 @@ export async function runLayerGithubOauthAccessPush(opts) {
         GIT_ASKPASS_ALWAYS: '1',
       });
       appendGitPushReqLog(
-        `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} run ${cmdLine}`,
+        `oauth layer_id=${layerId} slug=${slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} run ${cmdLine}`,
       );
       try {
         await gitExecAsync(pushArgs, row.workdir, pushEnv);
         item.push_ok = true;
         appendGitPushReqLog(
-          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push ok`,
+          `oauth layer_id=${layerId} slug=${slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push ok`,
         );
       } catch (e) {
         item.detail = String(e.message || e);
         appendGitPushReqLog(
-          `oauth layer_id=${layerId} slug=${slugInfo.slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push fail cmd=${cmdLine} err=${String(e.message || e).slice(0, 800)}`,
+          `oauth layer_id=${layerId} slug=${slug} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} git_push fail cmd=${cmdLine} err=${String(e.message || e).slice(0, 800)}`,
         );
         repos.push(item);
         return {
           httpStatus: 400,
           payload: {
             ok: false,
-            detail: `推送失败（${slugInfo.slug}）：${item.detail}`,
+            detail: `推送失败（${slug}）：${item.detail}`,
             github_oauth_multirepo: { repos },
           },
         };
       }
 
-      if (baseName && headName && baseName !== headName) {
+      if (provider === 'github' && baseName && headName && baseName !== headName) {
         const prRes = await createGithubPullRequest({
           owner: slugInfo.owner,
           repo: slugInfo.repo,

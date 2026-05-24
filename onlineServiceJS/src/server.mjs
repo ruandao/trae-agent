@@ -1230,7 +1230,7 @@ api.post('/layers/:layer_id/git/push', async (req, res) => {
 });
 
 /**
- * 接口 A：OAuth 按仓库 token 入参（github_auth_by_repo），对层内所有 GitHub 远程工作区 HTTPS 推送当前 HEAD，
+ * 接口 A：OAuth 按仓库 token 入参（github_auth_by_repo / oauth_auth_by_repo），对层内远程工作区 HTTPS 推送当前 HEAD，
  * 并在给定 base 上创建 PR（可选）。供 SaaS 在 refresh_token 换票后转发，与 TaskDetail 推送流程对齐。
  */
 api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
@@ -1238,6 +1238,11 @@ api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
   const tokenByRepo =
     rawTokenByRepo && typeof rawTokenByRepo === 'object' && !Array.isArray(rawTokenByRepo)
       ? rawTokenByRepo
+      : null;
+  const rawOauthAuthByRepo = req.body?.oauth_auth_by_repo;
+  const oauthAuthByRepo =
+    rawOauthAuthByRepo && typeof rawOauthAuthByRepo === 'object' && !Array.isArray(rawOauthAuthByRepo)
+      ? rawOauthAuthByRepo
       : null;
   const targetBranch = String(req.body?.target_branch || '').trim();
   const prBase = String(req.body?.pr_base_branch || '').trim();
@@ -1249,6 +1254,7 @@ api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
       layerId,
       targetBranch,
       accessTokenByRepoSlug: tokenByRepo,
+      oauthAuthByRepo,
       prBaseBranch: prBase,
       prTitle,
       prBody,
