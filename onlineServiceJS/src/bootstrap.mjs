@@ -188,6 +188,74 @@ function collectRepoUrls(taskDetail) {
   return out;
 }
 
+function canonicalRepoUrlKey(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return '';
+  return v.replace(/\/+$/, '').replace(/\.git$/i, '').toLowerCase();
+}
+
+export function resolveRepoCloneCredential(credRoot, repoUrl) {
+  if (!credRoot || typeof credRoot !== 'object') return null;
+  const direct = credRoot[String(repoUrl || '').trim()];
+  if (direct && typeof direct === 'object') return direct;
+  const target = canonicalRepoUrlKey(repoUrl);
+  if (!target) return null;
+  for (const [k, v] of Object.entries(credRoot)) {
+    if (canonicalRepoUrlKey(k) !== target) continue;
+    if (v && typeof v === 'object') return v;
+  }
+  return null;
+}
+
+export function buildHttpAuthFromRepoCredential(rawCredential) {
+  if (!rawCredential || typeof rawCredential !== 'object') return null;
+  const password = String(
+    rawCredential.ephemeral_git_http_password ||
+      rawCredential.ephemeral_git_password ||
+      rawCredential.ephemeral_oauth_access_token ||
+      ''
+  ).trim();
+  if (!password) return null;
+  const username = String(rawCredential.ephemeral_git_remote_username || '').trim() || 'oauth2';
+  return { username, password };
+}
+
+function createBootstrapGitAskPassScript(httpAuth) {
+  if (!httpAuth) return null;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bootstrap-askpass-'));
+  const shPath = path.join(dir, 'askpass.sh');
+  fs.writeFileSync(
+    shPath,
+    [
+      '#!/usr/bin/env sh',
+      'prompt="$1"',
+      'case "$prompt" in',
+      '  *sername*) printf %s "$GIT_HTTP_USERNAME" ;;',
+      '  *assword*) printf %s "$GIT_HTTP_PASSWORD" ;;',
+      '  *) printf "" ;;',
+      'esac',
+      '',
+    ].join('\n'),
+    { mode: 0o700 }
+  );
+  const cleanup = () => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  };
+  return {
+    envPatch: {
+      GIT_ASKPASS: shPath,
+      GIT_ASKPASS_ALWAYS: '1',
+      GIT_HTTP_USERNAME: httpAuth.username,
+      GIT_HTTP_PASSWORD: httpAuth.password,
+    },
+    cleanup,
+  };
+}
+
 /**
  * 并行发起单仓 git clone；stderr 写入 {@link bootstrapRepoLogState} 中对应仓库的 body（与其它仓并行追加）。
  * @returns {Promise<{ ok: boolean, err?: Error }>}
@@ -201,8 +269,15 @@ async function runOneBootstrapClone({
 }) {
   const { raw, repoDir, index: i } = job;
   const cloneRemote = raw;
+  const credential = resolveRepoCloneCredential(credRoot, raw);
+  const httpAuth = buildHttpAuthFromRepoCredential(credential);
+  const askpass = createBootstrapGitAskPassScript(httpAuth);
   try {
-    const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+    const gitEnv = {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      ...(askpass?.envPatch || {}),
+    };
     const useV4 = String(process.env.TRAE_GIT_CLONE_ALLOW_IPV6 || '').trim() !== '1';
     const args = useV4
       ? [...gitCloneConfigArgs(), 'clone', '-4', '--progress', cloneRemote, repoDir]
@@ -275,6 +350,8 @@ async function runOneBootstrapClone({
     return { ok: true };
   } catch (err) {
     return { ok: false, err: err instanceof Error ? err : new Error(String(err)) };
+  } finally {
+    askpass?.cleanup?.();
   }
 }
 
