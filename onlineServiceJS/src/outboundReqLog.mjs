@@ -9,6 +9,25 @@ export const GIT_PUSH_REQ_LOG_FILE = 'git-push.log';
 /** 允许写入 reqLogs 下的日志文件名（防路径穿越） */
 const ALLOWED_REQ_LOG_FILES = new Set([DEFAULT_REQ_LOG, 'heartbeat.log', GIT_PUSH_REQ_LOG_FILE]);
 
+export function isDebugAgentEnabled() {
+  const raw = String(process.env.DEBUG_AGENT || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+/**
+ * DEBUG_AGENT 调试日志：按用户要求不做脱敏和截断，完整序列化。
+ * 循环引用等不可序列化场景回退为 String()。
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function debugAgentStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function reqLogBasename(filename) {
   const raw = String(filename ?? '').trim();
   if (!raw) return DEFAULT_REQ_LOG;

@@ -8,7 +8,13 @@ import os from 'os';
 import { spawn, spawnSync } from 'child_process';
 import { gitCmd, formatGitExecDebugLine } from './gitCmd.mjs';
 import { layerGitWorkdirRootsForFileListing } from './layerFs.mjs';
-import { appendOutboundReqLog, appendGitPushReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
+import {
+  appendOutboundReqLog,
+  appendGitPushReqLog,
+  sanitizeUrlForOutboundLog,
+  isDebugAgentEnabled,
+  debugAgentStringify,
+} from './outboundReqLog.mjs';
 
 const GH_SLUG_RE = /github\.com[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i;
 const GL_SLUG_RE = /gitlab[^:/]*[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i;
@@ -130,20 +136,27 @@ async function createGithubPullRequest({ owner, repo, head, base, accessToken, t
   const t0 = Date.now();
   let r;
   try {
+    const headers = {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${accessToken}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+    };
+    const requestBody = {
+      title: title || 'Pull request',
+      head,
+      base,
+      body: bodyText || '',
+    };
+    if (isDebugAgentEnabled()) {
+      appendOutboundReqLog(
+        `DEBUG_AGENT outbound request method=POST url=${apiUrl} headers=${debugAgentStringify(headers)} body=${debugAgentStringify(requestBody)}`,
+      );
+    }
     r = await fetch(apiUrl, {
       method: 'POST',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${accessToken}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        title: title || 'Pull request',
-        head,
-        base,
-        body: bodyText || '',
-      }),
+      headers,
+      body: JSON.stringify(requestBody),
     });
   } catch (e) {
     appendOutboundReqLog(
@@ -152,6 +165,11 @@ async function createGithubPullRequest({ owner, repo, head, base, accessToken, t
     throw e;
   }
   const text = await r.text();
+  if (isDebugAgentEnabled()) {
+    appendOutboundReqLog(
+      `DEBUG_AGENT outbound response method=POST url=${apiUrl} status=${r.status} headers=${debugAgentStringify(Object.fromEntries(r.headers.entries()))} body=${text}`,
+    );
+  }
   appendOutboundReqLog(`github-api POST ${safeUrl} -> HTTP ${r.status} ${Date.now() - t0}ms`);
   let json = null;
   try {

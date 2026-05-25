@@ -6,7 +6,7 @@
 import fs from 'fs';
 import YAML from 'yaml';
 import { configFilePath } from './paths.mjs';
-import { appendOutboundReqLog } from './outboundReqLog.mjs';
+import { appendOutboundReqLog, isDebugAgentEnabled, debugAgentStringify } from './outboundReqLog.mjs';
 
 const DIFF_MAX = 28000;
 const LLM_TIMEOUT_MS = 45000;
@@ -81,29 +81,41 @@ async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent)
   appendOutboundReqLog(`staged-commit-suggest POST ${url} model=${model}`);
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  };
+  const reqBody = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content:
+          '你是助手。根据用户提供的 git 暂存区（已索引）unified diff，用中文写一句简短的提交说明：一行标题风格，不超过 72 个字符。只输出这一句说明，不要引号、不要前缀或解释。',
+      },
+      { role: 'user', content: userContent },
+    ],
+    max_tokens: 128,
+    temperature: 0.2,
+  };
   try {
+    if (isDebugAgentEnabled()) {
+      appendOutboundReqLog(
+        `DEBUG_AGENT outbound request method=POST url=${url} headers=${debugAgentStringify(headers)} body=${debugAgentStringify(reqBody)}`,
+      );
+    }
     const r = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          {
-            role: 'system',
-            content:
-              '你是助手。根据用户提供的 git 暂存区（已索引）unified diff，用中文写一句简短的提交说明：一行标题风格，不超过 72 个字符。只输出这一句说明，不要引号、不要前缀或解释。',
-          },
-          { role: 'user', content: userContent },
-        ],
-        max_tokens: 128,
-        temperature: 0.2,
-      }),
+      headers,
+      body: JSON.stringify(reqBody),
       signal: ac.signal,
     });
     const text = await r.text();
+    if (isDebugAgentEnabled()) {
+      appendOutboundReqLog(
+        `DEBUG_AGENT outbound response method=POST url=${url} status=${r.status} headers=${debugAgentStringify(Object.fromEntries(r.headers.entries()))} body=${text}`,
+      );
+    }
     if (!r.ok) {
       appendOutboundReqLog(`staged-commit-suggest LLM HTTP ${r.status} ${text.slice(0, 240)}`);
       return null;

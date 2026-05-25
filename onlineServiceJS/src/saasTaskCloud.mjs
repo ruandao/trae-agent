@@ -7,7 +7,12 @@
 import { spawn } from 'child_process';
 
 import { gitCmd } from './gitCmd.mjs';
-import { appendOutboundReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
+import {
+  appendOutboundReqLog,
+  sanitizeUrlForOutboundLog,
+  isDebugAgentEnabled,
+  debugAgentStringify,
+} from './outboundReqLog.mjs';
 
 function traceHeaders() {
   const tid = String(process.env.TRACE_ID || '').trim();
@@ -116,14 +121,27 @@ export async function postJson(url, body, timeoutSec = 8, opts = {}) {
     while (idx < attempts.length) {
       const targetUrl = attempts[idx];
       const safeTargetUrl = sanitizeUrlForOutboundLog(targetUrl);
+      const headers = traceHeaders();
       try {
+        if (isDebugAgentEnabled()) {
+          appendOutboundReqLog(
+            `DEBUG_AGENT outbound request method=POST url=${targetUrl} headers=${debugAgentStringify(headers)} body=${debugAgentStringify(body)}`,
+            logOpts,
+          );
+        }
         const r = await fetch(targetUrl, {
           method: 'POST',
-          headers: traceHeaders(),
+          headers,
           body: JSON.stringify(body),
           signal: ac.signal,
         });
         const text = await r.text();
+        if (isDebugAgentEnabled()) {
+          appendOutboundReqLog(
+            `DEBUG_AGENT outbound response method=POST url=${targetUrl} status=${r.status} headers=${debugAgentStringify(Object.fromEntries(r.headers.entries()))} body=${text}`,
+            logOpts,
+          );
+        }
         const ms = Date.now() - t0;
         appendOutboundReqLog(`postJson POST ${safeTargetUrl} -> HTTP ${r.status} ${ms}ms`, logOpts);
         let data = {};
@@ -141,6 +159,12 @@ export async function postJson(url, body, timeoutSec = 8, opts = {}) {
         }
         return data;
       } catch (e) {
+        if (isDebugAgentEnabled()) {
+          appendOutboundReqLog(
+            `DEBUG_AGENT outbound error method=POST url=${targetUrl} message=${formatErrorWithCause(e)}`,
+            logOpts,
+          );
+        }
         if (
           idx === 0 &&
           attempts.length > 1 &&

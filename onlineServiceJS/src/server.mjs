@@ -10,7 +10,12 @@ import { spawn, spawnSync } from 'child_process';
 import { authMiddleware, accessTokenExpected } from './auth.mjs';
 import { getAgentRenderHints } from './agentRenderHints.mjs';
 import { serviceRoot, configFilePath, repoRoot, logsDir } from './paths.mjs';
-import { appendOutboundReqLog, appendGitPushReqLog } from './outboundReqLog.mjs';
+import {
+  appendOutboundReqLog,
+  appendGitPushReqLog,
+  isDebugAgentEnabled,
+  debugAgentStringify,
+} from './outboundReqLog.mjs';
 import { ssePingLoop, addSseClient, broadcast } from './sseHub.mjs';
 import {
   runBootstrapTokenExchangeOnly,
@@ -84,6 +89,7 @@ import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
 import { runLayerOauthRefreshPush } from './layerGitOauthRefreshPush.mjs';
 import { runLayerOauthFetchTokenFiles } from './layerGitOauthFetchTokenFiles.mjs';
 import { gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
+import { appendInitLogBestEffort } from './initLog.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -96,6 +102,45 @@ function traceMiddleware(req, res, next) {
 
 function cryptoRandomId() {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+export function createDebugAgentInboundLoggerMiddleware({
+  isEnabled = isDebugAgentEnabled,
+  appendLog = appendOutboundReqLog,
+  stringify = debugAgentStringify,
+} = {}) {
+  return (req, res, next) => {
+    if (!isEnabled()) return next();
+    const requestHeaders = { ...req.headers };
+    const requestBody = req.body;
+    let responseBody;
+    const origJson = typeof res.json === 'function' ? res.json.bind(res) : null;
+    const origSend = typeof res.send === 'function' ? res.send.bind(res) : null;
+    if (origJson) {
+      res.json = (payload) => {
+        responseBody = payload;
+        return origJson(payload);
+      };
+    }
+    if (origSend) {
+      res.send = (payload) => {
+        responseBody = payload;
+        return origSend(payload);
+      };
+    }
+    res.on('finish', () => {
+      try {
+        const responseHeaders =
+          typeof res.getHeaders === 'function' ? res.getHeaders() : {};
+        appendLog(
+          `DEBUG_AGENT inbound request method=${req.method} url=${req.originalUrl} headers=${stringify(requestHeaders)} body=${stringify(requestBody)} response_status=${res.statusCode} response_headers=${stringify(responseHeaders)} response_body=${stringify(responseBody)}`,
+        );
+      } catch {
+        /* ignore */
+      }
+    });
+    next();
+  };
 }
 
 function useGitCloneForceIpv4() {
@@ -202,6 +247,7 @@ function safeRepoRelativePathForGitAdd(work, relPath) {
 const app = express();
 app.use(traceMiddleware);
 app.use(express.json({ limit: '20mb' }));
+app.use(createDebugAgentInboundLoggerMiddleware());
 
 const accessLogPath = () => path.join(logsDir(), 'requests.log');
 function logReq(req, res, start, statusOverride) {
@@ -1349,28 +1395,40 @@ async function callOpenAiCompatibleChat({ baseUrl, apiKey, model }, userContent)
   appendOutboundReqLog(`diff-log-summary POST ${url} model=${model}`);
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), AI_SUMMARY_TIMEOUT_MS);
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  };
+  const reqBody = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content: '你是一个代码变更总结助手。请根据用户提供的 git diff 内容，用简洁的中文总结用户做了什么修改。输出格式：1. 变更类型：描述；2. 涉及文件：文件名列表；3. 主要改动：简要说明。保持简洁明了。',
+      },
+      { role: 'user', content: userContent },
+    ],
+    max_tokens: 256,
+    temperature: 0.3,
+  };
   try {
+    if (isDebugAgentEnabled()) {
+      appendOutboundReqLog(
+        `DEBUG_AGENT outbound request method=POST url=${url} headers=${debugAgentStringify(headers)} body=${debugAgentStringify(reqBody)}`,
+      );
+    }
     const r = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          {
-            role: 'system',
-            content: '你是一个代码变更总结助手。请根据用户提供的 git diff 内容，用简洁的中文总结用户做了什么修改。输出格式：1. 变更类型：描述；2. 涉及文件：文件名列表；3. 主要改动：简要说明。保持简洁明了。',
-          },
-          { role: 'user', content: userContent },
-        ],
-        max_tokens: 256,
-        temperature: 0.3,
-      }),
+      headers,
+      body: JSON.stringify(reqBody),
       signal: ac.signal,
     });
     const text = await r.text();
+    if (isDebugAgentEnabled()) {
+      appendOutboundReqLog(
+        `DEBUG_AGENT outbound response method=POST url=${url} status=${r.status} headers=${debugAgentStringify(Object.fromEntries(r.headers.entries()))} body=${text}`,
+      );
+    }
     if (!r.ok) {
       appendOutboundReqLog(`diff-log-summary LLM HTTP ${r.status} ${text.slice(0, 240)}`);
       return null;
@@ -1640,19 +1698,38 @@ app.use('/api', api);
 const port = parseInt(process.env.PORT || '8765', 10);
 const host = '0.0.0.0';
 
-async function main() {
-  ssePingLoop();
+export async function main({
+  appendInitLog = appendInitLogBestEffort,
+  runBootstrapTokenExchangeOnlyFn = runBootstrapTokenExchangeOnly,
+  startSsePingLoop = ssePingLoop,
+  stopAfterBootstrapTokenExchangeOnly = false,
+} = {}) {
+  startSsePingLoop();
+  try {
+    const initLogResult = appendInitLog({
+      pid: process.pid,
+      port: String(port),
+      envMapping: process.env,
+      rawPolicy: process.env.INIT_LOG_ENV_KEYS,
+    });
+    if (initLogResult && initLogResult.ok === false) {
+      console.error('[onlineServiceJS] init.log append error:', initLogResult.error);
+    }
+  } catch (e) {
+    console.error('[onlineServiceJS] init.log append error:', e);
+  }
   const strict = ['1', 'true', 'yes', 'on'].includes(
     String(process.env.TASK_API_BOOTSTRAP_STRICT_STARTUP || '').toLowerCase()
   );
   let bootstrapCtx;
   try {
-    bootstrapCtx = await runBootstrapTokenExchangeOnly();
+    bootstrapCtx = await runBootstrapTokenExchangeOnlyFn();
   } catch (e) {
     console.error('[onlineServiceJS] bootstrap (token) error:', e);
     if (strict) process.exit(1);
     bootstrapCtx = { skipped: true };
   }
+  if (stopAfterBootstrapTokenExchangeOnly) return;
   ensureStartupEmptyLayer();
   try {
     sweepDanglingLayerDirs();
@@ -1705,7 +1782,9 @@ async function main() {
   });
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+if (process.env.ONLINE_SERVICE_JS_SKIP_MAIN !== '1') {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

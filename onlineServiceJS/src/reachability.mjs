@@ -3,7 +3,12 @@
  */
 import os from 'os';
 
-import { appendOutboundReqLog, sanitizeUrlForOutboundLog } from './outboundReqLog.mjs';
+import {
+  appendOutboundReqLog,
+  sanitizeUrlForOutboundLog,
+  isDebugAgentEnabled,
+  debugAgentStringify,
+} from './outboundReqLog.mjs';
 import { postJson, rewriteDockerInternal, taskApiPrefix } from './saasTaskCloud.mjs';
 
 /** IPv6 等非 IPv4 文本在 URL authority 中需方括号 */
@@ -119,8 +124,18 @@ async function fetchPublicIpv4Domestic(timeoutMs = 4500) {
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     const t0 = Date.now();
     try {
+      if (isDebugAgentEnabled()) {
+        appendOutboundReqLog(
+          `DEBUG_AGENT outbound request method=GET url=${url} headers=${debugAgentStringify({})} body=${debugAgentStringify(null)}`,
+        );
+      }
       const r = await fetch(url, { signal: ac.signal });
       const body = await r.text();
+      if (isDebugAgentEnabled()) {
+        appendOutboundReqLog(
+          `DEBUG_AGENT outbound response method=GET url=${url} status=${r.status} headers=${debugAgentStringify(Object.fromEntries(r.headers.entries()))} body=${body}`,
+        );
+      }
       appendOutboundReqLog(`reachability GET ${safe} -> HTTP ${r.status} ${Date.now() - t0}ms`);
       if (!r.ok) return null;
       return parse(body);
