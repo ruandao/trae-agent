@@ -574,7 +574,7 @@ function parseStructuredPayloadFromErrorMessage(errLike) {
   return null;
 }
 
-function taskDetailStructuredPayload(errLike) {
+function bootstrapStructuredPayload(errLike) {
   const direct = errLike && typeof errLike === 'object' ? errLike.structuredPayload : null;
   if (direct && typeof direct === 'object') return direct;
   return parseStructuredPayloadFromErrorMessage(errLike);
@@ -591,23 +591,51 @@ function summarizeMissingRepoCredentials(payload) {
   return out;
 }
 
-export function buildTaskDetailBootstrapError(errLike) {
-  const payload = taskDetailStructuredPayload(errLike);
+export function buildRepoCloneCredentialsBootstrapError(errLike) {
+  const payload = bootstrapStructuredPayload(errLike);
   const code = String(payload?.error_code || '').trim();
   if (code !== 'REPO_CLONE_CREDENTIALS_INCOMPLETE') {
-    return errLike instanceof Error ? errLike : new Error(String(errLike || 'task-detail failed'));
+    return errLike instanceof Error
+      ? errLike
+      : new Error(String(errLike || 'repo-clone-credentials failed'));
   }
   const detail = String(payload?.detail || '').trim();
   const missing = summarizeMissingRepoCredentials(payload);
   const missingBrief = missing.length
     ? ` 缺失仓库(${missing.length}): ${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ' ...' : ''}`
     : '';
-  const msg = `task-detail 未返回完整 repo_clone_credentials；请在任务详情为全部仓库绑定 Git 授权后重试。${missingBrief}${detail ? ` detail=${detail}` : ''}`;
+  const msg = `repo-clone-credentials 未返回完整 repo_clone_credentials；请在任务详情为全部仓库绑定 Git 授权后重试。${missingBrief}${detail ? ` detail=${detail}` : ''}`;
   const wrapped = new Error(msg);
   if (payload && typeof payload === 'object') {
     wrapped.structuredPayload = payload;
   }
   return wrapped;
+}
+
+export function buildTaskDetailBootstrapError(errLike) {
+  return buildRepoCloneCredentialsBootstrapError(errLike);
+}
+
+export async function fetchBootstrapRepoInputs(prefix, accessToken, timeoutSec) {
+  const detail = await postJson(
+    `${prefix}/server-container-token/task-detail/`,
+    { access_token: accessToken },
+    timeoutSec
+  );
+  const urls = collectRepoUrls(detail);
+  if (!urls.length) {
+    return { urls, credRoot: {} };
+  }
+  const credResp = await postJson(
+    `${prefix}/server-container-token/repo-clone-credentials/`,
+    { access_token: accessToken },
+    timeoutSec
+  );
+  const credRoot =
+    credResp && typeof credResp.repo_clone_credentials === 'object'
+      ? credResp.repo_clone_credentials
+      : {};
+  return { urls, credRoot };
 }
 
 function bootstrapTimeoutSec() {
@@ -838,22 +866,23 @@ export async function runBootstrapAfterListen(ctx) {
   console.log('[onlineServiceJS] 容器已启动，开始拉取任务详情…');
   appendOutboundReqLog('bootstrap post-listen: task-detail');
 
-  let detail;
-  try {
-    detail = await postJson(
-      `${prefix}/server-container-token/task-detail/`,
-      { access_token: newAccess },
-      timeoutSec
-    );
-  } catch (e) {
-    throw buildTaskDetailBootstrapError(e);
-  }
-  const urls = collectRepoUrls(detail);
+  let urls = [];
   let credRoot = {};
-  if (detail && typeof detail.repo_clone_credentials === 'object') {
-    credRoot = detail.repo_clone_credentials;
+  try {
+    const repoInputs = await fetchBootstrapRepoInputs(prefix, newAccess, timeoutSec);
+    urls = repoInputs.urls;
+    credRoot = repoInputs.credRoot;
+  } catch (e) {
+    if (
+      String(e?.message || '').includes('/server-container-token/repo-clone-credentials/')
+      || String(e?.message || '').includes('REPO_CLONE_CREDENTIALS_INCOMPLETE')
+    ) {
+      throw buildRepoCloneCredentialsBootstrapError(e);
+    }
+    throw e instanceof Error ? e : new Error(String(e || 'task-detail failed'));
   }
   if (urls.length) {
+    appendOutboundReqLog('bootstrap post-listen: repo-clone-credentials');
     console.log('[onlineServiceJS] 任务详情已就绪，开始项目克隆…');
     bootstrapCloneLayerId = await cloneReposIntoSharedLayer(urls, credRoot, prefix, newAccess);
     bootstrapRegisterCloneJob = true;
