@@ -194,6 +194,25 @@ function canonicalRepoUrlKey(raw) {
   return v.replace(/\/+$/, '').replace(/\.git$/i, '').toLowerCase();
 }
 
+function repoPathKey(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return '';
+  try {
+    const u = new URL(v);
+    return String(u.pathname || '')
+      .replace(/\/+$/, '')
+      .replace(/\.git$/i, '')
+      .toLowerCase();
+  } catch {
+    const scp = v.match(/^[^@]+@[^:]+:(.+)$/);
+    if (!scp || !scp[1]) return '';
+    return String(scp[1])
+      .replace(/\/+$/, '')
+      .replace(/\.git$/i, '')
+      .toLowerCase();
+  }
+}
+
 export function resolveRepoCloneCredential(credRoot, repoUrl) {
   if (!credRoot || typeof credRoot !== 'object') return null;
   const direct = credRoot[String(repoUrl || '').trim()];
@@ -204,19 +223,43 @@ export function resolveRepoCloneCredential(credRoot, repoUrl) {
     if (canonicalRepoUrlKey(k) !== target) continue;
     if (v && typeof v === 'object') return v;
   }
+  // 兼容同一仓库因 allowedHost/隧道映射导致 host 不同（如 gitlab.aidevpm.com ↔ localhost:8012）。
+  // 仅在“路径唯一”时回退，避免多仓同路径误配凭证。
+  const targetPath = repoPathKey(repoUrl);
+  if (!targetPath) return null;
+  const byPath = [];
+  for (const [k, v] of Object.entries(credRoot)) {
+    if (!v || typeof v !== 'object') continue;
+    if (repoPathKey(k) !== targetPath) continue;
+    byPath.push(v);
+    if (byPath.length > 1) return null;
+  }
+  if (byPath.length === 1) return byPath[0];
   return null;
 }
 
-export function buildHttpAuthFromRepoCredential(rawCredential) {
+function usernameFromRepoUrl(repoUrl) {
+  const raw = String(repoUrl || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    const segs = String(u.pathname || '')
+      .split('/')
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (!segs.length) return '';
+    return segs[0] || '';
+  } catch {
+    return '';
+  }
+}
+
+export function buildHttpAuthFromRepoCredential(rawCredential, repoUrl = '') {
   if (!rawCredential || typeof rawCredential !== 'object') return null;
-  const password = String(
-    rawCredential.ephemeral_git_http_password ||
-      rawCredential.ephemeral_git_password ||
-      rawCredential.ephemeral_oauth_access_token ||
-      ''
-  ).trim();
+  const password = String(rawCredential.ephemeral_oauth_access_token || '').trim();
   if (!password) return null;
-  const username = String(rawCredential.ephemeral_git_remote_username || '').trim() || 'oauth2';
+  const username = usernameFromRepoUrl(repoUrl);
+  if (!username) return null;
   return { username, password };
 }
 
@@ -270,7 +313,7 @@ async function runOneBootstrapClone({
   const { raw, repoDir, index: i } = job;
   const cloneRemote = raw;
   const credential = resolveRepoCloneCredential(credRoot, raw);
-  const httpAuth = buildHttpAuthFromRepoCredential(credential);
+  const httpAuth = buildHttpAuthFromRepoCredential(credential, raw);
   const askpass = createBootstrapGitAskPassScript(httpAuth);
   try {
     const gitEnv = {
@@ -515,6 +558,58 @@ function logTokenExchange(line) {
   console.log(`[onlineServiceJS] ${msg}`);
 }
 
+function parseStructuredPayloadFromErrorMessage(errLike) {
+  const raw = String(errLike?.message || errLike || '').trim();
+  if (!raw) return null;
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] !== '{') continue;
+    const jsonPart = raw.slice(i);
+    try {
+      const parsed = JSON.parse(jsonPart);
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      /* continue scanning */
+    }
+  }
+  return null;
+}
+
+function taskDetailStructuredPayload(errLike) {
+  const direct = errLike && typeof errLike === 'object' ? errLike.structuredPayload : null;
+  if (direct && typeof direct === 'object') return direct;
+  return parseStructuredPayloadFromErrorMessage(errLike);
+}
+
+function summarizeMissingRepoCredentials(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  const rows = Array.isArray(payload.missing_repo_credentials) ? payload.missing_repo_credentials : [];
+  const out = [];
+  for (const raw of rows) {
+    const s = String(raw || '').trim();
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+export function buildTaskDetailBootstrapError(errLike) {
+  const payload = taskDetailStructuredPayload(errLike);
+  const code = String(payload?.error_code || '').trim();
+  if (code !== 'REPO_CLONE_CREDENTIALS_INCOMPLETE') {
+    return errLike instanceof Error ? errLike : new Error(String(errLike || 'task-detail failed'));
+  }
+  const detail = String(payload?.detail || '').trim();
+  const missing = summarizeMissingRepoCredentials(payload);
+  const missingBrief = missing.length
+    ? ` 缺失仓库(${missing.length}): ${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ' ...' : ''}`
+    : '';
+  const msg = `task-detail 未返回完整 repo_clone_credentials；请在任务详情为全部仓库绑定 Git 授权后重试。${missingBrief}${detail ? ` detail=${detail}` : ''}`;
+  const wrapped = new Error(msg);
+  if (payload && typeof payload === 'object') {
+    wrapped.structuredPayload = payload;
+  }
+  return wrapped;
+}
+
 function bootstrapTimeoutSec() {
   return Math.max(1, parseFloat(process.env.TASK_API_BOOTSTRAP_TIMEOUT_SEC || '15') || 15);
 }
@@ -743,11 +838,16 @@ export async function runBootstrapAfterListen(ctx) {
   console.log('[onlineServiceJS] 容器已启动，开始拉取任务详情…');
   appendOutboundReqLog('bootstrap post-listen: task-detail');
 
-  const detail = await postJson(
-    `${prefix}/server-container-token/task-detail/`,
-    { access_token: newAccess },
-    timeoutSec
-  );
+  let detail;
+  try {
+    detail = await postJson(
+      `${prefix}/server-container-token/task-detail/`,
+      { access_token: newAccess },
+      timeoutSec
+    );
+  } catch (e) {
+    throw buildTaskDetailBootstrapError(e);
+  }
   const urls = collectRepoUrls(detail);
   let credRoot = {};
   if (detail && typeof detail.repo_clone_credentials === 'object') {
