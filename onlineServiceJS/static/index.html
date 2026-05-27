@@ -1190,6 +1190,14 @@
       });
     };
 
+    /** 带超时的 api：避免拉取 OAuth 等长耗时请求让按钮一直停在「拉取中…」。 */
+    const apiWithTimeout = (path, opts = {}, timeoutMs = 130000) => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      const merged = { ...opts, signal: ac.signal };
+      return api(path, merged).finally(() => clearTimeout(timer));
+    };
+
     async function refreshHostRepoPushLine() {
       const el = document.getElementById('hostRepoPushLine');
       if (!el) return;
@@ -4013,55 +4021,72 @@
       oauthFetchTokenFilesBtn.textContent = '拉取AccessToken';
       oauthFetchTokenFilesBtn.title = '经 task2app 换发 access_token，并写入每个仓库根目录 .task2app_access_token';
       oauthFetchTokenFilesBtn.onclick = debounceClick(() => {
-        void runAsyncButton(
-          oauthFetchTokenFilesBtn,
-          async () => {
-            const r = await api(
-              '/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/oauth-fetch-token-files',
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({}),
-              },
-            );
-            const rawText = await r.text();
-            let j = null;
-            try {
-              j = JSON.parse(rawText);
-            } catch (_) {}
-            if (!r.ok) {
-              let msg = rawText;
-              if (j && j.detail !== undefined) {
-                msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+        void (async () => {
+          let dialogMsg = null;
+          await runAsyncButton(
+            oauthFetchTokenFilesBtn,
+            async () => {
+              let r;
+              try {
+                r = await apiWithTimeout(
+                  '/api/layers/' + encodeURIComponent(layer.layer_id) + '/git/oauth-fetch-token-files',
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                  },
+                  130000,
+                );
+              } catch (e) {
+                const errName = String(e && e.name ? e.name : '');
+                if (errName === 'AbortError') {
+                  dialogMsg = '拉取AccessToken失败：请求超时（130s），请检查 task2app/gitOauth 是否可达后重试';
+                  return;
+                }
+                dialogMsg = '拉取AccessToken失败：' + String(e && e.message ? e.message : e);
+                return;
               }
-              alert('拉取AccessToken失败：' + msg);
-              return;
-            }
-            if (j && j.ok) {
-              const rows = Array.isArray(j.token_files) ? j.token_files : [];
-              const okRows = rows.filter((x) => x && x.write_ok);
-              const failedRows = rows.filter((x) => x && !x.write_ok);
-              const okNames = okRows.map((x) => x.github_slug || x.rel_prefix || '?');
-              const msg =
-                '已写入 ' +
-                okRows.length +
-                '/' +
-                rows.length +
-                ' 个仓库 token 文件' +
-                (okNames.length ? '\n\n成功：' + okNames.join(', ') : '') +
-                (failedRows.length
-                  ? '\n\n失败：' +
-                    failedRows
-                      .map((x) => (x.github_slug || x.rel_prefix || '?') + (x.detail ? '（' + x.detail + '）' : ''))
-                      .join(', ')
-                  : '');
-              alert(msg);
-            } else {
-              alert('已完成：' + rawText);
-            }
-          },
-          { busyText: '拉取中…' },
-        );
+              const rawText = await r.text();
+              let j = null;
+              try {
+                j = JSON.parse(rawText);
+              } catch (_) {}
+              if (!r.ok) {
+                let msg = rawText;
+                if (j && j.detail !== undefined) {
+                  msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+                }
+                dialogMsg = '拉取AccessToken失败：' + msg;
+                return;
+              }
+              if (j && j.ok) {
+                const rows = Array.isArray(j.token_files) ? j.token_files : [];
+                const okRows = rows.filter((x) => x && x.write_ok);
+                const failedRows = rows.filter((x) => x && !x.write_ok);
+                const okNames = okRows.map((x) => x.github_slug || x.rel_prefix || '?');
+                dialogMsg =
+                  '已写入 ' +
+                  okRows.length +
+                  '/' +
+                  rows.length +
+                  ' 个仓库 token 文件' +
+                  (okNames.length ? '\n\n成功：' + okNames.join(', ') : '') +
+                  (failedRows.length
+                    ? '\n\n失败：' +
+                      failedRows
+                        .map((x) => (x.github_slug || x.rel_prefix || '?') + (x.detail ? '（' + x.detail + '）' : ''))
+                        .join(', ')
+                    : '');
+              } else {
+                dialogMsg = '已完成：' + rawText;
+              }
+            },
+            { busyText: '拉取中…' },
+          );
+          if (dialogMsg) {
+            alert(dialogMsg);
+          }
+        })();
       }, BTN_DEBOUNCE_MS);
       bar.appendChild(oauthFetchTokenFilesBtn);
 

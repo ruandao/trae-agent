@@ -11,7 +11,8 @@ export function gitCmd() {
  * @see https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory
  */
 export function gitCloneConfigArgs() {
-  return ['-c', 'safe.directory=*'];
+  // 禁用 osxkeychain 等全局 credential.helper，避免覆盖 GIT_ASKPASS 下发的 OAuth token。
+  return ['-c', 'safe.directory=*', '-c', 'credential.helper='];
 }
 
 /** 单引号包裹，便于日志里复制含空格的路径（POSIX 风格） */

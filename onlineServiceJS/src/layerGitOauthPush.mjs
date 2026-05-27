@@ -39,6 +39,68 @@ function parseGitlabOwnerRepoFromRemoteUrl(url) {
   return { owner, repo, slug: `${owner}/${repo}` };
 }
 
+/** 从任意 HTTPS 远端路径解析 owner/repo（如 http://localhost:8012/ljy/somanyad.git）。 */
+function parseOwnerRepoFromPathUrl(url) {
+  try {
+    const u = new URL(String(url || '').trim());
+    let pth = String(u.pathname || '').replace(/^\/+/, '').replace(/\.git$/i, '');
+    const parts = pth.split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    const repo = String(parts.pop() || '').trim();
+    const owner = String(parts.pop() || '').trim();
+    if (!owner || !repo) return null;
+    return { owner, repo, slug: `${owner}/${repo}` };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 结合远端 URL 与 SaaS 下发的 oauth_auth_by_repo，解析推送上下文。
+ * 本地 GitLab（host 不含 gitlab）须依赖 oauth_auth_by_repo 的 canonical key，不能仅靠 hostname 正则。
+ */
+function resolveOAuthPushRepoContext(originUrl, accessTokenByRepoSlug, oauthAuthByRepo) {
+  const canonicalKey = canonicalRepoKey(originUrl);
+  const oauthEntry = oauthAuthByRepo[canonicalKey] || null;
+  let slugInfo = parseGithubOwnerRepoFromRemoteUrl(originUrl);
+  let gitlabInfo = parseGitlabOwnerRepoFromRemoteUrl(originUrl);
+  if (!slugInfo && !gitlabInfo && oauthEntry) {
+    const pathSlug = parseOwnerRepoFromPathUrl(originUrl);
+    const provider = String(oauthEntry.provider || '').trim().toLowerCase();
+    if (provider === 'gitlab' && pathSlug) {
+      gitlabInfo = pathSlug;
+    } else if (provider === 'github') {
+      slugInfo = slugInfo || pathSlug || parseGithubOwnerRepoFromRemoteUrl(originUrl);
+    }
+  }
+  if (!slugInfo && !gitlabInfo) {
+    return { skip: true, canonicalKey, oauthEntry };
+  }
+  const provider = slugInfo ? 'github' : 'gitlab';
+  const slug = slugInfo ? slugInfo.slug : gitlabInfo.slug;
+  const httpsRemote = slugInfo ? githubHttpsRemoteFromSlug(slugInfo.owner, slugInfo.repo) : originUrl;
+  const repoToken =
+    provider === 'github'
+      ? accessTokenByRepoSlug[String(slug || '').toLowerCase()] || oauthEntry?.accessToken || ''
+      : oauthEntry?.accessToken || '';
+  return {
+    skip: false,
+    canonicalKey,
+    oauthEntry,
+    slugInfo,
+    gitlabInfo,
+    provider,
+    slug,
+    httpsRemote,
+    repoToken,
+  };
+}
+
+const GIT_PUSH_TIMEOUT_MS = Math.max(
+  5000,
+  Number.parseInt(String(process.env.GIT_PUSH_TIMEOUT_MS || '90000'), 10) || 90000,
+);
+
 function canonicalRepoKey(url) {
   let s = String(url || '').trim().replace(/\/$/, '');
   if (s.toLowerCase().endsWith('.git')) s = s.slice(0, -4);
@@ -103,16 +165,34 @@ async function gitExecAsync(args, cwd, env = {}) {
     });
     let out = '';
     let err = '';
+    let settled = false;
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(val);
+    };
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+      finish(
+        reject,
+        new Error(`git 命令超时（${GIT_PUSH_TIMEOUT_MS}ms）：${formatGitExecDebugLine(cwd, args, null)}`),
+      );
+    }, GIT_PUSH_TIMEOUT_MS);
     proc.stdout?.on('data', (c) => {
       out += c.toString();
     });
     proc.stderr?.on('data', (c) => {
       err += c.toString();
     });
-    proc.on('error', reject);
+    proc.on('error', (e) => finish(reject, e));
     proc.on('close', (code) => {
-      if (code === 0) resolve(out + err);
-      else reject(new Error((err || out || `git exit ${code}`).slice(-4000)));
+      if (code === 0) finish(resolve, out + err);
+      else finish(reject, new Error((err || out || `git exit ${code}`).slice(-4000)));
     });
   });
 }
@@ -275,8 +355,6 @@ export async function runLayerGithubOauthAccessPush(opts) {
   try {
     for (const row of gitRoots) {
       const originUrl = gitConfigGetRemoteOrigin(row.workdir);
-      const slugInfo = parseGithubOwnerRepoFromRemoteUrl(originUrl);
-      const gitlabInfo = parseGitlabOwnerRepoFromRemoteUrl(originUrl);
       const item = {
         rel_prefix: row.relPrefix || '',
         origin_url: originUrl ? 'set' : '',
@@ -284,23 +362,18 @@ export async function runLayerGithubOauthAccessPush(opts) {
         pr: null,
         pr_error: null,
       };
-      if (!slugInfo && !gitlabInfo) {
-        item.detail = 'remote 非 github.com，已跳过 OAuth 推送';
+      const ctx = resolveOAuthPushRepoContext(originUrl, accessTokenByRepoSlug, oauthAuthByRepo);
+      if (ctx.skip) {
+        item.detail = 'remote 无法识别且 oauth_auth_by_repo 无匹配项，已跳过 OAuth 推送';
         appendGitPushReqLog(
-          `oauth layer_id=${layerId} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} skip=non_github_remote`,
+          `oauth layer_id=${layerId} rel_prefix=${String(row.relPrefix || '').slice(0, 160)} skip=unmatched_remote canonical=${ctx.canonicalKey}`,
         );
         repos.push(item);
         continue;
       }
-      const provider = slugInfo ? 'github' : 'gitlab';
-      const slug = slugInfo ? slugInfo.slug : gitlabInfo.slug;
-      const httpsRemote = slugInfo ? githubHttpsRemoteFromSlug(slugInfo.owner, slugInfo.repo) : originUrl;
+      const { slugInfo, provider, slug, httpsRemote, repoToken } = ctx;
       item.github_slug = slug;
       item.provider = provider;
-      const canonicalKey = canonicalRepoKey(originUrl);
-      const repoToken = provider === 'github'
-        ? (accessTokenByRepoSlug[String(slug || '').toLowerCase()] || oauthAuthByRepo[canonicalKey]?.accessToken || '')
-        : (oauthAuthByRepo[canonicalKey]?.accessToken || '');
       if (!repoToken) {
         item.detail = '该仓库未找到可用的 OAuth access_token';
         appendGitPushReqLog(
@@ -395,7 +468,7 @@ export async function runLayerGithubOauthAccessPush(opts) {
       httpStatus: 400,
       payload: {
         ok: false,
-        detail: '层内未发现可供 OAuth 推送的 github.com 远程仓库',
+        detail: '层内未发现可供 OAuth 推送的 Git 远程仓库（请确认 oauth_auth_by_repo 与 origin 地址一致）',
         github_oauth_multirepo: { repos },
       },
     };
