@@ -59,7 +59,7 @@ test('buildHttpAuthFromRepoCredential returns null when repo path is missing', (
   assert.equal(auth, null);
 });
 
-test('buildHttpAuthFromRepoCredential extracts username from repo path', () => {
+test('buildHttpAuthFromRepoCredential extracts username from repo path when provider unknown', () => {
   const auth = buildHttpAuthFromRepoCredential(
     {
       ephemeral_oauth_access_token: 'glpat-123',
@@ -67,6 +67,40 @@ test('buildHttpAuthFromRepoCredential extracts username from repo path', () => {
     'http://localhost:8012/demo/repo-a.git'
   );
   assert.deepEqual(auth, { username: 'demo', password: 'glpat-123' });
+});
+
+test('buildHttpAuthFromRepoCredential prefers git_http_username from credential', () => {
+  const auth = buildHttpAuthFromRepoCredential(
+    {
+      ephemeral_oauth_access_token: 'token-a',
+      provider: 'gitlab',
+      git_http_username: 'oauth2',
+    },
+    'http://localhost:8012/ljy/somanyad.git'
+  );
+  assert.deepEqual(auth, { username: 'oauth2', password: 'token-a' });
+});
+
+test('buildHttpAuthFromRepoCredential defaults gitlab provider to oauth2', () => {
+  const auth = buildHttpAuthFromRepoCredential(
+    {
+      ephemeral_oauth_access_token: 'token-a',
+      provider: 'gitlab',
+    },
+    'http://localhost:8012/ljy/somanyad.git'
+  );
+  assert.deepEqual(auth, { username: 'oauth2', password: 'token-a' });
+});
+
+test('buildHttpAuthFromRepoCredential defaults github provider to x-access-token', () => {
+  const auth = buildHttpAuthFromRepoCredential(
+    {
+      ephemeral_oauth_access_token: 'gho_abc',
+      provider: 'github',
+    },
+    'https://github.com/org/repo.git'
+  );
+  assert.deepEqual(auth, { username: 'x-access-token', password: 'gho_abc' });
 });
 
 test('buildHttpAuthFromRepoCredential returns null when repo path cannot be parsed', () => {

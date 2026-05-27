@@ -91,9 +91,18 @@ function startMockTaskCloud() {
                 git_repos: ['http://localhost:8012/demo/repo-a.git'],
               },
             ],
+          }),
+        );
+        return;
+      }
+      if (url.includes('/server-container-token/repo-clone-credentials/')) {
+        res.end(
+          JSON.stringify({
             repo_clone_credentials: {
               'http://gitlab.aidevpm.com/demo/repo-a.git': {
                 ephemeral_oauth_access_token: 'mock-gitlab-token-123',
+                provider: 'gitlab',
+                git_http_username: 'oauth2',
               },
             },
           }),
@@ -220,7 +229,7 @@ exit 0
 
     const fakeLog = fs.readFileSync(gitLogPath, 'utf8');
     expect(fakeLog).toContain('clone_remote:http://localhost:8012/demo/repo-a.git');
-    expect(fakeLog).toContain('git_http_username:demo');
+    expect(fakeLog).toContain('git_http_username:oauth2');
     expect(fakeLog).toMatch(/git_http_password_len:[1-9]\d*/);
 
     expect(

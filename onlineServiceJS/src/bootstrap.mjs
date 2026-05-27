@@ -254,11 +254,24 @@ function usernameFromRepoUrl(repoUrl) {
   }
 }
 
+function defaultGitHttpUsernameForProvider(provider) {
+  const p = String(provider || '').trim().toLowerCase();
+  if (p === 'gitlab') return 'oauth2';
+  if (p === 'github') return 'x-access-token';
+  return '';
+}
+
 export function buildHttpAuthFromRepoCredential(rawCredential, repoUrl = '') {
   if (!rawCredential || typeof rawCredential !== 'object') return null;
   const password = String(rawCredential.ephemeral_oauth_access_token || '').trim();
   if (!password) return null;
-  const username = usernameFromRepoUrl(repoUrl);
+  let username = String(rawCredential.git_http_username || '').trim();
+  if (!username) {
+    username = defaultGitHttpUsernameForProvider(rawCredential.provider);
+  }
+  if (!username) {
+    username = usernameFromRepoUrl(repoUrl);
+  }
   if (!username) return null;
   return { username, password };
 }
@@ -314,6 +327,12 @@ async function runOneBootstrapClone({
   const cloneRemote = raw;
   const credential = resolveRepoCloneCredential(credRoot, raw);
   const httpAuth = buildHttpAuthFromRepoCredential(credential, raw);
+  if (httpAuth) {
+    const provider = credential && typeof credential === 'object' ? String(credential.provider || '').trim() : '';
+    appendOutboundReqLog(
+      `bootstrap-clone auth repo=${raw} provider=${provider || 'unknown'} git_http_username=${httpAuth.username}`,
+    );
+  }
   const askpass = createBootstrapGitAskPassScript(httpAuth);
   try {
     const gitEnv = {
