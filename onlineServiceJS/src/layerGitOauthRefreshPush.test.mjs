@@ -503,4 +503,72 @@ describe('layerGitOauthRefreshPush', () => {
 
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
+
+  test('runLayerOauthFetchTokenFiles 支持 localhost GitLab remote 与 repo_match_keys', async () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'oauth-fetch-gitlab-local-'));
+    process.env.ONLINE_PROJECT_STATE_ROOT = stateRoot;
+    const layerId = 'oauth-fetch-gitlab-local-layer';
+    const layerDir = path.join(stateRoot, 'layers', layerId);
+    const repoDir = path.join(layerDir, 'somanyad');
+    fs.mkdirSync(repoDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(layerDir, 'layer_meta.json'),
+      JSON.stringify({ layer_id: layerId, kind: 'workspace' }),
+    );
+    assert.equal(spawnSync('git', ['init'], { cwd: repoDir, encoding: 'utf8' }).status, 0);
+    assert.equal(
+      spawnSync('git', ['remote', 'add', 'origin', 'http://localhost:8012/ljy/somanyad.git'], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      }).status,
+      0,
+    );
+
+    const requests = [];
+    const server = http.createServer((req, res) => {
+      if (req.method === 'POST' && req.url?.includes('layer-github-oauth-access-tokens')) {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', () => {
+          requests.push(JSON.parse(body));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              git_auth_by_repo_match_key: {
+                'localhost:8012/ljy/somanyad': 'glpat-local-gitlab',
+              },
+            }),
+          );
+        });
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'not found' }));
+    });
+
+    try {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+      process.env.TaskApiEndPoint = `${base}/api/tenant/t1/workspace/w1/task/task1/cloud`;
+      process.env.ACCESS_TOKEN = 'container_access_token_gitlab';
+      const mod = await import(`./layerGitOauthFetchTokenFiles.mjs?gitlablocal=${Date.now()}`);
+      const res = await mod.runLayerOauthFetchTokenFiles({ layerId, targetBranch: '' });
+      assert.equal(res.httpStatus, 200);
+      assert.equal(res.payload?.ok, true);
+      assert.equal(requests.length, 1);
+      assert.deepEqual(requests[0].repo_match_keys, ['localhost:8012/ljy/somanyad']);
+      assert.equal(
+        fs.readFileSync(path.join(repoDir, '.task2app_access_token'), 'utf8'),
+        'glpat-local-gitlab\n',
+      );
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      fs.rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
 });

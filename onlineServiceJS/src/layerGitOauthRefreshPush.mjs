@@ -2,32 +2,11 @@
  * 从 task2app（TaskApiEndPoint）用 GitHub OAuth refresh 换 access_token，再对层级内仓库 HTTPS 推送。
  */
 import { postJson, taskApiPrefix } from './saasTaskCloud.mjs';
-import { layerGitWorkdirRootsForFileListing } from './layerFs.mjs';
-import { parseGithubOwnerRepoFromRemoteUrl, runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
-import { spawnSync } from 'child_process';
+import { runLayerGithubOauthAccessPush } from './layerGitOauthPush.mjs';
+import { collectOauthRepoWriteTargets } from './layerGitOauthFetchTokenFiles.mjs';
 import fs from 'fs';
 import path from 'path';
-import { gitCmd } from './gitCmd.mjs';
 import { logsDir } from './paths.mjs';
-
-function gitConfigGetRemoteOrigin(workdir) {
-  try {
-    const out = spawnSync(gitCmd(), ['config', '--get', 'remote.origin.url'], {
-      cwd: workdir,
-      encoding: 'utf8',
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-      maxBuffer: 1024 * 1024,
-    });
-    if (out.status !== 0) return '';
-    return (
-      String(out.stdout || '')
-        .trim()
-        .split('\n')[0] || ''
-    );
-  } catch {
-    return '';
-  }
-}
 
 function appendOauthRefreshPushLog(line) {
   try {
@@ -47,19 +26,17 @@ function oauthTokenFetchTimeoutSec() {
 
 /** @returns {string[]} owner/repo slug（小写），来自层内 GitHub 远程 */
 export function collectGithubRepoSlugsInLayer(layerId) {
-  const roots = layerGitWorkdirRootsForFileListing(layerId);
-  const slugs = new Set();
-  for (const row of roots) {
-    try {
-      if (!fs.existsSync(path.join(row.workdir, '.git'))) continue;
-    } catch {
-      continue;
-    }
-    const origin = gitConfigGetRemoteOrigin(row.workdir);
-    const info = parseGithubOwnerRepoFromRemoteUrl(origin);
-    if (info?.slug) slugs.add(String(info.slug).toLowerCase());
-  }
-  return [...slugs];
+  return collectOauthRepoWriteTargets(layerId)
+    .map((x) => x.githubSlug)
+    .filter(Boolean);
+}
+
+/** @returns {{ repoMatchKey: string, githubSlug: string }[]} */
+export function collectOauthRepoKeysInLayer(layerId) {
+  return collectOauthRepoWriteTargets(layerId).map((x) => ({
+    repoMatchKey: x.repoMatchKey,
+    githubSlug: x.githubSlug,
+  }));
 }
 
 /**
@@ -125,14 +102,16 @@ export async function runLayerOauthRefreshPush(opts) {
     return { httpStatus: 400, payload: { ok: false, detail: 'target_branch 必填（任务未配置目标分支）' } };
   }
 
-  const repoSlugs = collectGithubRepoSlugsInLayer(layerId);
-  if (!repoSlugs.length) {
-    appendOauthRefreshPushLog(`oauth-refresh-push fail layer_id=${layerId} detail=层内未发现 github.com 远程仓库`);
+  const oauthTargets = collectOauthRepoWriteTargets(layerId);
+  if (!oauthTargets.length) {
+    appendOauthRefreshPushLog(`oauth-refresh-push fail layer_id=${layerId} detail=层内未发现 Git 远程仓库`);
     return {
       httpStatus: 400,
-      payload: { ok: false, detail: '层内未发现 github.com 远程仓库' },
+      payload: { ok: false, detail: '层内未发现 Git 远程仓库' },
     };
   }
+  const repoMatchKeys = [...new Set(oauthTargets.map((x) => x.repoMatchKey))];
+  const repoSlugs = [...new Set(oauthTargets.map((x) => x.githubSlug).filter(Boolean))];
 
   const oauthFetchTimeoutSec = oauthTokenFetchTimeoutSec();
   appendOauthRefreshPushLog(
@@ -144,7 +123,8 @@ export async function runLayerOauthRefreshPush(opts) {
       `${cloudPrefix.replace(/\/$/, '')}/server-container-token/layer-github-oauth-access-tokens/`,
       {
         access_token: accessToken,
-        repo_slugs: repoSlugs,
+        repo_match_keys: repoMatchKeys,
+        repo_slugs: repoSlugs.length ? repoSlugs : undefined,
         target_branch: targetBranch,
       },
       oauthFetchTimeoutSec,
@@ -162,10 +142,16 @@ export async function runLayerOauthRefreshPush(opts) {
     };
   }
 
-  const githubAuthByRepo =
-    tokenPayload && typeof tokenPayload.github_auth_by_repo === 'object' && tokenPayload.github_auth_by_repo
-      ? tokenPayload.github_auth_by_repo
+  const authByKey =
+    tokenPayload && typeof tokenPayload.git_auth_by_repo_match_key === 'object'
+      ? tokenPayload.git_auth_by_repo_match_key
       : null;
+  const githubAuthByRepo =
+    authByKey && Object.keys(authByKey).length
+      ? authByKey
+      : tokenPayload && typeof tokenPayload.github_auth_by_repo === 'object' && tokenPayload.github_auth_by_repo
+        ? tokenPayload.github_auth_by_repo
+        : null;
   if (!githubAuthByRepo || !Object.keys(githubAuthByRepo).length) {
     const partial = tokenPayload?.partial_error || tokenPayload?.detail;
     appendOauthRefreshPushLog(

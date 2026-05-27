@@ -1,5 +1,5 @@
 /**
- * 从 task2app 拉取 GitHub OAuth access_token，并按仓库写入 <repo>/.task2app_access_token。
+ * 从 task2app 拉取 Git OAuth access_token，并按仓库写入 <repo>/.task2app_access_token。
  */
 import fs from 'fs';
 import path from 'path';
@@ -7,6 +7,7 @@ import { spawnSync } from 'child_process';
 import { postJson, taskApiPrefix } from './saasTaskCloud.mjs';
 import { layerGitWorkdirRootsForFileListing } from './layerFs.mjs';
 import { parseGithubOwnerRepoFromRemoteUrl } from './layerGitOauthPush.mjs';
+import { repoMatchKeyFromUrl } from './repoMatchKey.mjs';
 import { gitCmd } from './gitCmd.mjs';
 import { logsDir } from './paths.mjs';
 
@@ -89,7 +90,7 @@ function pickStructuredErrorFields(value) {
   return picked;
 }
 
-function collectGithubRepoWriteTargets(layerId) {
+export function collectOauthRepoWriteTargets(layerId) {
   const roots = layerGitWorkdirRootsForFileListing(layerId);
   const targets = [];
   for (const row of roots) {
@@ -99,15 +100,36 @@ function collectGithubRepoWriteTargets(layerId) {
       continue;
     }
     const origin = gitConfigGetRemoteOrigin(row.workdir);
-    const info = parseGithubOwnerRepoFromRemoteUrl(origin);
-    if (!info?.slug) continue;
+    const repoMatchKey = repoMatchKeyFromUrl(origin);
+    if (!repoMatchKey) continue;
+    const slugInfo = parseGithubOwnerRepoFromRemoteUrl(origin);
     targets.push({
       workdir: row.workdir,
       relPrefix: row.relPrefix || '',
-      slug: String(info.slug).toLowerCase(),
+      originUrl: origin,
+      repoMatchKey,
+      githubSlug: slugInfo?.slug ? String(slugInfo.slug).toLowerCase() : '',
     });
   }
   return targets;
+}
+
+/** @deprecated 使用 collectOauthRepoWriteTargets */
+export function collectGithubRepoWriteTargets(layerId) {
+  return collectOauthRepoWriteTargets(layerId).filter((x) => x.githubSlug);
+}
+
+function authTokensByRepoMatchKeyFromPayload(tokenPayload) {
+  const byKey =
+    tokenPayload && typeof tokenPayload.git_auth_by_repo_match_key === 'object'
+      ? tokenPayload.git_auth_by_repo_match_key
+      : null;
+  if (byKey && Object.keys(byKey).length) return byKey;
+  const legacy =
+    tokenPayload && typeof tokenPayload.github_auth_by_repo === 'object'
+      ? tokenPayload.github_auth_by_repo
+      : null;
+  return legacy && Object.keys(legacy).length ? legacy : null;
 }
 
 /**
@@ -142,19 +164,21 @@ export async function runLayerOauthFetchTokenFiles(opts) {
 
   const targetBranch = String(opts?.targetBranch || '').trim();
 
-  const targets = collectGithubRepoWriteTargets(layerId);
+  const targets = collectOauthRepoWriteTargets(layerId);
   if (!targets.length) {
-    return { httpStatus: 400, payload: { ok: false, detail: '层内未发现 github.com 远程仓库' } };
+    return { httpStatus: 400, payload: { ok: false, detail: '层内未发现 Git 远程仓库' } };
   }
-  const repoSlugs = [...new Set(targets.map((x) => x.slug))];
+  const repoMatchKeys = [...new Set(targets.map((x) => x.repoMatchKey))];
+  const repoSlugs = [...new Set(targets.map((x) => x.githubSlug).filter(Boolean))];
   const oauthFetchTimeoutSec = oauthTokenFetchTimeoutSec();
 
   let tokenPayload;
   try {
     const body = {
       access_token: accessToken,
-      repo_slugs: repoSlugs,
+      repo_match_keys: repoMatchKeys,
     };
+    if (repoSlugs.length) body.repo_slugs = repoSlugs;
     if (targetBranch) body.target_branch = targetBranch;
     tokenPayload = await postJson(
       `${cloudPrefix.replace(/\/$/, '')}/server-container-token/layer-github-oauth-access-tokens/`,
@@ -171,7 +195,7 @@ export async function runLayerOauthFetchTokenFiles(opts) {
       httpStatus: 502,
       payload: {
         ok: false,
-        detail: `从 task2app 拉取 GitHub AccessToken 失败：${errMsg.slice(0, 500)}`,
+        detail: `从 task2app 拉取 Git OAuth AccessToken 失败：${errMsg.slice(0, 500)}`,
         error_code: structured?.error_code,
         failed_stage: structured?.failed_stage,
         retryable: structured?.retryable,
@@ -180,17 +204,14 @@ export async function runLayerOauthFetchTokenFiles(opts) {
     };
   }
 
-  const githubAuthByRepo =
-    tokenPayload && typeof tokenPayload.github_auth_by_repo === 'object' && tokenPayload.github_auth_by_repo
-      ? tokenPayload.github_auth_by_repo
-      : null;
-  if (!githubAuthByRepo || !Object.keys(githubAuthByRepo).length) {
+  const authByRepo = authTokensByRepoMatchKeyFromPayload(tokenPayload);
+  if (!authByRepo || !Object.keys(authByRepo).length) {
     const partial = tokenPayload?.partial_error || tokenPayload?.detail;
     return {
       httpStatus: 409,
       payload: {
         ok: false,
-        detail: partial ? String(partial) : 'task2app 未返回可用的 github_auth_by_repo',
+        detail: partial ? String(partial) : 'task2app 未返回可用的 OAuth access_token',
       },
     };
   }
@@ -198,11 +219,17 @@ export async function runLayerOauthFetchTokenFiles(opts) {
   const repos = [];
   let writeOkCount = 0;
   for (const target of targets) {
-    const token = String(githubAuthByRepo[target.slug] || '').trim();
+    const token = String(
+      authByRepo[target.repoMatchKey] ||
+        (target.githubSlug ? authByRepo[target.githubSlug] : '') ||
+        '',
+    ).trim();
     const filePath = path.join(target.workdir, '.task2app_access_token');
+    const repoLabel = target.repoMatchKey || target.githubSlug || target.relPrefix || '?';
     if (!token) {
       repos.push({
-        github_slug: target.slug,
+        repo_match_key: target.repoMatchKey,
+        github_slug: target.githubSlug || undefined,
         rel_prefix: target.relPrefix,
         token_file_path: filePath,
         write_ok: false,
@@ -214,14 +241,17 @@ export async function runLayerOauthFetchTokenFiles(opts) {
       fs.writeFileSync(filePath, `${token}\n`, { mode: 0o600 });
       writeOkCount += 1;
       repos.push({
-        github_slug: target.slug,
+        repo_match_key: target.repoMatchKey,
+        github_slug: target.githubSlug || undefined,
         rel_prefix: target.relPrefix,
         token_file_path: filePath,
         write_ok: true,
+        repo_label: repoLabel,
       });
     } catch (e) {
       repos.push({
-        github_slug: target.slug,
+        repo_match_key: target.repoMatchKey,
+        github_slug: target.githubSlug || undefined,
         rel_prefix: target.relPrefix,
         token_file_path: filePath,
         write_ok: false,
