@@ -90,6 +90,7 @@ import { runLayerOauthRefreshPush } from './layerGitOauthRefreshPush.mjs';
 import { runLayerOauthFetchTokenFiles } from './layerGitOauthFetchTokenFiles.mjs';
 import { gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
 import { appendInitLogBestEffort } from './initLog.mjs';
+import { logJson } from './jsonLog.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -258,6 +259,13 @@ function logReq(req, res, start, statusOverride) {
       .replace(/\s+/g, '_');
     const status =
       statusOverride != null ? statusOverride : res.statusCode;
+    logJson('info', 'http_request', {
+      trace_id: tid || undefined,
+      method: req.method,
+      path: req.originalUrl,
+      status: String(status),
+      duration_ms: ms,
+    });
     const line = `${req.ip || '-'} trace=${tid || '-'} "${req.method} ${req.originalUrl}" ${status} ${ms}ms\n`;
     fs.mkdirSync(path.dirname(accessLogPath()), { recursive: true });
     fs.appendFileSync(accessLogPath(), `${new Date().toISOString()} | ${line}`);
