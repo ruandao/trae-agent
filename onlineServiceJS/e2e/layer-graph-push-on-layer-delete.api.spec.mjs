@@ -69,8 +69,15 @@ function startMockTaskCloud() {
         res.end(JSON.stringify({ repo_clone_credentials: {} }));
         return;
       }
-      if (url.includes('feature-params-yaml')) {
-        res.end(JSON.stringify({ yaml: 'noop: true\n' }));
+      if (url.includes('feature-params-env')) {
+        res.end(
+          JSON.stringify({
+            env: {
+              TASK_LLM_PROVIDERS_JSON: '[]',
+              TASK_AGENT_MAX_STEPS: '200',
+            },
+          }),
+        );
         return;
       }
       res.end('{}');

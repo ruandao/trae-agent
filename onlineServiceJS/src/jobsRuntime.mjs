@@ -4,6 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 
 import { bootstrapCloneLayerId } from './bootstrap.mjs';
+import { normalizeJobCommandEnv } from './normalizeJobCommandEnv.mjs';
 import {
   jobsStatePath,
   configFilePath,
@@ -115,17 +116,23 @@ function venvTraePaths() {
 }
 
 function buildTraeCmd(workDir, cmdText, opts = {}) {
-  const { trajectoryFile } = opts;
+  const { trajectoryFile, model, provider } = opts;
   const custom = String(process.env.TRAE_CLI || '').trim();
   if (custom) {
     const args = [cmdText, `--working-dir=${workDir}`];
     if (trajectoryFile) args.push(`--trajectory-file=${trajectoryFile}`);
+    if (provider) args.push(`--provider=${provider}`);
+    if (model) args.push(`--model=${model}`);
     return { cmd: custom, args, shell: true };
   }
   const { traeCli, py, py3 } = venvTraePaths();
   const cfg = configFilePath();
+  const modelArgs = [
+    ...(provider ? [`--provider=${provider}`] : []),
+    ...(model ? [`--model=${model}`] : []),
+  ];
   if (fs.existsSync(traeCli)) {
-    const a = ['run', cmdText, `--config-file=${cfg}`, `--working-dir=${workDir}`];
+    const a = ['run', cmdText, `--config-file=${cfg}`, `--working-dir=${workDir}`, ...modelArgs];
     if (trajectoryFile) a.push(`--trajectory-file=${trajectoryFile}`);
     return { cmd: traeCli, args: a, shell: false };
   }
@@ -139,6 +146,7 @@ function buildTraeCmd(workDir, cmdText, opts = {}) {
         cmdText,
         `--config-file=${cfg}`,
         `--working-dir=${workDir}`,
+        ...modelArgs,
         ...(trajectoryFile ? [`--trajectory-file=${trajectoryFile}`] : []),
       ],
       shell: false,
@@ -154,6 +162,7 @@ function buildTraeCmd(workDir, cmdText, opts = {}) {
         cmdText,
         `--config-file=${cfg}`,
         `--working-dir=${workDir}`,
+        ...modelArgs,
         ...(trajectoryFile ? [`--trajectory-file=${trajectoryFile}`] : []),
       ],
       shell: false,
@@ -495,8 +504,10 @@ function runJobAsync(rec, workDir) {
     trajectoryFile = path.join(trajDir, `trajectory_${rec.id}.json`);
     env.TRAE_AGENT_JSON_OUTPUT_DIR = jobLogsTaeJsonDir(rec.id);
   }
+  let normalizedCommandEnv = null;
   if (rec.command_env && typeof rec.command_env === 'object') {
-    for (const [k, v] of Object.entries(rec.command_env)) {
+    normalizedCommandEnv = normalizeJobCommandEnv(rec.command_env);
+    for (const [k, v] of Object.entries(normalizedCommandEnv)) {
       if (v != null) env[String(k)] = String(v);
     }
   }
@@ -510,7 +521,11 @@ function runJobAsync(rec, workDir) {
   if (rec.command_kind === 'shell') {
     proc = spawn('bash', ['-lc', rec.command], { cwd: workDir, env });
   } else {
-    const trae = buildTraeCmd(workDir, commandForTrae, { trajectoryFile });
+    const trae = buildTraeCmd(workDir, commandForTrae, {
+      trajectoryFile,
+      model: normalizedCommandEnv?.TRAE_MODEL,
+      provider: normalizedCommandEnv?.TRAE_MODEL_PROVIDER,
+    });
     if (trae) {
       proc = spawn(trae.cmd, trae.args, { cwd: workDir, env, shell: trae.shell || false });
     } else {

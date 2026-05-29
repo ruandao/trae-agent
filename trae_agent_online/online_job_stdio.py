@@ -165,6 +165,16 @@ def resolve_model_cli_args_from_command_env(
     """将任务级环境变量映射为 trae-cli 参数。"""
     if not isinstance(command_env, dict):
         return None, None
-    provider = str(command_env.get("TRAE_MODEL_PROVIDER") or "").strip() or None
-    model = str(command_env.get("TRAE_MODEL") or "").strip() or None
+    provider = (
+        str(
+            command_env.get("TRAE_MODEL_PROVIDER")
+            or command_env.get("TASK_AGENT_MODEL_PROVIDER")
+            or ""
+        ).strip()
+        or None
+    )
+    model = (
+        str(command_env.get("TRAE_MODEL") or command_env.get("TASK_AGENT_MODEL") or "").strip()
+        or None
+    )
     return provider, model

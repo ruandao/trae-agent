@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import YAML from 'yaml';
+import { resolveAgentConfigFromEnv } from './featureParamsEnvToYaml.mjs';
 
 import { configFilePath, logsDir, runtimeDir } from './paths.mjs';
 import { appendOutboundReqLog } from './outboundReqLog.mjs';
@@ -926,14 +927,18 @@ export async function runBootstrapAfterListen(ctx) {
 
   await staggerBootstrapSaasCall();
   const y = await postJson(
-    `${prefix}/server-container-token/feature-params-yaml/`,
+    `${prefix}/server-container-token/feature-params-env/`,
     { access_token: newAccess },
     timeoutSec
   );
-  const yamlText = y.yaml;
-  if (yamlText == null || typeof yamlText !== 'string') {
-    throw new Error('feature-params-yaml missing yaml');
+  const envMap = y.env;
+  if (envMap == null || typeof envMap !== 'object') {
+    throw new Error('feature-params-env missing env');
   }
+  if (envMap.TASK_AGENT_MAX_STEPS == null) {
+    throw new Error('feature-params-env missing TASK_AGENT_MAX_STEPS');
+  }
+  const yamlText = resolveAgentConfigFromEnv(envMap);
   YAML.parse(yamlText);
   const dest = configFilePath();
   fs.mkdirSync(path.dirname(dest), { recursive: true });

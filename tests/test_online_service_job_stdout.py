@@ -111,6 +111,14 @@ def test_resolve_model_cli_args_from_command_env() -> None:
     assert model == "gpt-4o-mini"
 
 
+def test_resolve_model_cli_args_from_task_agent_env() -> None:
+    provider, model = resolve_model_cli_args_from_command_env(
+        {"TASK_AGENT_MODEL_PROVIDER": "openai", "TASK_AGENT_MODEL": "gpt-4o-mini"}
+    )
+    assert provider == "openai"
+    assert model == "gpt-4o-mini"
+
+
 def test_build_trae_run_cmd_appends_model_and_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "trae_agent_online.online_job_stdio.venv_activate_path", lambda: Path("/mock/bin/activate")
