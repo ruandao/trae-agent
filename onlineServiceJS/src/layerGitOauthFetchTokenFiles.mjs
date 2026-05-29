@@ -136,9 +136,11 @@ function authTokensByRepoMatchKeyFromPayload(tokenPayload) {
  * @param {object} opts
  * @param {string} opts.layerId
  * @param {string} [opts.targetBranch]
+ * @param {string} [opts.traceId] forwarded X-Trace-Id from inbound HTTP request
  */
 export async function runLayerOauthFetchTokenFiles(opts) {
   const layerId = String(opts?.layerId || '').trim();
+  const traceId = opts?.traceId;
   if (!layerId) {
     return { httpStatus: 400, payload: { ok: false, detail: 'layer_id 无效' } };
   }
@@ -184,6 +186,7 @@ export async function runLayerOauthFetchTokenFiles(opts) {
       `${cloudPrefix.replace(/\/$/, '')}/server-container-token/layer-github-oauth-access-tokens/`,
       body,
       oauthFetchTimeoutSec,
+      { traceId },
     );
   } catch (e) {
     const errMsg = String(e?.message || e);

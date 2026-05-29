@@ -10,8 +10,6 @@
 #   ONLINE_PROJECT_STATE_ROOT / ONLINE_PROJECT_LAYERS  见 skill.md
 #   TRAE_GIT_CLONE_ALLOW_IPV6=1  关闭默认的「git clone -4」与 GIT_HTTP_IPV4（仅当你必须走纯 IPv6 时）
 #   TRAE_GIT_PATH       可设为绝对路径（如 /usr/bin/git），当 PATH 上 git 为不兼容包装脚本时避免克隆失败
-#   NODEJS_WATCH      默认开启：node --watch，改动 src/*.mjs 等依赖树会自动重启。
-#                     设为 0 / false 则单次运行（与生产行为一致）。
 #   若 PORT 已被监听（本地 Node 模式），本脚本会先 kill -9 占用该端口的进程再启动。
 #   Docker 模式：自动使用随机可用主机端口映射到容器 PORT，避免端口冲突。
 #                映射端口记录在 ${STATE_ROOT}/runtime/.docker_mapped_port。
@@ -221,13 +219,6 @@ if [[ -n "$_pids" ]]; then
   fi
 fi
 
-_watch_flag=()
-_js_watch="${NODEJS_WATCH:-1}"
-if [[ "${_js_watch}" != "0" && "${_js_watch}" != "false" ]]; then
-  _watch_flag=(--watch)
-  echo "[run.sh] 热加载已启用: node --watch（关闭请设 NODEJS_WATCH=0）" >&2
-fi
-
 # 勿使用 exec：保留 shell 以注册 trap，在收到 INT/TERM/HUP 时对 node 发 SIGTERM，确保 Ctrl+C、kill 与 IDE「停止」能结束服务。
 # 仅对 node 的 PID 发信号，避免用负号 PGID 误伤与 shell 同组的前台/后台布局。
 _node_pid=''
@@ -238,7 +229,7 @@ __cleanup_node() {
   return 0
 }
 set +e
-node ${_watch_flag+"${_watch_flag[@]}"} src/server.mjs &
+node src/server.mjs &
 _node_pid=$!
 set -e
 trap '__cleanup_node' INT TERM HUP

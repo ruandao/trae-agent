@@ -6,8 +6,8 @@
   "description": "Trae 在线业务服务（Node.js / Express）：HTTP API 供容器与 SaaS 转发对接。",
   "scripts": {
     "start": "node src/server.mjs",
-    "dev": "node --watch src/server.mjs",
-    "test:unit": "node --test src/layerFlatFiles.test.mjs src/saasTaskCloud.taskApiPrefix.test.mjs src/gitRemote.test.mjs src/reachability.test.mjs src/layerGitOauthRefreshPush.test.mjs src/layerGitOauthPush.test.mjs src/bootstrap.cloneCredentials.test.mjs src/otelTraceId.test.mjs src/jsonLog.test.mjs",
+    "dev": "node src/server.mjs",
+    "test:unit": "node --test src/layerFlatFiles.test.mjs src/saasTaskCloud.taskApiPrefix.test.mjs src/gitRemote.test.mjs src/reachability.test.mjs src/layerGitOauthRefreshPush.test.mjs src/layerGitOauthPush.test.mjs src/bootstrap.cloneCredentials.test.mjs src/otelTraceId.test.mjs src/traceId.test.mjs src/jsonLog.test.mjs",
     "test:e2e": "playwright test --project=api",
     "test:e2e:browser": "playwright test --project=chromium",
     "test:e2e:cdp": "playwright test --project=cdp9222"

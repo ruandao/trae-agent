@@ -112,6 +112,16 @@ function traceMiddleware(req, res, next) {
   next();
 }
 
+function errorLogFields(e) {
+  const detail = String(e?.message || e);
+  const fields = { detail: detail.slice(0, 2000) };
+  if (e?.stack) fields.stack = String(e.stack).slice(0, 4000);
+  if (e?.structuredPayload && typeof e.structuredPayload === 'object') {
+    fields.structured = e.structuredPayload;
+  }
+  return fields;
+}
+
 function cryptoRandomId() {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
@@ -1323,6 +1333,7 @@ api.post('/layers/:layer_id/git/oauth-access-push', async (req, res) => {
       prBaseBranch: prBase,
       prTitle,
       prBody,
+      traceId: req.traceId,
     });
     res.status(httpStatus).json(payload);
   } catch (e) {
@@ -1336,7 +1347,11 @@ api.post('/layers/:layer_id/git/oauth-refresh-push', async (req, res) => {
   const layerId = String(req.params.layer_id || '').trim();
   const targetBranch = String(req.body?.target_branch || '').trim();
   try {
-    const { httpStatus, payload } = await runLayerOauthRefreshPush({ layerId, targetBranch });
+    const { httpStatus, payload } = await runLayerOauthRefreshPush({
+      layerId,
+      targetBranch,
+      traceId: req.traceId,
+    });
     res.status(httpStatus).json(payload);
   } catch (e) {
     console.warn('[LayerGitOauthRefreshPush] fail layer_id=%s err=%s', layerId, String(e.message || e));
@@ -1349,7 +1364,11 @@ api.post('/layers/:layer_id/git/oauth-fetch-token-files', async (req, res) => {
   const layerId = String(req.params.layer_id || '').trim();
   const targetBranch = String(req.body?.target_branch || '').trim();
   try {
-    const { httpStatus, payload } = await runLayerOauthFetchTokenFiles({ layerId, targetBranch });
+    const { httpStatus, payload } = await runLayerOauthFetchTokenFiles({
+      layerId,
+      targetBranch,
+      traceId: req.traceId,
+    });
     res.status(httpStatus).json(payload);
   } catch (e) {
     console.warn('[LayerGitOauthFetchTokenFiles] fail layer_id=%s err=%s', layerId, String(e.message || e));
@@ -1761,50 +1780,61 @@ export async function main({
   }
 
   await new Promise((resolve, reject) => {
-    try {
-      app.listen(port, host, async () => {
-        console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);
-        broadcast({ type: 'service_ready', port });
-        // register-reachability（server_url）与 SaaS 心跳须在 HTTP 已监听后立即执行，不得被引导克隆/写 YAML 阻塞。
+    const server = app.listen(port, host, async () => {
+      console.log(`[onlineServiceJS] server listening on http://${host}:${port}`);
+      broadcast({ type: 'service_ready', port });
+      // register-reachability（server_url）与 SaaS 心跳须在 HTTP 已监听后立即执行，不得被引导克隆/写 YAML 阻塞。
+      try {
+        await registerReachabilityAfterBootstrap(bootstrapCtx);
+      } catch (e) {
+        logJson('error', 'reachability_failed', {
+          use_startup_trace: true,
+          ...errorLogFields(e),
+        });
+        process.exit(1);
+      }
+      if (!bootstrapCtx.skipped && bootstrapCtx.prefix) {
+        startSaasContainerHeartbeatLoop();
+        const hbDelay = String(process.env.TRAE_SAAS_HEARTBEAT_INITIAL_DELAY_SEC || '5').trim();
+        console.log(
+          `[onlineServiceJS] 已调度 SaaS 容器心跳（首跳延迟 ${hbDelay}s，间隔见 TRAE_SAAS_HEARTBEAT_INTERVAL_SEC）`,
+        );
+      }
+      void (async () => {
         try {
-          await registerReachabilityAfterBootstrap(bootstrapCtx);
-        } catch (e) {
-          console.error('[onlineServiceJS] reachability 失败（不会回退 127.0.0.1）:', e);
-          process.exit(1);
-        }
-        if (!bootstrapCtx.skipped && bootstrapCtx.prefix) {
-          startSaasContainerHeartbeatLoop();
-          const hbDelay = String(process.env.TRAE_SAAS_HEARTBEAT_INITIAL_DELAY_SEC || '5').trim();
-          console.log(
-            `[onlineServiceJS] 已调度 SaaS 容器心跳（首跳延迟 ${hbDelay}s，间隔见 TRAE_SAAS_HEARTBEAT_INTERVAL_SEC）`,
-          );
-        }
-        void (async () => {
+          await runBootstrapAfterListen(bootstrapCtx);
           try {
-            await runBootstrapAfterListen(bootstrapCtx);
-            try {
-              if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
-                registerBootstrapCloneJob(bootstrapCloneLayerId);
-              }
-            } catch (e) {
-              console.error('[onlineServiceJS] bootstrap clone job 注册错误:', e);
-              if (strict) process.exit(1);
-            }
-            try {
-              await mirrorLayerGraphToTaskCloudSSE();
-            } catch {
-              /* 推层图至任务云为辅助通道，失败不阻断服务 */
+            if (bootstrapCloneLayerId && bootstrapRegisterCloneJob) {
+              registerBootstrapCloneJob(bootstrapCloneLayerId);
             }
           } catch (e) {
-            console.error('[onlineServiceJS] bootstrap (post-listen) error:', e);
+            console.error('[onlineServiceJS] bootstrap clone job 注册错误:', e);
             if (strict) process.exit(1);
           }
-        })();
-        resolve();
-      });
-    } catch (e) {
-      reject(e);
-    }
+          try {
+            await mirrorLayerGraphToTaskCloudSSE();
+          } catch {
+            /* 推层图至任务云为辅助通道，失败不阻断服务 */
+          }
+        } catch (e) {
+          console.error('[onlineServiceJS] bootstrap (post-listen) error:', e);
+          if (strict) process.exit(1);
+        }
+      })();
+      resolve();
+    });
+    server.on('error', (err) => {
+      if (err?.code === 'EADDRINUSE') {
+        console.error(`[onlineServiceJS] port ${port} already in use (${err.message})`);
+      }
+      reject(err);
+    });
+    const shutdownForWatch = () => {
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1500).unref();
+    };
+    process.once('SIGTERM', shutdownForWatch);
+    process.once('SIGINT', shutdownForWatch);
   });
 }
 

@@ -262,11 +262,38 @@ export async function registerReachabilityAfterBootstrap(ctx) {
   if (pip) body.public_ip = pip;
   if (vscodeUrl) body.container_vscode_url = vscodeUrl;
 
-  await postJson(
-    `${prefix.replace(/\/$/, '')}/server-container-token/register-reachability/`,
-    body,
-    timeoutSec
-  );
+  const registerUrl = `${prefix.replace(/\/$/, '')}/server-container-token/register-reachability/`;
+  const retryDelaysMs = [0, 200, 500, 1000];
+  let lastErr;
+  for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+    if (retryDelaysMs[attempt] > 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, retryDelaysMs[attempt]);
+      });
+    }
+    try {
+      await postJson(registerUrl, body, timeoutSec);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      const status = Number(e?.structuredPayload?.status || e?.status || 0);
+      const code = String(e?.structuredPayload?.error_code || e?.structuredPayload?.detail || '');
+      const retryable =
+        status === 503 ||
+        code.includes('RELAY_DOWNSTREAM_BUSY') ||
+        String(e?.message || '').includes('HTTP 503');
+      if (!retryable || attempt === retryDelaysMs.length - 1) {
+        throw e;
+      }
+      appendOutboundReqLog(
+        `reachability: register-reachability retry ${attempt + 1} after ${retryDelaysMs[attempt + 1] ?? 0}ms (${String(e?.message || e).slice(0, 200)})`,
+      );
+    }
+  }
+  if (lastErr) {
+    throw lastErr;
+  }
   const pipText = pip || '(none)';
   console.log(
     `[onlineServiceJS] 已向 SaaS 注册可达地址 public_ip=${pipText} server_url=${serverUrl} business_api_endpoint=${biz}` +

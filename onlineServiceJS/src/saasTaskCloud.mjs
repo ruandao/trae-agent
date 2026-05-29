@@ -13,13 +13,7 @@ import {
   isDebugAgentEnabled,
   debugAgentStringify,
 } from './outboundReqLog.mjs';
-
-function traceHeaders() {
-  const tid = String(process.env.TRACE_ID || '').trim();
-  const h = { 'Content-Type': 'application/json' };
-  if (tid) h['X-Trace-Id'] = tid;
-  return h;
-}
+import { traceHeadersForOutbound } from './traceId.mjs';
 
 function loopbackFallbackUrl(url) {
   try {
@@ -103,10 +97,13 @@ export const HEARTBEAT_REQ_LOG_FILE = 'heartbeat.log';
  * @param {string} url
  * @param {object} body
  * @param {number} [timeoutSec]
- * @param {{ reqLogFile?: string }} [opts] — `reqLogFile: 'heartbeat.log'` 时写入 reqLogs/heartbeat.log
+ * @param {{ reqLogFile?: string, traceId?: string }} [opts]
+ *   — `reqLogFile: 'heartbeat.log'` 时写入 reqLogs/heartbeat.log
+ *   — `traceId` 转发请求的 X-Trace-Id；省略则用启动时 TRACE_ID env
  */
 export async function postJson(url, body, timeoutSec = 8, opts = {}) {
   const reqLogFile = opts && typeof opts === 'object' ? opts.reqLogFile : undefined;
+  const outboundTraceId = opts && typeof opts === 'object' ? opts.traceId : undefined;
   const safeUrl = sanitizeUrlForOutboundLog(url);
   const fallbackUrl = loopbackFallbackUrl(url);
   const safeFallbackUrl = fallbackUrl ? sanitizeUrlForOutboundLog(fallbackUrl) : '';
@@ -121,7 +118,7 @@ export async function postJson(url, body, timeoutSec = 8, opts = {}) {
     while (idx < attempts.length) {
       const targetUrl = attempts[idx];
       const safeTargetUrl = sanitizeUrlForOutboundLog(targetUrl);
-      const headers = traceHeaders();
+      const headers = traceHeadersForOutbound(outboundTraceId);
       try {
         if (isDebugAgentEnabled()) {
           appendOutboundReqLog(

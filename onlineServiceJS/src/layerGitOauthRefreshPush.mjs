@@ -43,9 +43,11 @@ export function collectOauthRepoKeysInLayer(layerId) {
  * @param {object} opts
  * @param {string} opts.layerId
  * @param {string} [opts.targetBranch]
+ * @param {string} [opts.traceId] forwarded X-Trace-Id from inbound HTTP request
  */
 export async function runLayerOauthRefreshPush(opts) {
   const layerId = String(opts.layerId || '').trim();
+  const traceId = opts.traceId;
   if (!layerId) {
     appendOauthRefreshPushLog('oauth-refresh-push fail layer_id=invalid detail=layer_id 无效');
     return { httpStatus: 400, payload: { ok: false, detail: 'layer_id 无效' } };
@@ -81,6 +83,7 @@ export async function runLayerOauthRefreshPush(opts) {
         `${cloudPrefix.replace(/\/$/, '')}/server-container-token/task-detail/`,
         { access_token: accessToken },
         30,
+        { traceId },
       );
       const tb = detail?.task?.target_branch;
       if (typeof tb === 'string' && tb.trim()) targetBranch = tb.trim();
@@ -128,6 +131,7 @@ export async function runLayerOauthRefreshPush(opts) {
         target_branch: targetBranch,
       },
       oauthFetchTimeoutSec,
+      { traceId },
     );
   } catch (e) {
     appendOauthRefreshPushLog(
