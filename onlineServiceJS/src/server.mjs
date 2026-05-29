@@ -91,6 +91,7 @@ import { runLayerOauthFetchTokenFiles } from './layerGitOauthFetchTokenFiles.mjs
 import { gitPushRemoteArgFromOrigin } from './gitRemote.mjs';
 import { appendInitLogBestEffort } from './initLog.mjs';
 import { logJson } from './jsonLog.mjs';
+import { initOtel, startHttpSpan } from './otel.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const TRACE_HEADER = 'X-Trace-Id';
@@ -98,6 +99,16 @@ const TRACE_HEADER = 'X-Trace-Id';
 function traceMiddleware(req, res, next) {
   const tid = (req.headers[TRACE_HEADER.toLowerCase()] || '').toString().trim() || cryptoRandomId();
   res.setHeader(TRACE_HEADER, tid);
+  req.traceId = tid;
+  const { end } = startHttpSpan(req, tid);
+  let ended = false;
+  const finishSpan = () => {
+    if (ended) return;
+    ended = true;
+    end();
+  };
+  res.on('finish', finishSpan);
+  res.on('close', finishSpan);
   next();
 }
 
@@ -1712,6 +1723,10 @@ export async function main({
   startSsePingLoop = ssePingLoop,
   stopAfterBootstrapTokenExchangeOnly = false,
 } = {}) {
+  const shutdownOtel = initOtel('onlineServiceJS');
+  process.on('beforeExit', () => {
+    void shutdownOtel();
+  });
   startSsePingLoop();
   try {
     const initLogResult = appendInitLog({

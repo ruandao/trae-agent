@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { logJson } from './jsonLog.mjs';
+import { otelTraceIdHex } from './otelTraceId.mjs';
 
-test('logJson writes trace_id from TRACE_ID env', () => {
+test('logJson writes trace_id and otel_trace_id from TRACE_ID env', () => {
   const prev = process.env.TRACE_ID;
   process.env.TRACE_ID = 'trace-node-test1234';
   const lines = [];
@@ -14,6 +15,7 @@ test('logJson writes trace_id from TRACE_ID env', () => {
     assert.equal(lines.length, 1);
     const payload = JSON.parse(lines[0]);
     assert.equal(payload.trace_id, 'trace-node-test1234');
+    assert.equal(payload.otel_trace_id, otelTraceIdHex('trace-node-test1234'));
     assert.equal(payload.service, 'onlineServiceJS');
     assert.equal(payload.msg, 'hello');
   } finally {
