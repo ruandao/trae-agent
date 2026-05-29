@@ -1774,7 +1774,10 @@ export async function main({
         }
         if (!bootstrapCtx.skipped && bootstrapCtx.prefix) {
           startSaasContainerHeartbeatLoop();
-          console.log('[onlineServiceJS] 已启动 SaaS 容器心跳定时上报（server-container-token/heartbeat/）');
+          const hbDelay = String(process.env.TRAE_SAAS_HEARTBEAT_INITIAL_DELAY_SEC || '5').trim();
+          console.log(
+            `[onlineServiceJS] 已调度 SaaS 容器心跳（首跳延迟 ${hbDelay}s，间隔见 TRAE_SAAS_HEARTBEAT_INTERVAL_SEC）`,
+          );
         }
         void (async () => {
           try {

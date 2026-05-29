@@ -408,12 +408,27 @@ export function startSaasContainerHeartbeatLoop() {
   }
   const raw = String(process.env.TRAE_SAAS_HEARTBEAT_INTERVAL_SEC || '').trim();
   const sec = Math.max(5, Number.isFinite(parseFloat(raw)) ? parseFloat(raw) : DEFAULT_SAAS_HEARTBEAT_INTERVAL_SEC);
+  const initialDelayRaw = String(process.env.TRAE_SAAS_HEARTBEAT_INITIAL_DELAY_SEC || '5').trim();
+  const initialDelaySec = Math.max(
+    0,
+    Number.isFinite(parseFloat(initialDelayRaw)) ? parseFloat(initialDelayRaw) : 5,
+  );
   const tick = () => {
     void postContainerHeartbeatToSaas('onlineServiceJS');
   };
-  tick();
-  const id = setInterval(tick, Math.round(sec * 1000));
-  return () => clearInterval(id);
+  let intervalId = null;
+  const startInterval = () => {
+    tick();
+    intervalId = setInterval(tick, Math.round(sec * 1000));
+  };
+  const initialTimer =
+    initialDelaySec > 0
+      ? setTimeout(startInterval, Math.round(initialDelaySec * 1000))
+      : (startInterval(), null);
+  return () => {
+    if (initialTimer != null) clearTimeout(initialTimer);
+    if (intervalId != null) clearInterval(intervalId);
+  };
 }
 
 export async function publishLayerGraphSnapshotToSaas(snapshot) {

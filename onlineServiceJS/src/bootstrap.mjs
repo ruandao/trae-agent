@@ -645,6 +645,7 @@ export async function fetchBootstrapRepoInputs(prefix, accessToken, timeoutSec) 
   if (!urls.length) {
     return { urls, credRoot: {} };
   }
+  await staggerBootstrapSaasCall();
   const credResp = await postJson(
     `${prefix}/server-container-token/repo-clone-credentials/`,
     { access_token: accessToken },
@@ -675,6 +676,18 @@ function isAbortError(e) {
 
 async function sleepMs(ms) {
   await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function bootstrapSaasStaggerMs() {
+  const raw = String(process.env.TASK_API_BOOTSTRAP_SAAS_STAGGER_MS || '200').trim();
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 200;
+}
+
+/** 启动风暴缓解：连续 SaaS inbound 请求之间插入短间隔，降低 SQLite 写重叠概率。 */
+async function staggerBootstrapSaasCall() {
+  const ms = bootstrapSaasStaggerMs();
+  if (ms > 0) await sleepMs(ms);
 }
 
 async function postJsonWithAbortRetry(url, body, timeoutSec, tag) {
@@ -911,6 +924,7 @@ export async function runBootstrapAfterListen(ctx) {
     bootstrapRegisterCloneJob = false;
   }
 
+  await staggerBootstrapSaasCall();
   const y = await postJson(
     `${prefix}/server-container-token/feature-params-yaml/`,
     { access_token: newAccess },
