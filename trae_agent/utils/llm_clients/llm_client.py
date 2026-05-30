@@ -82,6 +82,13 @@ class LLMClient:
         reuse_history: bool = True,
     ) -> LLMResponse:
         """Send chat messages to the LLM."""
+        from trae_agent.utils.task_llm_budget import assert_llm_budget_available
+
+        assert_llm_budget_available(
+            provider=self.provider.value,
+            base_url=model_config.model_provider.base_url,
+            model=model_config.model,
+        )
         return self.client.chat(messages, model_config, tools, reuse_history)
 
     def supports_tool_calling(self, model_config: ModelConfig) -> bool:
