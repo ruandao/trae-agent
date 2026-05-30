@@ -3,7 +3,7 @@ import { spawn } from 'child_process';
 import path from 'path';
 import crypto from 'crypto';
 
-import { bootstrapCloneLayerId } from './bootstrap.mjs';
+import { normalizeJobCommandEnv } from './normalizeJobCommandEnv.mjs';
 import {
   jobsStatePath,
   configFilePath,
@@ -496,7 +496,8 @@ function runJobAsync(rec, workDir) {
     env.TRAE_AGENT_JSON_OUTPUT_DIR = jobLogsTaeJsonDir(rec.id);
   }
   if (rec.command_env && typeof rec.command_env === 'object') {
-    for (const [k, v] of Object.entries(rec.command_env)) {
+    const normalizedEnv = normalizeJobCommandEnv(rec.command_env);
+    for (const [k, v] of Object.entries(normalizedEnv)) {
       if (v != null) env[String(k)] = String(v);
     }
   }
