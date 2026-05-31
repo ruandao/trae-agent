@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node src/server.mjs",
-    "test:unit": "node --test src/layerFlatFiles.test.mjs src/saasTaskCloud.taskApiPrefix.test.mjs src/gitRemote.test.mjs src/reachability.test.mjs src/layerGitOauthRefreshPush.test.mjs src/layerGitOauthPush.test.mjs src/bootstrap.cloneCredentials.test.mjs src/otelTraceId.test.mjs src/traceId.test.mjs src/jsonLog.test.mjs",
+    "test:unit": "node --test src/layerFlatFiles.test.mjs src/saasTaskCloud.taskApiPrefix.test.mjs src/gitRemote.test.mjs src/reachability.test.mjs src/layerGitOauthRefreshPush.test.mjs src/layerGitOauthPush.test.mjs src/bootstrap.cloneCredentials.test.mjs src/bootstrap.agentConfig.test.mjs src/jobsRuntime.bootstrapBinding.test.mjs src/otelTraceId.test.mjs src/traceId.test.mjs src/jsonLog.test.mjs",
     "test:e2e": "playwright test --project=api",
     "test:e2e:browser": "playwright test --project=chromium",
     "test:e2e:cdp": "playwright test --project=cdp9222"

@@ -2,6 +2,8 @@
  * Trae runtime adapter: TASK_* env map → service_config.yaml text.
  */
 
+import path from 'path';
+
 function parseSupportedModels(raw) {
   if (Array.isArray(raw)) {
     return raw.map((item) => String(item || '').trim()).filter(Boolean);
@@ -125,4 +127,23 @@ export function resolveAgentConfigFromEnv(env) {
     throw new Error('AGENT_RUNTIME=cursor not implemented');
   }
   return featureParamsEnvToYaml(env);
+}
+
+/**
+ * 将 feature-params env 物化为 service_config.yaml（可注入 fs/yaml 便于单测）。
+ * @returns {string} 写入的绝对路径
+ */
+export function materializeAgentConfigFile(env, deps) {
+  const {
+    configFilePath: configFilePathFn,
+    fs: fsMod,
+    yaml: yamlMod,
+    resolveConfig = resolveAgentConfigFromEnv,
+  } = deps;
+  const yamlText = resolveConfig(env);
+  yamlMod.parse(yamlText);
+  const dest = configFilePathFn();
+  fsMod.mkdirSync(path.dirname(dest), { recursive: true });
+  fsMod.writeFileSync(dest, yamlText, 'utf8');
+  return dest;
 }

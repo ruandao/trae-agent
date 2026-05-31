@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import YAML from 'yaml';
 
-import { resolveAgentConfigFromEnv } from './featureParamsEnvToYaml.mjs';
+import { materializeAgentConfigFile } from './featureParamsEnvToYaml.mjs';
 import { appendOutboundReqLog } from './outboundReqLog.mjs';
 import {
   newLayerId,
@@ -15,7 +15,7 @@ import {
   LAYER_ID_RE,
   repoDirNameFromUrl,
 } from './layerFs.mjs';
-import { layersRoot } from './paths.mjs';
+import { configFilePath, layersRoot } from './paths.mjs';
 import {
   appendExecStream,
   resetExecStream,
@@ -937,11 +937,11 @@ export async function runBootstrapAfterListen(ctx) {
   if (env.TASK_AGENT_MAX_STEPS == null) {
     throw new Error('feature-params-env missing TASK_AGENT_MAX_STEPS');
   }
-  const yamlText = resolveAgentConfigFromEnv(env);
-  YAML.parse(yamlText);
-  const dest = configFilePath();
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.writeFileSync(dest, yamlText, 'utf8');
+  const dest = materializeAgentConfigFile(env, {
+    configFilePath,
+    fs,
+    yaml: YAML,
+  });
   appendOutboundReqLog(`bootstrap: wrote ${dest}`);
   console.log('[onlineServiceJS] 任务引导完成（详情已拉取、克隆与配置已就绪）。');
 }
